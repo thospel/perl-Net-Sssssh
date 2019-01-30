@@ -1,0 +1,7 @@
+Changes
+MANIFEST
+Makefile.PL
+README
+bin/sssssh
+md5-versions
+t/00_syntax.t

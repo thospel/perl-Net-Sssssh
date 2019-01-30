@@ -1,0 +1,3526 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+
+our $VERSION = "1.000";
+
+use FindBin qw($Bin $Script);
+use Getopt::Long 2.24 qw(:config bundling require_order);
+use Carp;
+use Sys::Hostname;
+use Socket qw(inet_aton);
+use Errno qw(EINTR ECONNREFUSED ENETUNREACH ETIMEDOUT);
+use IO::Socket::INET;
+use Time::Local qw(timegm);
+use Data::Dumper;
+$Data::Dumper::Indent   = 1;
+$Data::Dumper::Sortkeys = 1;
+
+my $msghdr_error;
+BEGIN {
+    # Can't use "require" later on since Socket::MsgHdr has INIT blocks
+    eval sprintf(qq(#line %d "%s"\nuse Socket::MsgHdr; 1), __LINE__, __FILE__)
+        or $msghdr_error = $@ || "Unknown error loading Socket::MsgHdr\n";
+}
+($Bin, $Script) = __FILE__ =~ m{^(.*)/(.+)\z} or
+    die "Could not parse ", __FILE__ if $Script eq "-" && __FILE__ ne "-";
+
+$SIG{PIPE} = "IGNORE";
+
+# Unfortunately not a builtin in Socket nor Socket::MsgHdr.
+# This is the linux value, can be different on other systems
+my $IP_PKTINFO = 8;
+
+my $ssh = "/usr/bin/ssh";
+my $verbose = undef;
+my $debug   = 0;
+my $default_local_bind  = "127.0.0.1";
+my $default_remote_bind = "127.0.0.1";
+
+# How long a server UDP socket lingers without traffic
+# How long an errored TCP connection tries to push lingering output
+my $TIMEOUT = 120;
+my $SOCKS_TIMEOUT = 120;
+# How much we can typically fit into our communication channel
+my $LINE_BLOCK_SIZE = 16384;
+my $BLOCK_SIZE = 65536;
+my $MARKER_BLOCK = 65536;
+my $LISTEN_BACKLOG = 128;
+my $KEEPALIVE = 300;
+
+my $LOW_WATER  = 3e6;
+my $HIGH_WATER = 4e6;
+
+my %settings = (
+    debug		=> \$debug,
+    verbose     	=> \$verbose,
+    epoch		=> \my $epoch,
+    TIMEOUT		=> \$TIMEOUT,
+    SOCKS_TIMEOUT	=> \$SOCKS_TIMEOUT,
+    BLOCK_SIZE		=> \$BLOCK_SIZE,
+    LINE_BLOCK_SIZE	=> \$LINE_BLOCK_SIZE,
+    MARKER_BLOCK	=> \$MARKER_BLOCK,
+    KEEPALIVE		=> \$KEEPALIVE,
+    LOW_WATER		=> \$LOW_WATER,
+    HIGH_WATER		=> \$HIGH_WATER,
+    );
+my @settings = sort keys %settings;
+my @server_settings;
+
+# Line protocol commands
+my $UDP_LOCAL		= "l";
+my $TCP_LOCAL		= "L";
+my $UDP_REMOTE		= "r";
+my $TCP_REMOTE		= "R";
+my $SOCKS_REMOTE	= "d";	# Set up socks at the remote side
+my $BIND_REMOTE		= "B";	# Result of the remote bind
+my $TCP_CONNECT		= "c";
+my $TCP_EOF		= "E";	# EOF (FIN, end of stream)
+my $TCP_CLOSE		= "C";	# Both error and double EOF
+my $TCP_DATA    	= "D";
+my $TCP_FULL    	= "F";	# Flow control. Start/Stop sending me data
+my $SOCKS_CONNECT_NAMED	= "}";
+my $SOCKS_CONNECT	= ">";
+my $SOCKS_BIND_NAMED	= "{";
+my $SOCKS_BIND		= "<";
+my $SOCKS_UDP		= "=";
+my $SOCKS_ASSOCIATED	= "+";
+my $SOCKS_FAILED	= "-";
+my $UDP_FULL    = "f";
+my $UDP4	= "u";
+my $VDP4	= "v";	# UDP with variable server destination
+my $UDP4_BACK	= "w";
+my $VDP4_BACK	= "x";	# UDP with variable server destination
+my $UDP6	= "U";
+my $VDP6	= "V";	# UDP with variable server destination
+my $TCP4	= "t";
+my $TCP6	= "T";
+my $KEEP	= "K";  # Keepalive packet/Ack
+my $INFO	= "I";	# Message for STDERR on the other side
+my $SET		= "S";	# sets a server variable
+my $START	= "1";
+my $GREETING	= "G";
+my $MARKER	= "";
+
+my $ERROR_ECONNREFUSED	= "Connection refused";
+my $ERROR_ENETUNREACH	= "Network is unreachable";
+my $ERROR_ETIMEDOUT	= "Timed out";
+
+my $role = @ARGV ? "client" : "server";
+my $role_peer = $role eq "server" ? "client" : "server";
+my (@tcp_local, @udp_local, @tcp_remote, @udp_remote);
+my (@socks_local, @socks_remote);
+my $msghdr = $msghdr_error ? undef : Socket::MsgHdr->new();
+
+# Determine some system settings
+my $hostname = hostname();
+my $me;
+if ($^O eq "MSWin32") {
+    require Win32;
+    $me = Win32::LoginName();
+} else {
+    if (my $user = $ENV{LOGNAME}) {
+        if (defined(my $uid = getpwnam($user))) {
+            $me = $user if $> == $uid;
+        }
+    }
+    $me ||= getpwuid $>;
+}
+die "Can't determine who I am" if !$me;
+
+# Client stuffer
+my $POST_STUFFER = sprintf(qq(#line %d "%s"\n%s),
+                           __LINE__, __FILE__, '
+BEGIN {
+    eval {
+        open($SAVED_STDIN, "<&", \*STDIN);
+        open(STDIN, "<", "/dev/null") || die "NULL: $!";
+        1;
+    } or do {
+        print STDERR $@ || "Unknown error\n";
+        exit 255;
+    };
+}
+');
+my $PRE_STUFFER = sprintf(qq(#line %d "%s"\n%s),
+                           __LINE__, __FILE__, '
+BEGIN { $^W = 1 }
+
+my $SAVED_STDIN;
+open(STDIN, "<&", $SAVED_STDIN) || die "Could not dup STDIN: $^E";
+close($SAVED_STDIN) || die "Could not close SAVED_STDIN: $^E";
+$| = 1;
+print "GoNow";
+');
+
+sub standard_error {
+    my ($err) = @_;
+
+    return $ERROR_ECONNREFUSED	if $err == ECONNREFUSED;
+    return $ERROR_ENETUNREACH	if $err == ENETUNREACH;
+    return $ERROR_ETIMEDOUT	if $err == ETIMEDOUT;
+    local $! = $err;
+    return "$!";
+}
+
+package Events;
+# A small event core
+use Carp;
+use Errno qw(EINTR);
+
+my @timers = (undef);
+my $read_mask  = "";
+my $write_mask = "";
+my $error_mask = "";
+my (%read_refs, %write_refs, %error_refs, @immediate, $now);
+
+sub add_read(*$ ) {
+    defined(my $fd = fileno(shift)) || croak "Not a filehandle";
+    ::caller_info("add_read $fd") if $debug;
+    croak "Descriptor $fd already selected for read" if $read_refs{$fd};
+    $read_refs{$fd} = shift;
+    vec($read_mask, $fd, 1) = 1;
+}
+
+sub add_write(*$ ) {
+    defined(my $fd = fileno(shift)) || croak "Not a filehandle";
+    ::caller_info("add_write $fd") if $debug;
+    croak "Descriptor $fd already selected for write" if $write_refs{$fd};
+    $write_refs{$fd} = shift;
+    vec($write_mask, $fd, 1) = 1;
+}
+
+sub add_error(*$ ) {
+    defined(my $fd = fileno(shift)) || croak "Not a filehandle";
+    ::caller_info("add_error $fd") if $debug;
+    croak "Descriptor $fd already selected for error" if $error_refs{$fd};
+    $error_refs{$fd} = shift;
+    vec($error_mask, $fd, 1) = 1;
+}
+
+sub delete_read(*) {
+    defined(my $fd = fileno(shift)) || croak "Not a filehandle";
+    ::caller_info("delete_read $fd") if $debug;
+    croak "Descriptor $fd wasn't selected for read" unless $read_refs{$fd};
+    # This strange assign before delete is to poison the reference @work in
+    # sub mainloop may still have
+    $read_refs{$fd} = undef;
+    delete $read_refs{$fd};
+    if (%read_refs) {
+        vec($read_mask, $fd, 1) = 0;
+        $read_mask =~ s/\x00+\z//;
+    } else {
+        $read_mask = "";
+    }
+}
+
+sub delete_write(*) {
+    defined(my $fd = fileno(shift)) || croak "Not a filehandle";
+    ::caller_info("delete_write $fd") if $debug;
+    croak "Descriptor $fd wasn't selected for write " unless $write_refs{$fd};
+    # This strange assign before delete is to poison the reference @work in
+    # sub mainloop may still have
+    $write_refs{$fd} = undef;
+    delete $write_refs{$fd};
+    if (%write_refs) {
+        vec($write_mask, $fd, 1) = 0;
+        $write_mask =~ s/\x00+\z//;
+    } else {
+        $write_mask = "";
+    }
+}
+
+sub delete_error(*) {
+    defined(my $fd = fileno(shift)) || croak "Not a filehandle";
+    ::caller_info("delete_error $fd") if $debug;
+    croak "Descriptor $fd wasn't selected for error " unless $error_refs{$fd};
+    # This strange assign before delete is to poison the reference @work in
+    # sub mainloop may still have
+    $error_refs{$fd} = undef;
+    delete $error_refs{$fd};
+    if (%error_refs) {
+        vec($error_mask, $fd, 1) = 0;
+        $error_mask =~ s/\x00+\z//;
+    } else {
+        $error_mask = "";
+    }
+}
+
+{
+    no warnings "once";
+    *IO::Handle::add_read     = \&add_read;
+    *IO::Handle::add_write    = \&add_write;
+    *IO::Handle::add_error    = \&add_error;
+    *IO::Handle::delete_read  = \&delete_read;
+    *IO::Handle::delete_write = \&delete_write;
+    *IO::Handle::delete_error = \&delete_error;
+}
+
+sub mainloop {
+    while (1) {
+        Timer::run_now() if @timers > 1 || @immediate;
+        my $timeout = @timers > 1 ?
+            $timers[1][0]-$now > 0 ? $timers[1][0]-$now : 0 :
+            %read_refs || %write_refs || %error_refs ? undef : last;
+        if ((select(my $r = $read_mask, my $w = $write_mask, my $e = $error_mask, $timeout) || next) > 0) {
+            $$_ && $$_->() for
+                \@read_refs{ grep vec($r, $_, 1), keys %read_refs},
+                \@write_refs{grep vec($w, $_, 1), keys %write_refs},
+                \@error_refs{grep vec($e, $_, 1), keys %error_refs};
+        } elsif ($! != EINTR) {
+            die "Select failed: $^E";
+        }
+    }
+}
+
+package Timer;
+use Scalar::Util qw(weaken);
+use Carp;
+use Time::HiRes qw(clock_gettime CLOCK_REALTIME CLOCK_MONOTONIC );
+
+# Timer indices
+sub TIME	() { 0 };
+sub INDEX	() { 1 };
+sub CODE	() { 2 };	# Must come after INDEX
+
+my $CLOCK_TYPE;
+my $CLOCK_TYPE_NAME =
+    eval { $CLOCK_TYPE = CLOCK_MONOTONIC; "MONOTONIC" } ||
+    eval { $CLOCK_TYPE = CLOCK_REALTIME;  "REAL" } ||
+    die "Time::HiRes doesn't even have CLOCK_REALTIME";
+
+sub realtime {
+    return clock_gettime(CLOCK_REALTIME);
+}
+
+# Timers are kept in a simple binary heap @timers
+sub new {
+    my ($class, $time, $fun) = @_;
+
+    $now = clock_gettime($CLOCK_TYPE);
+    $time = $time + $now;
+    $time = 0.5+1/3-$time if $time < 1;
+    my $i = @timers;
+    while ($i > 1 && $time < $timers[$i >> 1][TIME]) {
+        weaken($timers[$i] = $timers[$i >> 1]);
+        $i = ($timers[$i][INDEX] = $i) >> 1;
+    }
+    my $timer = bless [$time, $i, $fun], $class;
+    weaken($timers[$i] = $timer);
+    return $timer;
+}
+
+sub delete : method {
+    my ($timer) = @_;
+
+    my $i = $timer->[INDEX];
+    if (!$i) {
+        croak "Not a timer reference" unless defined($i) && $i == 0;
+        # Could be a timer sitting on the expired queue in run_now
+        $#$timer = INDEX if @$timer > INDEX;
+        return;
+    }
+    $timer->[INDEX] = 0;
+    # Last element or beyond...
+    if ($i >= $#timers) {
+        croak "Not a timer reference" if $i > $#timers;
+        pop(@timers);
+        return;
+    }
+    my $time = $timers[-1][TIME];
+    if ($i > 1 && $time < $timers[$i >> 1][TIME]) {
+        # percolate to root
+        do {
+            weaken($timers[$i] = $timers[$i >> 1]);
+            $i = ($timers[$i][INDEX] = $i) >> 1;
+        } while ($i > 1 && $time < $timers[$i >> 1][TIME]);
+    } else {
+        # percolate to leafs
+        my $n = @timers-2;
+        my $l = $i * 2;
+        while ($l < $n) {
+            if ($timers[$l][TIME] < $time) {
+                if ($timers[$l+1][TIME] < $timers[$l][TIME]) {
+                    weaken($timers[$i] = $timers[$l+1]);
+                    $timers[$i][INDEX] = $i;
+                    $i = $l+1;
+                } else {
+                    weaken($timers[$i] = $timers[$l]);
+                    $timers[$i][INDEX] = $i;
+                    $i = $l;
+                }
+            } elsif ($timers[$l+1][TIME] < $time) {
+                weaken($timers[$i] = $timers[$l+1]);
+                $timers[$i][INDEX] = $i;
+                $i = $l+1;
+            } else {
+                last;
+            }
+            $l = $i * 2;
+        }
+        if ($l == $n && $timers[$l][TIME] < $time) {
+            weaken($timers[$i] = $timers[$l]);
+            $timers[$i][INDEX] = $i;
+            $i = $l;
+        }
+    }
+    weaken($timers[$i] = pop @timers);
+    $timers[$i][INDEX] = $i;
+}
+
+sub DESTROY {
+    shift->delete;
+}
+
+sub run_now {
+    # @immediate must be persistent so no timers get lost if a callback dies
+    goto EXPIRED if @timers <= 1 ||
+        $timers[1][TIME] > ($now = clock_gettime($CLOCK_TYPE));
+    while (@timers > 2) {
+        push @immediate, $timers[1];
+        $timers[1][INDEX] = 0;
+
+        my $time = $timers[-1][TIME];
+        my $n = @timers-2;
+        my $i = 1;
+        my $l = 2;
+        while ($l < $n) {
+            if ($timers[$l][TIME] < $time) {
+                if ($timers[$l+1][TIME] < $timers[$l][TIME]) {
+                    weaken($timers[$i] = $timers[$l+1]);
+                    $timers[$i][INDEX] = $i;
+                    $i = $l+1;
+                } else {
+                    weaken($timers[$i] = $timers[$l]);
+                    $timers[$i][INDEX] = $i;
+                    $i = $l;
+                }
+            } elsif ($timers[$l+1][0] < $time) {
+                weaken($timers[$i] = $timers[$l+1]);
+                $timers[$i][INDEX] = $i;
+                $i = $l+1;
+            } else {
+                last;
+            }
+            $l = $i * 2;
+        }
+        if ($l == $n && $timers[$l][TIME] < $time) {
+            weaken($timers[$i] = $timers[$l]);
+            $timers[$i][INDEX] = $i;
+            $i = $l;
+        }
+        weaken($timers[$i] = pop @timers);
+        $timers[$i][INDEX] = $i;
+        goto EXPIRED if $timers[1][TIME] > $now;
+    }
+    if (@timers == 2) {
+        $timers[1][INDEX] = 0;
+        push @immediate, pop @timers;
+    }
+  EXPIRED:
+    my $fun;
+    $fun->[CODE] && $fun->[CODE]->() while $fun = shift @immediate;
+    $now = clock_gettime($CLOCK_TYPE);
+}
+
+package Ids;
+# Allocate and free unique numbers
+
+sub id_init {
+    my ($ids) = @_;
+
+    $ids->{free_ids} = [];
+    $ids->{free_id}  = 0;
+}
+
+sub id_alloc {
+    my ($ids) = @_;
+
+    return shift @{$ids->{free_ids}} || ++$ids->{free_id};
+}
+
+sub id_free {
+    my ($ids, $id) = @_;
+
+    push @{$ids->{free_ids}}, $id;
+    # Decrease free_ids some if we are lucky
+    while (@{$ids->{free_ids}}) {
+        if ($ids->{free_ids}[-1] == $ids->{free_id}) {
+            --$ids->{free_id};
+            pop @{$ids->{free_ids}};
+        } elsif ($ids->{free_ids}[0] == $ids->{free_id}) {
+            --$ids->{free_id};
+            shift @{$ids->{free_ids}};
+        } else {
+            last;
+        }
+    }
+}
+
+package TCP;
+use Errno qw(EINTR EAGAIN EWOULDBLOCK ENOTCONN ECONNRESET);
+
+sub proto {
+    return "TCP";
+}
+
+sub mark_pending {
+    my ($connection) = @_;
+
+    my $line = $connection->{line} || die "No line";
+    push @{$line->{pending}}, $connection if
+        $connection->{pending} eq "" && $connection->{pending_close} eq "";
+}
+
+sub write {
+    my $connection = shift;
+
+    if ($connection->{socket}) {
+        if ($connection->{local_ip}) {
+            # Socket is connected
+            $connection->{socket}->add_write(sub { $connection->tcp_writer }) if $connection->{out} eq "";
+        }
+        $connection->{out} .= $_[0];
+    } else {
+        $connection->{dropped_out} += length $_[0];
+    }
+}
+
+sub tcp_reader {
+    my ($connection) = @_;
+
+    my $rc = $connection->{socket}->sysread(my $in, $BLOCK_SIZE);
+    if (!defined $rc) {
+        $connection->close("read error from", "$^E");
+    } elsif ($rc == 0) {
+        $connection->eof;
+    } else {
+        $connection->info("TCP read %d bytes from %s: '%s'", $rc,
+                          $connection->{description}, ::display($in)) if $debug;
+        if ($connection->{closed_write}) {
+            # other side is in error. No point in sending
+            $connection->{dropped_in} += length $in;
+        } else {
+            my $read_action = $connection->{read_action};
+            my $was_empty = $connection->{pending} eq "" && $connection->{pending_close} eq "";
+            $connection->{pending} .= $in;
+            $connection->$read_action($rc, $was_empty);
+        }
+    }
+}
+
+sub tcp_writer {
+    my ($connection) = @_;
+
+    while (1) {
+        my $rc = $connection->{socket}->syswrite($connection->{out}, $BLOCK_SIZE);
+        if (!defined $rc) {
+            $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK ||
+                $connection->close("Write error ->", "$^E");
+            return;
+        }
+        die "Zero write. Is this even possible ?" if $rc == 0;
+
+        $connection->info("wrote %d bytes (%d left) %s: %s", $rc,
+                          length($connection->{out}) - $rc,
+                          $connection->{description},
+                          ::display($connection->{out})) if $debug;
+        substr($connection->{out}, 0, $rc, "");
+        if ($connection->{out} eq "") {
+            $connection->{socket}->delete_write;
+            if (defined $connection->{closed_write}) {
+                if (!$connection->{closed_write}) {
+                    # Shutdown for write (send FIN)
+                    $connection->info("shutdown %d (%s)",
+                                      fileno($connection->{socket}),
+                                      $connection->{description}) if $debug;
+                    $connection->{socket}->shutdown(1) ||
+                        $! == ENOTCONN || $! == ECONNRESET ||
+                        die "shutdown write: $^E";
+                }
+                $connection->maybe_free;
+            }
+            return;
+        }
+    }
+}
+
+package UDP;
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+use Socket qw(IPPROTO_IP MSG_TRUNC MSG_CTRUNC
+              pack_sockaddr_in unpack_sockaddr_in inet_ntoa);
+
+sub proto {
+    return "UDP";
+}
+
+sub mark_pending {
+    my ($connection) = @_;
+
+    my $line = $connection->{line} || die "No line";
+    push @{$line->{pending}}, $connection if
+        @{$connection->{pending}} == 0 && $connection->{pending_close} eq "";
+}
+
+sub client_recv {
+    my ($listener_udp) = @_;
+
+    if ($listener_udp->{client_host} eq "0.0.0.0") {
+        $msghdr->controllen(256);
+        $msghdr->namelen(256);
+        $msghdr->buflen($BLOCK_SIZE);
+        my $rc = $listener_udp->{socket}->recvmsg($msghdr);
+        if (!defined $rc) {
+            return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+            die "Error from recvmsg: $^E";
+        }
+        $rc || die "Did not get any bytes";
+        die "Yikes! Buffer was truncated\n" if
+            $msghdr->flags & MSG_TRUNC;
+        die "Yikes! Ancillary data was truncated\n" if
+            $msghdr->flags & MSG_CTRUNC;
+        my $in = $msghdr->buf;
+        length $in == $rc || die "Inconsistent in length";
+        $rc || die "Zero length UDP recvmsg";
+        my @cmsg = $msghdr->cmsghdr();
+        my $local;
+        while (my ($level, $type, $data) = splice(@cmsg, 0, 3)) {
+            $level == IPPROTO_IP && $type == $IP_PKTINFO || next;
+            length $data == 12 || die "Unexpected IP_PKTINFO length";
+            my ($interface, undef, $to) = unpack("Na4a4", $data);
+            $local = $to;
+        }
+        $local || die "Could not get packet destination";
+        my $sender = $msghdr->name;
+        my ($peer_port, $peer) = unpack_sockaddr_in($sender);
+        my $msg = pack("Na4na4", $listener_udp->{id}, $peer, $peer_port, $local);
+        print STDERR "\n" if $debug;
+        ::info("received %s:%d -> %s:%d: '%s'",
+               inet_ntoa($peer), $peer_port,
+               inet_ntoa($local), $listener_udp->{client_port},
+               ::display($in)) if $debug;
+        push @{$listener_udp->{pending}}, "";
+        LineProtocol::line_message($listener_udp->{pending}[-1], $VDP4, $msg, $in);
+    } else {
+        my $sender = $listener_udp->{socket}->recv(my $in, $BLOCK_SIZE);
+        if (!defined $sender) {
+            return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+            die "Error from recv: $^E";
+        }
+        $in ne "" || die "Zero length UDP recv";
+        $sender ne "" || die "System cannot get UDP peer";
+        my $local = $listener_udp->{client_ip};
+        my ($peer_port, $peer) = unpack_sockaddr_in($sender);
+        print STDERR "\n" if $debug;
+        ::info("received %s:%d -> %s:%d: '%s'",
+               inet_ntoa($peer), $peer_port,
+               inet_ntoa($local), $listener_udp->{client_port},
+               ::display($in)) if $debug;
+        push @{$listener_udp->{pending}}, "";
+        LineProtocol::line_message(
+            $listener_udp->{pending}[-1],
+            $listener_udp->header($peer, $peer_port),
+            $in);
+    }
+
+    my $line = $listener_udp->{line} || die "No line";
+    $#{$listener_udp->{pending}} || push @{$line->{pending}}, $listener_udp;
+    $line->{pending_length} += length $listener_udp->{pending}[-1];
+    $line->write();
+}
+
+sub client_send {
+    my ($udp) = @_;
+
+    my $out = $udp->{out}[0];
+    my $to = pack_sockaddr_in($out->[2], $out->[1]);
+    ::info("send %s:%d '%s'\n\n",
+         inet_ntoa($out->[1]), $out->[2], ::display($out->[3])) if $debug;
+    my $rc;
+    if ($udp->{client_host} eq "0.0.0.0") {
+        $msghdr->name($to);
+        $msghdr->buf($out->[3]);
+        $msghdr->cmsghdr(IPPROTO_IP, $IP_PKTINFO, pack("NNa4", 0, 0, $out->[0]));
+        $rc = $udp->{socket}->sendmsg($msghdr);
+    } else {
+        $rc = $udp->{socket}->send($out->[3], 0, $to);
+    }
+    if (!defined $rc) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Unexpected UDP4 send error: $^E";
+    }
+    shift @{$udp->{out}};
+    $udp->{socket}->delete_write if @{$udp->{out}} == 0;
+    die "Zero write. Is this even possible ?" if $rc == 0;
+    $rc == length $out->[3] || die "Short send";
+}
+
+sub unsuspend {
+    my ($listener) = @_;
+
+    --$listener->{suspended} ||
+        $listener->{socket}->add_read( sub { $listener->client_recv });
+}
+
+sub line_write {
+    my ($udp, $wanted) = @_;
+
+    if (@{$udp->{pending}} == 0 && $udp->{pending_close} eq "") {
+        return if
+            defined $udp->{closed_write} &&
+            $udp->{closed_write} ne "";
+        die "Bad pending $udp";
+    }
+    $udp->{associated} || die "Must not write if not associated";
+    my $line = $udp->{line} || die "No line";
+    while ($wanted > 0 && @{$udp->{pending}}) {
+        # $line->{pending_length} does not change, we just move the data
+        $wanted -= length $udp->{pending}[0];
+        $line->{out} .= shift @{$udp->{pending}};
+    }
+    if (@{$udp->{pending}}) {
+        push @{$line->{pending}}, $udp if @{$udp->{pending}};
+    } else {
+        $line->{out} .= $udp->{pending_close};
+        $udp->{pending_close} = "";
+    }
+}
+
+package Forward;
+# represents the remote side of a forwarding
+
+package Forward::TCP;
+use base qw(TCP Forward);
+
+package Forward::UDP;
+use base qw(UDP Forward);
+
+package Connection;
+# represents a running connection between two sides
+use Socket qw(SOL_SOCKET SO_KEEPALIVE SO_ERROR SO_LINGER
+              inet_aton inet_ntoa pack_sockaddr_in unpack_sockaddr_in);
+use Errno qw(EINPROGRESS EWOULDBLOCK ENOTCONN ECONNRESET);
+use Scalar::Util qw(weaken);
+use Carp;
+
+sub info {
+    my $connection = shift;
+    my $format = shift;
+    if (@_) {
+        $format = "Connection %d:%d $format";
+        ::info($format, $connection->{parent_id}, $connection->{id}, @_);
+    } else {
+        ::info("Connection $connection->{parent_id}:$connection->{id} $format");
+    }
+}
+
+sub accept : method {
+    my ($class, $listener) = @_;
+
+    my ($socket, $peer_addr) = $listener->{socket}->accept or return undef;
+    my ($peer_port, $peer_ip) = unpack_sockaddr_in($peer_addr);
+    my $peer_host = inet_ntoa($peer_ip);
+    my $local_addr = $socket->sockname || die "getsockname: $^E";
+    my ($local_port, $local_ip) = unpack_sockaddr_in($local_addr);
+
+    my $parent_id = $listener->id;
+    my $id = $listener->id_alloc;
+    my $line = $listener->{line} || die "No line";
+    die "Assertion: Duplicate connection id $id" if $line->{connections}{$id};
+    my $description = sprintf("%s:%d -> %s:%d",
+                              $peer_host, $peer_port,
+                              inet_ntoa($local_ip), $local_port);
+
+    print STDERR "\n" if $verbose;
+
+    my $connection = $line->{connections}{"$parent_id:$id"} = bless {
+        parent_id	=> $parent_id,
+        id		=> $id,
+        description	=> $description,
+        socket		=> $socket,
+        read_action	=> "action_line_write",
+
+        remote		=> 0,
+        associated	=> 0,	# No corresponding object at the other side
+        dropped_in	=> 0,
+        dropped_out	=> 0,
+        out		=> "",
+        pending		=> "",	# Pending bytes
+        pending_close	=> "",  # EOF or error
+        suspended	=> 1,
+
+        local_addr	=> $local_addr,
+        local_ip	=> $local_ip,
+        local_port	=> $local_port,
+
+        peer_ip		=> $peer_ip,
+        peer_host	=> $peer_host,
+        peer_port	=> $peer_port,
+    }, $class;
+    weaken($connection->{line} = $line);
+
+    $connection->info("accepted %s (%d on %d)", $description,
+                      fileno($listener->{socket}), fileno($socket)) if $verbose;
+
+    return $connection;
+}
+
+sub connect : method {
+    my ($class, $line, $parent_id, $id, $server_host, $server_port,
+        $client_ip) = @_;
+
+    die "Already have connection $parent_id:$id" if
+        $line->{connections}{"$parent_id:$id"};
+
+    my $server_ip;
+    if ($server_host eq "0.0.0.0") {
+        $server_ip = $client_ip || croak "No fallback client_ip";
+    } else {
+        $server_ip = inet_aton($server_host);
+    }
+    my $socket = IO::Socket::INET->new(
+        Blocking	=> 0,
+        Proto		=> "tcp") || die $@;
+    $socket->setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1) || die "setsockopt: $^E";
+
+    my $description = sprintf("-> %s:%d", inet_ntoa($server_ip), $server_port);
+    my $connection = bless {
+        parent_id	=> $parent_id,
+        id		=> $id,
+        description	=> $description,
+        socket		=> $socket,
+        read_action	=> "action_line_write",
+
+        remote		=> 1,
+        associated	=> 1,
+        dropped_in	=> 0,
+        dropped_out	=> 0,
+        out		=> "",
+        pending		=> "",	# Pending bytes
+        pending_close	=> "",  # EOF or error
+        suspended	=> 1,
+
+        peer_ip		=> $server_ip,
+        peer_host	=> $server_host,
+        peer_port	=> $server_port,
+
+        client_ip	=> $client_ip,
+    }, $class;
+    weaken($connection->{line} = $line);
+    $line->{connections}{"$parent_id:$id"} = $connection;
+
+    if (!$connection->{peer_ip}) {
+        delete $connection->{socket};
+        $connection->close("connect failed ->", "Could not resolve host");
+        return $connection;
+    }
+
+    my $to = pack_sockaddr_in($connection->{peer_port}, $connection->{peer_ip});
+    if (connect($socket, $to)) {
+        my $local_addr = $socket->sockname || die "getsockname: $^E";
+        ($connection->{local_port}, $connection->{local_ip}) =
+            unpack_sockaddr_in($local_addr);
+        $connection->{description} = sprintf(
+            "%s:%d -> %s:%d",
+            inet_ntoa($connection->{local_ip}), $connection->{local_port},
+            inet_ntoa($server_ip), $server_port);
+
+        $connection->info("connected %s", $connection->{description}) if
+            $verbose;
+        $connection->on_connected;
+    } elsif ($! == EINPROGRESS || $! == EWOULDBLOCK) {
+        $connection->info("connecting %s", $connection->{description}) if
+            $verbose;
+        $socket->add_write(sub { $connection->connected });
+        # Needed on windows
+        $socket->add_error(sub { $connection->connected });
+    } else {
+        my $err = ::standard_error($!+0);
+        delete $connection->{socket};
+        $connection->close("connect failed ->", $err);
+    }
+    return $connection;
+}
+
+sub connected {
+    my ($connection) = @_;
+
+    my $packed = getsockopt($connection->{socket}, SOL_SOCKET, SO_ERROR) ||
+        die "Assertion: getsockopt: $^E";
+    length($packed) == length(pack("I", 0)) ||
+        die "Assertion: getsockopt: Strange result length";
+    my $err = unpack("I", $packed);
+    if ($err == 0) {
+        my $local_addr = $connection->{socket}->sockname ||
+            die "getsockname: $^E";
+        ($connection->{local_port}, $connection->{local_ip}) =
+            unpack_sockaddr_in($local_addr);
+        $connection->{description} = sprintf(
+            "%s:%d -> %s:%d",
+            inet_ntoa($connection->{local_ip}), $connection->{local_port},
+            inet_ntoa($connection->{peer_ip}), $connection->{peer_port});
+
+        $connection->info("connected %s", $connection->{description}) if
+            $verbose;
+        $connection->{socket}->delete_error;
+        $connection->{socket}->delete_write;
+        $connection->on_connected;
+        if ($connection->{out} ne "") {
+            $connection->{socket}->add_write(sub { $connection->tcp_writer });
+        } elsif (defined $connection->{closed_write}) {
+            if (!$connection->{closed_write}) {
+                # Shutdown for write (send FIN)
+                $connection->info("shutdown %d (%s)",
+                                  fileno($connection->{socket}),
+                                  $connection->{description}) if $debug;
+                $connection->{socket}->shutdown(1) ||
+                    $! == ENOTCONN ||
+                    $! == ECONNRESET ||
+                    die "shutdown write: $^E";
+            }
+            $connection->maybe_free;
+        }
+    } else {
+        $connection->close("connect failed ->", ::standard_error($err));
+    }
+}
+
+sub on_connected {
+    my ($connection) = @_;
+
+    $connection->unsuspend if !$connection->{line}{suspended};
+}
+
+# Add $length new bytes to $line
+sub action_line_write {
+    my ($connection, $length, $was_empty) = @_;
+
+    $connection->{associated} || die "Must not write if not associated";
+    my $line = $connection->{line} || die "No line";
+    push @{$line->{pending}}, $connection if $was_empty;
+    $line->{pending_length} += $length;
+    $line->write();
+}
+
+sub action_expect_eof {
+    my ($connection) = @_;
+
+    $connection->{dropped_in} = length $connection->{pending};
+    $connection->{pending} = "";
+    $connection->close("read", "data instead of EOF");
+}
+
+sub action_black_hole {
+    my ($connection) = @_;
+
+    $connection->{line}->{droppen_in} += length $connection->{pending};
+    $connection->{pending} = "";
+}
+
+sub suspend {
+    my ($connection) = @_;
+
+    if (!$connection->{suspended}++ &&
+        $connection->{socket} &&
+        $connection->{local_ip}) {
+        $connection->{socket}->delete_read;
+    }
+}
+
+sub unsuspend {
+    my ($connection) = @_;
+
+    if (!--$connection->{suspended} &&
+        $connection->{socket} &&
+        $connection->{local_ip}) {
+        $connection->{socket}->add_read(sub { $connection->tcp_reader });
+    }
+}
+
+sub rst {
+    my ($connection) = @_;
+
+    $connection->{socket} || die "RST without socket";
+    my $linger = pack("II", 1, 0);
+    $connection->{socket}->setsockopt(SOL_SOCKET, SO_LINGER, $linger) ||
+        die "setsockopt: $^E";
+}
+
+sub line_write {
+    my ($connection, $wanted) = @_;
+
+    if ($connection->{pending} eq "" && $connection->{pending_close} eq "") {
+        return if
+            defined $connection->{closed_write} &&
+            $connection->{closed_write} ne "";
+        die "Bad pending $connection";
+    }
+    $connection->{associated} || die "Must not write if not associated";
+    my $line = $connection->{line} || die "No line";
+    if (length($connection->{pending}) > $wanted) {
+        $line->{pending_length} -= $wanted;
+        $line->{pending_length} += LineProtocol::line_message(
+            $line->{out}, $TCP_DATA,
+            pack("ww", $connection->{parent_id}, $connection->{id}),
+            substr($connection->{pending}, 0, $wanted, ""));
+        push @{$line->{pending}}, $connection;
+    } else {
+        if ($connection->{pending} ne "") {
+            $line->{pending_length} -= length($connection->{pending});
+            $line->{pending_length} += LineProtocol::line_message(
+                $line->{out}, $TCP_DATA,
+                pack("ww", $connection->{parent_id}, $connection->{id}),
+                $connection->{pending});
+            $connection->{pending} = "";
+        }
+        if ($connection->{pending_close} ne "") {
+            $line->{out} .= $connection->{pending_close};
+            $connection->{pending_close} = "";
+        }
+        $connection->maybe_free;
+    }
+}
+
+sub maybe_free {
+    my ($connection) = @_;
+
+    $connection->{out} eq "" || return;
+    defined $connection->{closed_write} || return;
+    if ($connection->{closed_write} eq "") {
+        defined $connection->{closed_read} &&
+            $connection->{closed_read} eq "" || return;
+
+        # Mutual EOF
+        $connection->{closed_read} = "0";
+        if ($connection->{associated}) {
+            my $message = "";
+            LineProtocol::line_message(
+                $message, $TCP_CLOSE,
+                pack("wwa*", $connection->{parent_id}, $connection->{id}, "0"));
+            my $line = $connection->{line} || die "No line";
+            $line->{pending_length} += length $message;
+            push @{$line->{pending}}, $connection if
+                $connection->{pending} eq "" &&
+                $connection->{pending_close} eq "";
+            $line->write();
+            $connection->{pending_close} .= $message;
+        } else {
+            $connection->forward_close("0");
+        }
+        return;
+    }
+    # Now we know $connection->{closed_write} is "0" or true and out eq ""
+    # So there is no more work to be done on the "out" side
+
+    if (!defined $connection->{closed_read} ||
+        $connection->{closed_read} eq "") {
+        # If EOF was pending (close_read = "") we already sent it
+        $connection->close("forced close",
+                           "forwarded $connection->{closed_write}");
+        # The close will also trigger a new $connection->maybe_free
+        return;
+    }
+
+    # Now we know $connection->{closed_read} is "0" or true
+    if (!$connection->{associated}) {
+        $connection->{pending_close} = "";
+        $connection->{dropped_in} += length $connection->{pending};
+        $connection->{pending} = "";
+    }
+
+    $connection->{pending} eq "" && $connection->{pending_close} eq "" ||
+        return;
+
+    # So there is also no more work to be done on the "in" side
+    # We can do the actual free. After the free the connection can still
+    # linger on the @{$line->{pending}} queue until it is processed and sees
+    # no more work remains. But we DO want to stop all actual activity now
+    die "Double free" if $connection->{freed};
+    $connection->{freed} = 1;
+
+    delete $connection->{socket};
+    $connection->{close_timer} = undef;
+
+    $connection->info("cleanup %s: %d in drops, %d out drops",
+                      $connection->{description},
+                      $connection->{dropped_in}, $connection->{dropped_out}) if
+                          ($connection->{dropped_in} || $connection->{dropped_out}) && $verbose || $debug;
+    print STDERR "\n" if $verbose || $debug;
+
+    my $line = $connection->{line} || die "No line";
+    my $id        = $connection->{id};
+    my $parent_id = $connection->{parent_id};
+    delete($line->{connections}{"$parent_id:$id"}) ||
+        die "Unknown connection $parent_id:$id";
+    if (!$connection->{remote}) {
+        my $listener = $line->{listeners}{$parent_id} ||
+            die "Unknown listener $parent_id";
+        $listener->id_free($id);
+    }
+}
+
+# Stop reading
+sub eof {
+    my ($connection) = @_;
+
+    $connection->info("EOF from %s", $connection->{description}) if $verbose;
+
+    if (defined $connection->{closed_read}) {
+        die "EOF after error" if $connection->{closed_read};
+        die "Double EOF";
+    }
+    $connection->{pending_close} eq "" || die "EOF with close pending";
+
+    # No shutdown(0) since the socket is not connected anymore so that would
+    # just give an error. Instead just suspend. Since there is no
+    # corresponding unsuspend we will never try to read again
+    $connection->suspend;
+
+    $connection->{closed_read} = "";
+    if ($connection->{associated}) {
+        $connection->mark_pending;
+        LineProtocol::line_message(
+            $connection->{pending_close}, $TCP_EOF,
+            pack("ww", $connection->{parent_id}, $connection->{id}));
+        my $line = $connection->{line} || die "No line";
+        $line->{pending_length} += length $connection->{pending_close};
+        $line->write();
+        $connection->maybe_free;
+    } elsif (!defined $connection->{closed_write}) {
+        $connection->forward_eof;
+    }
+}
+
+# Read or write error
+sub close : method {
+    my ($connection, $operation, $err) = @_;
+
+    $err || die "close without error reason";
+    if (defined $connection->{closed_read}) {
+        die "Double error" if $connection->{closed_read};
+        die "Activity after double EOF" if $connection->{closed_read} eq "0";
+    }
+
+    $connection->info("%s %s: %s", $operation, $connection->{description}, $err)
+        if $verbose;
+    if ($connection->{socket}) {
+        if ($connection->{local_ip}) {
+            # Connected
+            $connection->suspend;
+            # No shutdown(0) since the socket is not connected anymore so that
+            # would just give an error. Instead just increase suspended. Since
+            # there is no corresponding decrease we will never try to read again
+            $connection->{socket}->delete_write if $connection->{out} ne "";
+        } elsif ($connection->{associated}) {
+            # Connection in progress
+            $connection->{socket}->delete_write;
+            $connection->{socket}->delete_error;
+        } else {
+            # Listen in progress
+            $connection->suspend;
+        }
+        delete $connection->{socket};
+    } else {
+        # The first connect already failed
+    }
+    $connection->{closed_read} = $err;
+    $connection->{dropped_out} += length $connection->{out};
+    $connection->{out} = "";
+
+    if ($connection->{associated}) {
+        my $close = "";
+        LineProtocol::line_message(
+            $close, $TCP_CLOSE,
+            pack("wwa*", $connection->{parent_id}, $connection->{id}, $err));
+        my $line = $connection->{line} || die "No line";
+        $line->{pending_length} += length $close;
+        push @{$line->{pending}}, $connection if
+            $connection->{pending} eq "" && $connection->{pending_close} eq "";
+        $line->write();
+        $connection->{pending_close} .= $close;
+    } elsif (!defined $connection->{closed_write} ||
+             $connection->{closed_write} eq "") {
+        $connection->forward_close($err);
+        return;
+    }
+    $connection->maybe_free;
+}
+
+sub forward_eof {
+    my ($connection) = @_;
+
+    if (defined $connection->{closed_write}) {
+        die "EOF after error" if $connection->{closed_write};
+        die "Double EOF";
+    }
+    $connection->{closed_write} = "";
+
+    if ($connection->{out} eq "" &&
+        $connection->{socket}  &&
+        $connection->{associated} &&
+        $connection->{local_ip}) {
+        # Shutdown for write (send FIN)
+        $connection->info("shutdown %d (%s)",
+                          fileno($connection->{socket}),
+                          $connection->{description}) if $debug;
+        $connection->{socket}->shutdown(1) ||
+            $! == ENOTCONN ||
+            $! == ECONNRESET ||
+            die "shutdown write: $^E";
+    }
+    $connection->maybe_free;
+}
+
+# Forwarded side tells us about a close.
+# This is also a promise never to send us more data
+# err  "0" means final close by mutual EOF
+# err  "" is impossible
+# err anything else is final close on error
+sub forward_close {
+    my ($connection, $err) = @_;
+
+    $connection->info("peer close %s: %s",
+                      $connection->{description}, $err || "EOF") if $verbose;
+
+    defined $err || die "forward_close err is undef";
+    $err ne "" || die "empty forward err";
+
+    die "Double forwarded error close" if
+        defined $connection->{closed_write} &&
+        $connection->{closed_write} ne "";
+    $connection->{closed_write} = $err;
+
+    $connection->rst if
+        $err && $connection->{socket} && $connection->{local_ip};
+
+    if ($err) {
+        # forwarded_close without association can only happen as a cleanup
+        # trigger by manual call
+        if ($connection->{associated}) {
+            my $line = $connection->{line} || die "No line";
+            $line->{pending_length} -= length $connection->{pending};
+            $line->{pending_length} -= length $connection->{pending_close};
+            if ($line->{pending_length} <= 0 && !$line->{keepalive}) {
+                length $line->{out} == $line->{out_sent} ||
+                    die "Unexpected non empty out";
+                $line->{pending_length} >= 0 ||
+                    die "Unexpected negative pending_length";
+                $line->{keepalive} = Timer->timer($KEEPALIVE, \&::keepalive);
+                $line->{socket_out}->delete_write;
+                $line->unsuspend if
+                    $line->{pending_length} <= $LOW_WATER && $line->{suspended};
+            }
+        }
+        $connection->info("Dropping %d bytes, pending_length=%d",
+                          length $connection->{pending},
+                          $connection->{line}{pending_length}) if $debug;
+
+        $connection->{dropped_in} += length $connection->{pending};
+        $connection->{pending_close} = "";
+        $connection->{pending} = "";
+    }
+
+    if ($connection->{out} eq "") {
+        $connection->maybe_free;
+    } else {
+        my $id        = $connection->{id};
+        my $parent_id = $connection->{parent_id};
+
+        $connection->{close_timer} =
+            Timer->new($TIMEOUT, sub { $connection->forced_close });
+    }
+}
+
+sub forced_close {
+    my ($connection) = @_;
+
+    $connection->{close_timer} = undef;
+    $connection->{dropped_out} += length $connection->{out};
+    $connection->{out} = "";
+    $connection->maybe_free;
+}
+
+package Connection::Forward::TCP;
+use base qw(TCP Connection);
+
+package Connection::Forward::SOCKS;
+use base qw(TCP Connection);
+
+sub on_connected {
+    my ($connection) = @_;
+
+    $connection->{line}->write(
+        $SOCKS_ASSOCIATED,
+        pack("wwna4",
+             $connection->{parent_id}, $connection->{id},
+             $connection->{local_port}, $connection->{local_ip}));
+    $connection->SUPER::on_connected;
+}
+
+package Connection::Forward::SOCKS::UDP;
+use Socket qw(unpack_sockaddr_in inet_ntoa inet_aton);
+use Scalar::Util qw(weaken);
+use Carp;
+
+use base qw(UDP Connection);
+
+sub new {
+    my ($class, $line, $parent_id, $id) = @_;
+
+    croak "Assertion: Duplicate connection id $parent_id:$id" if
+        $line->{connections}{"$parent_id:$id"};
+
+    my $socket = Listener::UDP->socket("0.0.0.0", 0);
+    my $local_addr = $socket->sockname || die "getsockname: $^E";
+    my ($local_port, $local_ip) = unpack_sockaddr_in($local_addr);
+    my $local_host = inet_ntoa($local_ip);
+
+    binmode($socket);
+
+    my $connection = $line->{connections}{"$parent_id:$id"} = bless {
+        parent_id	=> $parent_id,
+        id		=> $id,
+        description	=> "$local_host:$local_port",
+        socket		=> $socket,
+
+        client_port	=> $local_port,
+        client_ip	=> $local_ip,
+        client_host	=> "*",		# Needed to inherit from Listener::UDP
+
+        remote		=> 1,
+        associated	=> 1,
+        suspended	=> 1,
+
+        dropped_in	=> 0,
+        dropped_out	=> 0,
+        out		=> [],
+        pending		=> [],
+        pending_close	=> "",
+    }, $class;
+    weaken($connection->{line} = $line);
+    $connection->unsuspend if !$line->{suspended};
+    return $connection;
+}
+
+sub write {
+    my $connection = shift;
+
+    return if length $_[0] < 5;
+    my ($atyp, $len) = unpack("CC", $_[0]);
+    my ($ip, $port);
+    if ($atyp == 1) {
+        return if length $_[0] < 8;
+        ($ip, $port) = unpack("x a4 n", substr($_[0], 0, 7, ""));
+    } elsif ($atyp == 3) {
+        return if length $_[0] < 5+$len;
+        (my $name, $port) = unpack("x2 a$len n", substr($_[0], 0, 4+$len, ""));
+        $ip = inet_aton($name) || return;
+    } elsif ($atyp == 4) {
+        return if length $_[0] < 20;
+        ($ip, $port) = unpack("x a16 n", substr($_[0], 0, 19, ""));
+        return;
+    } else {
+        return;
+    }
+    $connection->{socket}->add_write(sub { $connection->client_send }) if
+        !@{$connection->{out}};
+    unshift @_, "", $ip, $port;
+    push @{$connection->{out}}, \@_;
+}
+
+sub header {
+    my ($connection, $peer_ip, $peer_port) = @_;
+
+    return $TCP_DATA, pack("wwCa4n",
+                           $connection->{parent_id}, $connection->{id}, 1,
+                           $peer_ip, $peer_port);
+}
+
+sub forward_eof {
+    my ($connection) = @_;
+
+    if (defined $connection->{closed_write}) {
+        die "EOF after error" if $connection->{closed_write};
+        die "Double EOF";
+    }
+    $connection->{closed_write} = "";
+    if (defined $connection->{closed_read}) {
+        $connection->maybe_free;
+    } else {
+        $connection->eof;
+    }
+}
+
+package Connection::Listener::TCP;
+use base qw(TCP Connection);
+
+sub accept : method {
+    my ($class, $tcp_listener) = @_;
+
+    my $connection = $class->SUPER::accept($tcp_listener);
+
+    # Only [$parent_id, $id] are really needed (and $local_ip if no target host)
+    my $msg = pack("wwa4",
+                   $connection->{parent_id}, $connection->{id},
+                   $tcp_listener->{server_variable} ?
+                   $connection->{local_ip} : "\0\0\0\0");
+    $tcp_listener->{line}->write($TCP_CONNECT, $msg);
+    $connection->{associated} = 1;
+
+    return $connection;
+}
+
+package Connection::Listener::SOCKS;
+use Socket qw(inet_ntoa unpack_sockaddr_in);
+use Scalar::Util qw(weaken);
+
+use base qw(TCP Connection);
+
+sub action_greeting {
+    my ($connection, $length) = @_;
+
+    my $version = ord substr($connection->{pending}, 0, 1, "");
+    $connection->info("wants to use SOCKS version $version") if $debug;
+    if ($version == 4) {
+        my $read_action = $connection->{read_action} = "action_greeting4";
+        $connection->$read_action if $connection->{pending} ne "";
+    } elsif ($version == 5) {
+        my $read_action = $connection->{read_action} = "action_greeting5";
+        $connection->{socks} = "5";
+        $connection->$read_action if $connection->{pending} ne "";
+    } else {
+        my $letter = chr $version;
+        if (index("GHP", $letter)+1) {
+            # Looks like a HTTP request
+            my $html = 'HTTP/1.0 400 Bad Request
+Content-Type: text/html; charset=UTF-8
+
+<!DOCTYPE html>
+<html lang=en>
+<title>This is not a HTTP proxy but a SOCKS proxy</title>
+<body><h1>This is not a HTTP proxy but a SOCKS proxy</h1>
+</html>
+';
+            $html =~ s/\n/\x0d\x0a/g;
+            $connection->write($html);
+            $connection->eof();
+            # No need to set read_action since we will never read again
+        } else {
+            $connection->close("SOCKS", "version $version not supported");
+        }
+    }
+}
+
+sub action_greeting4 {
+    my ($connection) = @_;
+
+    return if length $connection->{pending} < 8;
+
+    my $pos = index($connection->{pending}, "\0", 7)+1 || return;
+    if ($pos > 255+8) {
+        $connection->close("SOCKS4", "userid too long");
+        return;
+    }
+    @{$connection}{qw(command server_port server_ip user)} =
+        unpack("Cna4Z*", substr($connection->{pending}, 0, $pos, ""));
+    $connection->{server_host} = inet_ntoa($connection->{server_ip});
+    $connection->{socks} = $connection->{server_ip} ge "\0\0\1\\0" ? "4" : "4a";
+    $connection->info("SOCKS%s command=%d, port=%d, ip=%s, user=%s",
+                      $connection->{socks}, $connection->{command},
+                      $connection->{server_port}, $connection->{server_host},
+                      $connection->{user}) if $debug;
+
+    if ($connection->{command} == 1) {
+        if ($connection->{server_port} == 0) {
+            $connection->close("SOCKS4", "destination port 0", 1);
+            return;
+        }
+    } elsif ($connection->{command} != 2) {
+        $connection->close("SOCKS4", "Unknown command $connection->{command}", 1);
+        return;
+    }
+    if ($connection->{server_ip} le "\0\0\0\xff") {
+        # SOCKS4a
+        delete $connection->{server_ip};
+        my $read_action = $connection->{read_action} = "action_greeting4a";
+        $connection->$read_action if $connection->{pending} ne "";
+    } else {
+        # Plain SOCKS4
+        $connection->{line}->write(
+            $connection->{command} == 1 ? $SOCKS_CONNECT : $SOCKS_BIND,
+            pack("wwna4",
+                 $connection->{parent_id}, $connection->{id},
+                 $connection->{server_port}, $connection->{server_ip}));
+        $connection->{associated} = $connection->{command} == 1 ? 2 : 1;
+        my $read_action = $connection->{read_action} = "action_line_write";
+        $connection->$read_action(length $connection->{pending}, 1) if
+            $connection->{pending} ne "";
+    }
+}
+
+sub action_greeting4a {
+    my ($connection) = @_;
+
+    my $pos = index($connection->{pending}, "\0")+1 || return;
+    if ($pos > 255+1) {
+        $connection->close("SOCKS4a", "hostname too long");
+        return;
+    }
+    $connection->{server_host} = substr($connection->{pending}, 0, $pos, "");
+    chop $connection->{server_host};
+    $connection->info("SOCKS%s host=%s",
+                      $connection->{socks}, $connection->{server_host}) if
+                          $debug;
+
+    $connection->{line}->write(
+        $connection->{command} == 1 ? $SOCKS_CONNECT_NAMED : $SOCKS_BIND_NAMED,
+        pack("wwna*",
+             $connection->{parent_id}, $connection->{id},
+             $connection->{server_port}, $connection->{server_host}));
+    $connection->{associated} = $connection->{command} == 1 ? 2 : 1;
+    my $read_action = $connection->{read_action} = "action_line_write";
+    $connection->$read_action(length $connection->{pending}, 1) if
+        $connection->{pending} ne "";
+}
+
+sub action_greeting5 {
+    my ($connection) = @_;
+
+    my $nmethods = ord substr($connection->{pending}, 0, 1);
+    return if length $connection->{pending} <= $nmethods;
+    my $methods = substr($connection->{pending}, 0, $nmethods+1, "");
+    my $selected_method = 0xff;
+    my $read_action = "action_expect_eof";
+    for my $method (unpack("xC*", $methods)) {
+        if ($method == 0) {
+            $read_action = "action_request5";
+            $selected_method = 0;
+        }
+    }
+    $connection->info("SOCKS5 selected authentication method %d",
+                      $selected_method) if $debug;
+    $connection->write(pack("CC", 5, $selected_method));
+    $connection->forward_eof if $selected_method == 0xff;
+    $connection->{read_action} = $read_action;
+    $connection->$read_action if $connection->{pending} ne "";
+}
+
+sub action_request5 {
+    my ($connection) = @_;
+
+    return if length $connection->{pending} < 7;
+    my ($ver, $cmd, $rsv, $atyp, $len) =
+        unpack("CCCCC", $connection->{pending});
+    $connection->info("SOCKS5 request ver=%d cmd=%d, rsv=%d, atyp=%d",
+                      $ver, $cmd, $rsv, $atyp) if $debug;
+    if ($ver != 5) {
+        $connection->info("SOCKS5: Invalid socks request version $ver") if
+            $verbose;
+        $connection->close("read", "Invalid request version $ver");
+        return;
+    }
+    if ($rsv != 0 || !($cmd == 1 || $cmd == 2 || $cmd == 3)) {
+        $connection->info("SOCKS5: Unsupported rsv=%d, cmd=%d", $rsv, $cmd) if
+            $verbose;
+        $connection->{read_action} = "action_black_hole";
+        $connection->{dropped_in} += length $connection->{pending};
+        $connection->{pending} = "";
+        $connection->write(pack("CCxCCn", 5, 7, 3, 0, 0));
+        $connection->forward_eof;
+        return;
+    }
+    $connection->{command} = $cmd;
+    if ($atyp == 1) {
+        return if length $connection->{pending} < 10;
+        ($connection->{server_ip}, $connection->{server_port}) =
+            unpack("x4 a4 n", substr($connection->{pending}, 0, 10, ""));
+        if ($cmd == 3) {
+            $connection->{server_host} = inet_ntoa($connection->{server_ip});
+        } else {
+            # Nonstandard extension: if connecting to 0.0.0.0 replace target by
+            # IP of the socks server
+            $connection->{server_ip} = $connection->{local_ip} if
+                $connection->{server_ip} eq "\0\0\0\0";
+            $connection->{line}->write(
+                $cmd == 1 ? $SOCKS_CONNECT : $SOCKS_BIND,
+                pack("wwna4",
+                     $connection->{parent_id}, $connection->{id},
+                     $connection->{server_port}, $connection->{server_ip}));
+            $connection->{read_action} = "action_line_write";
+        }
+    } elsif ($atyp == 3) {
+        return if length $connection->{pending} < 7+$len;
+        ($connection->{server_host}, $connection->{server_port}) =
+            unpack("x5 a$len n", substr($connection->{pending}, 0, 7+$len, ""));
+        if ($cmd != 3) {
+            $connection->{line}->write(
+                $cmd == 1 ? $SOCKS_CONNECT_NAMED : $SOCKS_BIND_NAMED,
+                pack("wwna*",
+                     $connection->{parent_id}, $connection->{id},
+                     $connection->{server_port}, $connection->{server_host}));
+            $connection->{read_action} = "action_line_write";
+        }
+    } elsif ($atyp == 4) {
+        return if length $connection->{pending} < 22;
+        ($connection->{server_ip}, $connection->{server_port}) =
+            unpack("x4 a16 n", substr($connection->{pending}, 0, 22, ""));
+        $connection->info("SOCKS5: IPv6 currently unsupported", $atyp) if
+            $verbose;
+        $connection->{read_action} = "action_black_hole";
+        $connection->{dropped_in} += length $connection->{pending};
+        $connection->{pending} = "";
+        $connection->write(pack("CCxCx18", 5, 8, 4));
+        $connection->forward_eof;
+        return;
+    } else {
+        $connection->info("SOCKS5: Unsupported address type %d", $atyp) if
+            $verbose;
+        $connection->{read_action} = "action_black_hole";
+        $connection->{dropped_in} += length $connection->{pending};
+        $connection->{pending} = "";
+        $connection->write(pack("CCxCx6", 5, 8, 1));
+        $connection->forward_eof;
+        return;
+    }
+    if ($cmd == 3) {
+        $connection->{read_action} = "action_expect_eof";
+        $connection->{line}->write(
+            $SOCKS_UDP,
+            pack("wwna4",
+                 $connection->{parent_id}, $connection->{id}));
+    }
+    $connection->{associated} = $cmd == 2 ? 1 : 2;
+    if ($connection->{pending} ne "") {
+        my $read_action = $connection->{read_action};
+        $connection->$read_action(length $connection->{pending}, 1);
+    }
+}
+
+sub accept : method {
+    my ($class, $socks_listener) = @_;
+
+    my $connection = $class->SUPER::accept($socks_listener);
+    $connection->{read_action} = "action_greeting";
+    $connection->{socks_timer} =
+        Timer->new($SOCKS_TIMEOUT, sub { $connection->socks_timeout });
+    return $connection;
+}
+
+sub socks_timeout {
+    my ($connection) = @_;
+
+    $connection->{socks_timer} = undef;
+
+    if ($connection->{socks} && !defined $connection->{closed_read} &&
+        ($connection->{associated} == 1 || $connection->{associated} == 2)) {
+        $connection->{associated} = 3;
+        $connection->write($connection->{socks} eq "5" ?
+                           pack("CCxCx6", 5, 6, 1) :
+                           pack("CCx6", 0, 91));
+        $connection->eof;
+        $connection->{socks_timer} =
+            Timer->new(10, sub { $connection->socks_timeout });
+    } else {
+        $connection->close("SOCKS", $ERROR_ETIMEDOUT);
+    }
+}
+
+sub forward_close {
+    my ($connection, $err) = @_;
+
+    $connection->{socks_timer} = undef;
+    if ($connection->{associated} == 1 || $connection->{associated} == 2) {
+        $connection->{associated} = 3;
+        # Socks answer. 91: request rejected or failed
+        ::info("SOCKS REPLY connection %d:%d failed: %s",
+               $connection->{parent_id}, $connection->{id}, $err) if $verbose;
+        if ($connection->{socks} eq "5") {
+            my $rc;
+            if ($err eq $ERROR_ECONNREFUSED) {
+                $rc = 5;
+            } elsif ($err eq $ERROR_ENETUNREACH) {
+                $rc = 3;
+            } elsif ($err eq $ERROR_ETIMEDOUT) {
+                $rc = 6;
+            } else {
+                die "Unhandled SOCKS5 close error '$err'";
+            }
+            $connection->write(pack("CCxCx6", 5, $rc, 1));
+        } else {
+            $connection->write(pack("CCx6", 0, 91));
+        }
+        # Make the error into a normal close
+        $err = "0";
+    }
+    $connection->SUPER::forward_close($err);
+}
+
+sub udp {
+    my ($connection) = @_;
+
+    my $parent_id = $connection->{parent_id};
+    my $id = $connection->{id};
+    my $line = $connection->{line};
+
+    my $socket = IO::Socket::INET->new(
+        PeerAddr => $connection->{server_host},
+        PeerPort => $connection->{server_port},
+        Proto    => "udp") || die $@;
+
+    my $local_addr = $socket->sockname || die "getsockname: $^E";
+    my ($local_port, $local_ip) = unpack_sockaddr_in($local_addr);
+    my $local_host = inet_ntoa($local_ip);
+
+    my $peer_addr = $socket->peername || die "getsockname: $^E";
+    my ($peer_port, $peer_ip) = unpack_sockaddr_in($peer_addr);
+    my $peer_host = inet_ntoa($peer_ip);
+
+    my $udp_connection = bless {
+        ctrl_connection	=> $connection,
+        parent_id	=> $parent_id,
+        id		=> $id,
+        description	=> "$local_host:$local_port -> $peer_host:$peer_port",
+
+        socket		=> $socket,
+        local_port	=> $local_port,
+        local_host	=> $local_host,
+        local_ip	=> $local_ip,
+
+        peer_addr	=> $peer_addr,
+        peer_port	=> $peer_port,
+        peer_ip		=> $peer_ip,
+        peer_host	=> $peer_host,
+
+        remote		=> 1,
+        associated	=> 0,
+        suspended	=> 1,
+
+        dropped_in	=> 0,
+        dropped_out	=> 0,
+        out		=> [],
+        pending		=> [],
+    }, "Connection::Listener::SOCKS::UDP";
+    weaken($udp_connection->{line} = $line);
+    weaken($connection->{udp_connection} = $udp_connection);
+    $line->{connections}{"$parent_id:$id"} = $udp_connection;
+    bless $connection, "Connection::Listener::SOCKS::Ctrl";
+    $connection->write(pack("CCxCa4n", 5, 0, 1, $local_ip, $local_port));
+    $udp_connection->unsuspend if !$line->{suspended};
+
+    return $udp_connection;
+}
+
+package Connection::Listener::SOCKS::Ctrl;
+use base qw(TCP Connection::Listener::SOCKS);
+
+sub maybe_free {
+    my $connection = shift;
+
+    # Fetch early because maybe_free can remove the last strong reference
+    my $udp_connection = $connection->{udp_connection};
+
+    $connection->SUPER::maybe_free(@_);
+
+    $udp_connection->{free} if $connection->{freed};
+}
+
+package Connection::Listener::SOCKS::UDP;
+use Socket qw(unpack_sockaddr_in inet_ntoa);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+use base qw(UDP Connection);
+
+sub unsuspend {
+    my ($connection, $temporary) = @_;
+
+    if (!--$connection->{suspended} && $connection->{socket}) {
+        $connection->{socket}->add_read(sub { $connection->udp_read });
+    }
+}
+
+sub udp_read {
+    my ($connection) = @_;
+
+    my $sender = $connection->{socket}->recv(my $in, $BLOCK_SIZE);
+    if (!defined $sender) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Error from recv: $^E";
+    }
+    $in ne "" || die "Zero length UDP recv";
+    $sender ne "" || die "System cannot get UDP peer";
+    my ($peer_port, $peer_ip) = unpack_sockaddr_in($sender);
+    $connection->info("UDP received %d bytes from %s:%d on %s: '%s'",
+                      length($in), inet_ntoa($peer_ip), $peer_port,
+                      $connection->{description}, ::display($in)) if $debug;
+    # Drop packets from strange sources
+    return if $connection->{peer_ip} ne $peer_ip;
+    return if $connection->{peer_port} && $connection->{peer_port} != $peer_port;
+    # Sanity check on header
+    return if length $in < 8;
+    my ($rsv, $frag, $atyp, $len) = unpack("nCCC", $in);
+    $rsv == 0 && $frag == 0 || return;
+    substr($in, 0, 3, "");
+    if ($atyp == 1) {
+        return if length $in < 8;
+    } elsif ($atyp == 3) {
+        return if length $in < 5+$len;
+    } elsif ($atyp == 4) {
+        return if length $in < 20;
+    } else {
+        return;
+    }
+
+    my $line = $connection->{line} || die "No line";
+    @{$connection->{pending}} || push @{$line->{pending}}, $connection;
+    push @{$connection->{pending}}, "";
+    LineProtocol::line_message(
+        $connection->{pending}[-1],
+        $TCP_DATA,
+        pack("ww", $connection->{parent_id}, $connection->{id}),
+        $in);
+    $line->{pending_length} += length $connection->{pending}[-1];
+    $line->write();
+}
+
+sub write {
+    my $connection = shift;
+
+    $connection->{socket}->add_write(sub { $connection->server_send }) if
+        !@{$connection->{out}};
+    push @{$connection->{out}}, "\x00\x00\x00" . shift;
+}
+
+sub server_send {
+    my ($connection) = @_;
+
+    $connection->info("%s: send '%s'",
+                      $connection->{description},
+                      ::display($connection->{out}[0])) if $debug;
+    my $rc = $connection->{socket}->send(
+        $connection->{out}[0], 0, $connection->{peer_addr});
+    if (!defined $rc) {
+        return 1 if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Unexpected UDP4 send error: $^E";
+    }
+    shift @{$connection->{out}};
+    if (@{$connection->{out}}) {
+        return 1;
+    } else {
+        $connection->{socket}->delete_write;
+        return 0;
+    }
+}
+
+sub line_write {
+    my ($connection, $wanted) = @_;
+
+    length $connection->{pending}[0] ||
+        die "Assertion: Bad pending $connection";
+    my $line = $connection->{line} || die "No line";
+    $line->{out} .= shift @{$connection->{pending}};
+    push @{$line->{pending}}, $connection if @{$connection->{pending}};
+}
+
+sub free {
+    my ($connection) = @_;
+
+    die "Double free" if $connection->{freed};
+    $connection->suspend;
+    $connection->{socket}->delete_write if
+        $connection->{socket} && @{$connection->{out}};
+    $connection->{freed} = 1;
+}
+
+package Connection::Listener::Forward::SOCKS;
+use Scalar::Util qw(weaken);
+use Socket qw(unpack_sockaddr_in inet_ntoa);
+use Carp;
+
+use base qw(TCP Connection);
+
+sub new {
+    my ($class, $line, $parent_id, $id, $client_host, $client_port, $server_ip) = @_;
+
+    croak "Assertion: Duplicate connection id $parent_id:$id" if
+        $line->{connections}{"$parent_id:$id"};
+
+    my $socket = Listener::TCP->socket($client_host, $client_port);
+    my $client_addr = $socket->sockname || die "getsockname: $^E";
+    ($client_port, my $client_ip) = unpack_sockaddr_in($client_addr);
+    $client_host = inet_ntoa($client_ip);
+
+    binmode($socket);
+
+    my $connection = $line->{connections}{"$parent_id:$id"} = bless {
+        parent_id	=> $parent_id,
+        id		=> $id,
+        description	=> "$client_host:$client_port",
+        socket		=> $socket,
+        client_port	=> $client_port,
+        client_host	=> $client_host,
+        client_ip	=> $client_ip,
+        server_ip	=> $server_ip,
+
+        remote		=> 1,
+        associated	=> 0,	# No corresponding object at the other side
+
+        dropped_in	=> 0,
+        dropped_out	=> 0,
+        out		=> "",
+        pending		=> "",	# Pending bytes
+        pending_close	=> "",  # EOF or error
+        suspended	=> 1,
+    }, $class;
+    weaken($connection->{line} = $line);
+    $connection->unsuspend if !$line->{suspended};
+    return $connection;
+}
+
+sub suspend {
+    my ($connection) = @_;
+
+    if (!$connection->{suspended}++ &&
+        $connection->{socket}) {
+        $connection->{socket}->delete_read;
+    }
+}
+
+sub unsuspend {
+    my ($connection) = @_;
+
+    if (!--$connection->{suspended} && $connection->{socket}) {
+        $connection->{socket}->add_read(
+            $connection->{local_ip} ?
+                sub { $connection->tcp_reader } :
+                sub { $connection->accept });
+    }
+}
+
+sub accept : method {
+    my ($connection) = @_;
+
+    my ($socket, $peer_addr) = $connection->{socket}->accept or return undef;
+
+    ($connection->{peer_port}, $connection->{peer_ip}) =
+        unpack_sockaddr_in($peer_addr);
+    $connection->{peer_host} = inet_ntoa($connection->{peer_ip});
+    $connection->{local_addr} = $socket->sockname || die "getsockname: $^E";
+    ($connection->{local_port}, $connection->{local_ip}) =
+        unpack_sockaddr_in($connection->{local_addr});
+    $connection->{description} = sprintf(
+        "%s:%d -> %s:%d",
+        $connection->{peer_host}, $connection->{peer_port},
+        inet_ntoa($connection->{local_ip}), $connection->{local_port});
+
+    print STDERR "\n" if $verbose;
+    $connection->info("accepted %s (%d on %d)", $connection->{description},
+                      fileno($connection->{socket}), fileno($socket)) if
+                          $verbose;
+
+    # Since we got here $connection cannot already be suspended
+    $connection->suspend;
+    $connection->{socket} = $socket;
+    $connection->unsuspend;
+
+    $connection->{associated} = 1;
+    $connection->{read_action}	= "action_line_write";
+
+    my $err = "";
+    if ($connection->{server_ip} eq $connection->{peer_ip}) {
+        $connection->{line}->write($SOCKS_ASSOCIATED,
+                     pack("wwna4",
+                          $connection->{parent_id}, $connection->{id},
+                          $connection->{peer_port}, $connection->{peer_ip}));
+    } else {
+        $connection->{line}->write($SOCKS_ASSOCIATED,
+                     pack("wwna4a",
+                      $connection->{parent_id}, $connection->{id},
+                      $connection->{peer_port}, $connection->{peer_ip}, 1));
+        my $server_host = inet_ntoa($connection->{server_ip});
+        $connection->rst;
+        $connection->close("accept", "Connect from $connection->{peer_host}, expected $server_host");
+    }
+}
+
+package Listener;
+# Represents the local side of a forwarding waiting for incoming connections
+use Scalar::Util qw(weaken);
+use Carp;
+use Socket qw(unpack_sockaddr_in inet_ntoa);
+
+use base qw(Ids);
+
+sub new {
+    my ($class, $line, $id, $client_host, $client_port) = @_;
+
+    $id ||= $line->id_alloc;
+    croak "Assertion: Duplicate listener id $id" if $line->{listeners}{$id};
+
+    my $socket = $class->socket($client_host, $client_port);
+    my $client_addr = $socket->sockname || die "getsockname: $^E";
+    ($client_port, my $client_ip) = unpack_sockaddr_in($client_addr);
+    $client_host = inet_ntoa($client_ip);
+
+    binmode($socket);
+
+    my $listener = $line->{listeners}{$id} = bless {
+        id		=> $id,
+        socket		=> $socket,
+        client_port	=> $client_port,
+        client_host	=> $client_host,
+        client_ip	=> $client_ip,
+        out		=> [],
+        pending		=> [],
+        suspended	=> 1,
+    }, $class;
+    weaken($listener->{line} = $line);
+    $listener->id_init();
+    $listener->init();
+    $listener->unsuspend if !$line->{suspended};
+    return $listener;
+}
+
+sub init {
+}
+
+sub id {
+    return shift->{id};
+}
+
+sub suspend {
+    my ($listener) = @_;
+
+    $listener->{suspended}++ || $listener->{socket}->delete_read;
+}
+
+package Listener::TCP;
+use base qw(TCP Listener);
+
+sub socket : method {
+    my ($class, $client_host, $client_port) = @_;
+
+    return IO::Socket::INET->new(
+        Blocking	=> 0,
+        Proto		=> "tcp",
+        LocalHost	=> $client_host,
+        LocalPort	=> $client_port,
+        Listen		=> $LISTEN_BACKLOG,
+        ReuseAddr	=> 1) || die $@;
+}
+
+sub unsuspend {
+    my ($tcp_listener) = @_;
+
+    my $class = sprintf("Connection::%s", ref($tcp_listener));
+    --$tcp_listener->{suspended} || $tcp_listener->{socket}->add_read( sub {
+        my $connection = $class->accept($tcp_listener);
+        $connection->unsuspend if !$tcp_listener->{line}{suspended};
+    });
+}
+
+sub announce {
+    my ($tcp_listener, $server_host, $server_port) = @_;
+
+    $tcp_listener->{line}->write($TCP_LOCAL, pack("wna*", $tcp_listener->{id},
+                                                  $server_port, $server_host));
+}
+
+package Listener::SOCKS;
+use base qw(Listener::TCP);
+
+sub proto {
+    return "SOCKS";
+}
+
+sub announce {
+}
+
+package Listener::UDP;
+use Socket qw(IPPROTO_IP inet_aton pack_sockaddr_in);
+use base qw(UDP Listener);
+
+sub init {
+    my ($udp_listener) = @_;
+
+    if  ($udp_listener->{client_host} eq "0.0.0.0") {
+        die $msghdr_error if $msghdr_error;
+        setsockopt($udp_listener->{socket}, IPPROTO_IP, $IP_PKTINFO, 1) ||
+            die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
+    }
+}
+
+sub socket : method {
+    my ($class, $client_host, $client_port) = @_;
+
+    my $socket = IO::Socket::INET->new(
+        Blocking	=> 0,
+        Proto		=> "udp",
+        # In case perl bug [106370] gets solved
+        # LocalHost	=> $client_host,
+        # LocalPort	=> $client_port,
+        ReuseAddr	=> 1) || die $@;
+    # perl bug [106370]: IO::Socket::INET does not bind UDP
+    # sockets to ephemeral ports. So we do the bind
+    my $client_ip = inet_aton($client_host) ||
+        die "Could not resolve $client_host";
+    $socket->bind(pack_sockaddr_in($client_port, $client_ip)) ||
+        die "bind: $^E";
+}
+
+sub announce {
+    my ($udp_listener, $server_host, $server_port) = @_;
+
+    $udp_listener->{line}->write(
+        $UDP_LOCAL,
+        pack("wna4na*", $udp_listener->{id},
+             $udp_listener->{client_port}, $udp_listener->{client_ip},
+             $server_port, $server_host));
+}
+
+sub header {
+    my ($listener_udp, $peer_ip, $peer_port) = @_;
+
+    return $UDP4, pack("Na4n", $listener_udp->{id}, $peer_ip, $peer_port);
+}
+
+package ToUdp;
+# Represents a temporary UDP socket at the remote side
+use Socket qw(pack_sockaddr_in unpack_sockaddr_in inet_ntoa);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+use Scalar::Util qw(weaken);
+
+sub check_hash {
+    my ($line) = @_;
+    my (undef, $filename, $line_nr) = caller(0);
+    ::info("check_hash $filename, $line_nr");
+    while (my ($peer_port, $dest) = each %{$line->{dest}}) {
+        my $peer = substr($peer_port, 0, 4, "");
+        while (my ($source, $nr) = each %$dest) {
+            defined $line->{to_udp}{$nr} || die "Check: udp $nr does not exist";
+            my $s = $line->{to_udp}{$nr}{source}{$peer . $peer_port};
+            defined $s || die "Check: Missing source";
+            $s->[0] eq $source || die "Check: Inconsistent source";
+        }
+    }
+    while (my ($nr, $udp) = each %{$line->{to_udp}}) {
+        if (!$udp) {
+            print STDERR "No socket[$nr]\n";
+            next;
+        }
+        my $s = $udp->{source};
+        while (my ($peer_port, $source) = each %$s) {
+            my $peer = substr($peer_port, 0, 4, "");
+            my $dest = $line->{dest}{$peer . $peer_port} ||
+                die "Check: No dest";
+            my $n = $dest->{$source->[0]};
+            defined $n || die "No nr";
+            $n == $nr || die "Unexpected nr";
+            my ($id, $origin, $origin_port, $client_ip) =
+                unpack("Na4na4", $source->[0]);
+            printf(STDERR "    %d: %s:%d <- %d %s:%d:%s\n", $nr,
+                   inet_ntoa($peer), $peer_port,
+                   $id, inet_ntoa($origin), $origin_port, inet_ntoa($client_ip || "\0\0\0\0"));
+        }
+    }
+}
+
+sub server_recv {
+    my ($to_udp) = @_;
+
+    # check_hash($line);
+    my $addr = $to_udp->{socket}->recv(my $in, $BLOCK_SIZE);
+    if (!defined $addr) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Unexpected UDP4 send error: $^E";
+    }
+    die "Could not determine peer address" if $addr eq "";
+    my ($peer_port, $peer) = unpack_sockaddr_in($addr);
+    my $nr = $to_udp->{nr};
+    ::info("receive %d: %s:%d -> 0.0.0.0:%d: '%s'", $nr,
+           inet_ntoa($peer), $peer_port, $to_udp->{local_port},
+           ::display($in)) if $debug;
+    my $source = $to_udp->{source}{$peer . $peer_port};
+    if (!$source) {
+        ::info("Dropping UDP packet from unexpected peer %s:%d",
+               inet_ntoa($peer), $peer_port);
+        return;
+    }
+    $source->[1] = undef;
+    my $line = $to_udp->{line} || die "No line";
+    $source->[1] =
+        Timer->new($TIMEOUT, sub { cleanup($line, $nr, $peer, $peer_port) });
+
+    my ($id, $origin, $origin_port, $client_ip) =
+        unpack("Na4na4", $source->[0]);
+
+    if ($debug) {
+        my $forward = $line->{forwards}{$id} || die "Unknown forward $id";
+        my $client_port = $forward->{client_port};
+        ::info("selection %d: Got source %s:%d:%d", $nr,
+               inet_ntoa($origin), $origin_port, $client_port);
+    }
+    LineProtocol::line_message(my $out = "", length $source->[0] == 14 ? $VDP4_BACK : $UDP4_BACK, $source->[0], $in);
+    push @{$line->{pending}}, $to_udp if !@{$to_udp->{pending}};
+    $line->{pending_length} += length $out;
+    push @{$to_udp->{pending}}, $out;
+    $line->write();
+}
+
+sub server_send {
+    my ($udp) = @_;
+
+    my $out = $udp->{out}[0];
+    my $peer      = $out->[0];
+    my $peer_port = $out->[1];
+    my $to = pack_sockaddr_in($peer_port, $peer);
+    my $nr = $udp->{nr};
+    ::info("send %d -> %s:%d '%s'", $nr,
+           inet_ntoa($peer), $peer_port, ::display($out->[2])) if $debug;
+    my $rc = $udp->{socket}->send($out->[2], 0, $to);
+    if (!defined $rc) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Unexpected UDP4 send error: $^E";
+    }
+    shift @{$udp->{out}};
+    if (@{$udp->{out}} == 0) {
+        # check_hash($line);
+        $udp->{socket}->delete_write;
+        my $source = $udp->{source}{$peer . $peer_port} || die "No source";
+        delete $source->[1];
+        my $line = $udp->{line} || die "No line";
+        $source->[1] =
+            Timer->new($TIMEOUT, sub { cleanup($line, $nr, $peer, $peer_port) });
+    }
+
+    die "Zero write. Is this even possible ?" if $rc == 0;
+    $rc == length $out->[2] || die "Short send";
+}
+
+sub get {
+    my ($class, $line, $peer, $peer_port, $source) = @_;
+
+    # check_hash($line);
+
+    my $dest = $line->{dest}{$peer.$peer_port} ||= {};
+    my $nr = $dest->{$source};
+    return $line->{to_udp}{$nr} || die "No UDP4 nr $nr" if defined $nr;
+
+    # loop guaranteed to find at least one free number
+    for my $i (0..keys %{$line->{to_udp}}) {
+        if (!$line->{to_udp}{$i}) {
+            $nr = $i if !defined $nr;
+        } elsif (!$line->{to_udp}{$i}{source}{$peer . $peer_port}) {
+            $nr = $i;
+            last;
+        }
+    }
+    my $udp = $line->{to_udp}{$nr};
+    if (!$udp) {
+        ::info("creating socket %d", $nr) if $debug;
+        my $socket = IO::Socket::INET->new(
+            Blocking	=> 0,
+            Proto		=> "udp",
+            # In case perl bug [106370] gets solved
+            # LocalPort	=> 0,
+            ) || die $@;
+        # perl bug [106370]: IO::Socket::INET does not bind UDP
+        # sockets to ephemeral ports. So we do the bind
+        $socket->bind(pack_sockaddr_in(0, "\0\0\0\0")) || die "bind: $^E";
+        my $local_addr = $socket->sockname || die "getsockname: $^E";
+        my ($local_port, $local_ip) = unpack_sockaddr_in($local_addr);
+
+        binmode($socket);
+        $udp = $line->{to_udp}{$nr} = bless {
+            nr			=> $nr,
+            socket		=> $socket,
+            local_port		=> $local_port,
+            out     		=> [],
+            pending		=> [],
+            source		=> {},
+        }, $class;
+        weaken($udp->{line} = $line);
+        $socket->add_read(sub { $udp->server_recv });
+    }
+    $dest->{$source} = $nr;
+    my ($id, $origin, $origin_port, $client_ip) =
+        unpack("Na4na4", $source);
+    ::info("select %d: Set source %s:%d <- %s:%d", $nr,
+           inet_ntoa($peer), $peer_port, inet_ntoa($origin), $origin_port) if
+               $debug;
+    $udp->{source}{$peer . $peer_port} = [$source];
+    # check_hash($line);
+
+    return $udp;
+}
+
+sub cleanup {
+    my ($line, $nr, $peer, $peer_port) = @_;
+
+    # check_hash($line);
+    my $to_udp = $line->{to_udp}{$nr} || die "No udp nr $nr";
+    my $source = delete $to_udp->{source}{$peer . $peer_port} ||
+        die "No source for $peer, $peer_port";
+    if (!%{$to_udp->{source}}) {
+        # Socket not in use anymore
+        ::info("cleaning up socket[$nr]") if $debug;
+        $to_udp->{socket}->delete_read;
+        $to_udp->{socket}->delete_write if @{$to_udp->{out}};
+        delete $line->{to_udp}{$nr};
+    }
+    delete $line->{dest}{$peer.$peer_port}{$source->[0]};
+    delete $line->{dest}{$peer.$peer_port} if !%{$line->{dest}{$peer.$peer_port}};
+    if ($debug) {
+        my ($id, $origin, $origin_port, $client_ip) =
+            unpack("Na4na4", $source->[0]);
+        my $forward = $line->{forwards}{$id} || "Unknown forward $id";
+        my $client_port = $forward->{client_port};
+
+        ::info("cleaning up mapping[%d] %s:%d:%d -> %s:%d", $nr,
+             inet_ntoa($origin), $origin_port, $client_port, inet_ntoa($peer), $peer_port);
+    }
+    # check_hash($line);
+}
+
+sub line_write {
+    my ($to_udp, $wanted) = @_;
+
+    length $to_udp->{pending}[0] || die "Assertion: Bad pending $to_udp";
+    my $line = $to_udp->{line} || die "No line";
+    $line->{out} .= shift @{$to_udp->{pending}};
+    push @{$line->{pending}}, $to_udp if @{$to_udp->{pending}};
+}
+
+package LineProtocol;
+# Represents the communication protocol between the local and remote side
+use Socket qw(inet_aton inet_ntoa);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+use Scalar::Util qw(weaken);
+use FindBin qw($Script);
+use Carp;
+
+use base qw(Ids);
+
+my %process = (
+    $UDP_LOCAL		=> \&process_UDP_LOCAL,
+    $TCP_LOCAL		=> \&process_TCP_LOCAL,
+    $UDP_REMOTE		=> \&process_UDP_REMOTE,
+    $TCP_REMOTE		=> \&process_TCP_REMOTE,
+    $SOCKS_REMOTE	=> \&process_SOCKS_REMOTE,
+    $BIND_REMOTE	=> \&process_BIND_REMOTE,
+    $TCP_CONNECT	=> \&process_TCP_CONNECT,
+    $TCP_EOF		=> \&process_TCP_EOF,
+    $TCP_CLOSE		=> \&process_TCP_CLOSE,
+    $TCP_DATA		=> \&process_TCP_DATA,
+    $TCP_FULL		=> \&process_TCP_FULL,
+    $UDP_FULL		=> \&process_UDP_FULL,
+    $UDP4		=> \&process_UDP4,
+    $VDP4		=> \&process_UDP4,
+    $UDP4_BACK		=> \&process_UDP4_BACK,
+    $VDP4_BACK		=> \&process_UDP4_BACK,
+    $UDP6		=> \&process_UDP6,
+    $VDP6		=> \&process_VDP6,
+    $TCP4		=> \&process_TCP4,
+    $TCP6		=> \&process_TCP6,
+    $SOCKS_UDP		=> \&process_SOCKS_UDP,
+    $SOCKS_CONNECT	=> \&process_SOCKS_CONNECT,
+    $SOCKS_CONNECT_NAMED=> \&process_SOCKS_CONNECT_NAMED,
+    $SOCKS_BIND		=> \&process_SOCKS_BIND,
+    $SOCKS_BIND_NAMED	=> \&process_SOCKS_BIND_NAMED,
+    $SOCKS_ASSOCIATED	=> \&process_SOCKS_ASSOCIATED,
+    $SOCKS_FAILED	=> \&process_SOCKS_FAILED,
+    $KEEP		=> \&process_KEEP,
+    $INFO		=> \&process_INFO,
+    $SET		=> \&process_SET,
+    $START		=> \&process_START,
+    # $GREETING		=> \&process_GREETING,
+);
+
+sub new {
+    my ($class, $socket_in, $socket_out) = @_;
+
+    binmode($socket_in);
+    binmode($socket_out);
+
+    $socket_in ->blocking(0);
+    $socket_out->blocking(0);
+
+    my $line = bless {
+        socket_in	=> $socket_in,
+        socket_out	=> $socket_out,
+        in		=> "",	# input buffer
+        commands	=> [],	# read and parsed
+        out		=> "",	# output buffer
+        out_sent	=> 0,	# from here the output buffer has not been sent
+        markers		=> [],	# list of markers in the output buffer
+        saved_frames	=> {},	# frames sent but not yet acknowledged
+        saved_bytes	=> 0,	# Number of bytes in saved_frames
+        ack_position    => -1,  # position of first ack in output buffer
+        pending_length	=> 0,	# Nr bytes to be output, including not buffered
+        pending		=> [],	# queue of objects with unbuffered data
+        suspended	=> 1,	# Are reads from incomin sockets suspended ?
+        marker_in	=> "A",	# last marker seen on input
+        marker_out	=> "A",	# last marker sent on output
+        marker_acked	=> "A", # Last acknowledged marker
+        forwards	=> {},	# List of forwards on the forwarded side
+        connections	=> {},	# Established TCP forwards (both sides)
+        listeners	=> {},	# Listening sockets TCP/UDP (forwarding side)
+        to_udp		=> {},	# ephemeral UDP sockets (forwarded side)
+        dest		=> {},	# Mapping destinations/sources to to_udp
+        keepalive	=> undef,	# keepalive timer
+        started		=> undef,	# Normal operations started
+        utime_offset	=> 0,	# Estimated round trip time in microsecond
+    }, $class;
+    $line->id_init;
+
+    $socket_in->add_read(sub { $line->read });
+    $line->{keepalive} = Timer->new($KEEPALIVE, sub { $line->keepalive } );
+
+    return $line;
+}
+
+sub suspend {
+    my ($line) = @_;
+
+    ::info("Too much incoming traffic ($line->{pending_length} buffered). Suspending reads") if $verbose;
+    croak "Cannot suspend while already suspended" if $line->{suspended};
+
+    $line->{suspended} = 1;
+    for my $connection (values %{$line->{connections}}) {
+        $connection->suspend(1);
+    }
+    for my $listener (values %{$line->{listeners}}) {
+        $listener->suspend(1);
+    }
+}
+
+sub unsuspend {
+    my ($line) = @_;
+
+    croak "Cannot unsuspend while not suspended" if !$line->{suspended};
+    return if !$line->{started};
+    ::info("Buffer space avaialable ($line->{pending_length} buffered). Unuspending reads") if $verbose;
+
+    $line->{suspended} = 0;
+    for my $connection (values %{$line->{connections}}) {
+        $connection->unsuspend(1);
+    }
+    for my $listener (values %{$line->{listeners}}) {
+        $listener->unsuspend(1);
+    }
+}
+
+sub ack {
+    my ($line) = @_;
+
+    if ($line->{ack_position} >= $line->{out_sent}) {
+        # Try to fixup the old ack
+        my $marker = substr($line->{out}, $line->{ack_position}, length($line->{marker_in})+1);
+        my ($m) = $marker =~ /^(\S+) / or die "Unexpected old marker '$marker'";
+        if (length $m == length $line->{marker_in}) {
+            # ::info("Replacing ack $m by $line->{marker_in}") if $debug;
+            substr($line->{out}, $line->{ack_position}, length($line->{marker_in})) = $line->{marker_in};
+            return;
+        }
+    }
+    # The previous ack can't be reused. Send a new one
+    $line->keepalive;
+}
+
+sub mark {
+    my ($line) = @_;
+
+    my $last_marker = @{$line->{markers}} && $line->{markers}[-1][1];
+    if (length($line->{out}) - $last_marker >= $MARKER_BLOCK) {
+        # Marker
+        $line->{out} .= "\1";
+        ++$line->{pending_length};
+        ++$line->{marker_out};
+        ::info("Set marker $line->{marker_out}") if $debug;
+        push @{$line->{markers}}, [$line->{marker_out}, length($line->{out})];
+    }
+}
+
+sub line_writer {
+    my ($line) = @_;
+
+    while (1) {
+        while (length($line->{out}) - $line->{out_sent} < $LINE_BLOCK_SIZE-1) {
+            my $pending = shift @{$line->{pending}} || last;
+            $pending->line_write($LINE_BLOCK_SIZE);
+            $line->mark;
+        }
+        if (length($line->{out}) <= $line->{out_sent}) {
+            die "Short out" if length($line->{out}) < $line->{out_sent};
+            die "Empty out";
+        }
+        die "Long out" if length($line->{out}) - $line->{out_sent} > $line->{pending_length};
+
+        my $end_marker = @{$line->{markers}} && $line->{markers}[-1][1] == length($line->{out}) ? 1 : 0;
+        $line->{out} .= "\1" if !$end_marker;
+        my $rc = $line->{socket_out}->syswrite($line->{out}, $BLOCK_SIZE, $line->{out_sent});
+        if (!defined $rc) {
+            substr($line->{out}, -1, 1, "") if !$end_marker;
+            return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+            die "Could not write to client: $^E"
+        }
+        die "Zero write. Is this even possible ?" if $rc == 0;
+        #if ($rc > $LINE_BLOCK_SIZE) {
+        #    ::info("Increase LINE_BLOCK_SIZE from %d to %d",
+        #         $LINE_BLOCK_SIZE, $rc)  if $debug;
+        #    $LINE_BLOCK_SIZE = $rc;
+        #}
+        $line->{pending_length} -= $rc;
+        $line->{out_sent} += $rc;
+        if (!$end_marker) {
+            if ($line->{out_sent} >= length($line->{out}) -1 ) {
+                ++$line->{marker_out};
+                ++$line->{pending_length};
+                push @{$line->{markers}}, [$line->{marker_out}, $line->{out_sent}];
+                # ::info("Force marker $line->{marker_out}") if $debug;
+            } else {
+                substr($line->{out}, -1, 1, "");
+            }
+        }
+        ::info("wrote %d bytes to %s (%d left): %s",
+             $rc, $role_peer, $line->{pending_length}, ::display(substr($line->{out}, -$rc))) if
+                 $debug;
+        my $shifted = 0;
+        my $dropped = 0;
+        for my $marker (@{$line->{markers}}) {
+            $marker->[1] -= $shifted;
+            if ($marker->[1] <= $line->{out_sent}) {
+                my $length = $marker->[1];
+                $line->{saved_frames}{$marker->[0]} = substr($line->{out}, 0, $length, "");
+                $line->{saved_bytes}	+= $length;
+                $shifted	+= $length;
+                $line->{out_sent}	-= $length;
+                $line->{ack_position}	-= $length;
+                ++$dropped;
+                #::info("Save frame[%d] %s: %d bytes, %d saved, %d left, %d unsent",
+                #     $dropped, $marker->[0], $length, $line->{saved_bytes},
+                #     length($line->{out}), length($line->{out}) - $line->{out_sent}) if $debug;
+            }
+        }
+        splice(@{$line->{markers}}, 0, $dropped);
+
+        $line->unsuspend if $line->{pending_length} <= $LOW_WATER && $line->{suspended};
+        if ($line->{pending_length} <= 0) {
+            die "Unexpected non empty out" if $line->{out} ne "";
+            die "Unexpected negative pending_length" if $line->{pending_length} < 0;
+            $line->{keepalive} =
+                Timer->new($KEEPALIVE, sub { $line->keepalive });
+            $line->{socket_out}->delete_write;
+            return;
+        }
+    }
+}
+
+sub line_message {
+    my $out   = \shift;
+    my $command = shift;
+
+    # One initial BER byte + proto = 2 bytes
+    my $length = 2;
+    $length += length for @_;
+    ++$length if $length >= 128;
+    ++$length if $length >= 128*128;
+    # Don't accept more than 3 BER bytes (~ 2**21 byte message)
+    croak "Message too long" if $length >= 128*128*128;
+
+    $$out .= pack("wa", $length, $command);
+    $$out .= $_ for @_;
+    # ::info("Constructed %s: %s", $command, unpack("H*", substr($$out, -$length)));
+    return $length;
+}
+
+sub write : method {
+    my $line = shift;
+
+    if ($line->{keepalive}) {
+        $line->{keepalive} = undef;
+        $line->{socket_out}->add_write( sub { $line->line_writer });
+    }
+    $line->{pending_length} += line_message($line->{out}, @_) if @_;
+    $line->mark;
+    if ($line->{pending_length} > $HIGH_WATER && !$line->{suspended}) {
+        # Try to pass the buck to the OS
+        $line->line_writer;
+        # The OS didn't fall for it. Reduce incoming traffic
+        $line->suspend if $line->{pending_length} > $HIGH_WATER && !$line->{suspended};
+    }
+}
+
+sub keepalive {
+    my ($line) = @_;
+
+    $line->{ack_position} = length $line->{out};
+    $line->write($KEEP, sprintf("%s %.0f %.0f",
+                                     $line->{marker_in},
+                                     (Timer->realtime() - $^T)*1e6,
+                                     $line->{utime_offset}));
+    if ($line->{ack_position} >= 0) {
+        my ($length, $command) = unpack("wa", substr($line->{out}, $line->{ack_position}, 4));
+        $command eq $KEEP || die "Unpexpected proto '$command'";
+        $line->{ack_position} += length pack("wa", $length, $command);
+        my $marker = substr($line->{out}, $line->{ack_position}, length($line->{marker_in})+1);
+        $marker eq "$line->{marker_in} " || die "Unexpected marker '$marker'";
+    }
+}
+
+sub read : method {
+    my ($line) = @_;
+
+    my $rc = $line->{socket_in}->sysread($line->{in}, $BLOCK_SIZE, length($line->{in}));
+    if (!defined $rc) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Could not read from $role_peer: $^E"
+    }
+    if ($rc == 0) {
+        ::info("exit") if $verbose;
+        exit 0;
+    }
+    ::info("read %d bytes from $role_peer: %s", $rc, ::display(substr($line->{in}, -$rc)))
+        if $debug;
+    while ($line->{in} =~ /^(\x01|[\x80-\xff]{0,2}[\x00-\x7f].)/s) {
+        my ($length, @frame) = unpack("waa", $1);
+        # ::info("%s: needs %d bytes, have %d bytes", $frame[0],
+        #     $length, length($line->{in})) if $debug;
+        last if length($line->{in}) < $length;
+        $frame[1] = substr($line->{in}, 0, $length, "");
+        # ::info("Read %s: %s", $frame[0], unpack("H*", $frame[1]));
+        substr($frame[1], 0, length $1, "");
+
+        if ($frame[0] eq $MARKER) {
+            ++$line->{marker_in};
+            # ::info("Got marker $line->{marker_in}") if $debug;
+            # Avoid acking pure acks
+            for my $frame (@{$line->{commands}}) {
+                if ($frame->[0] ne $KEEP) {
+                    $line->ack();
+                    last;
+                }
+            }
+            for my $frame (@{$line->{commands}}) {
+                ::info("Processing %s: '%s' (%d bytes)",
+                     $frame->[0], ::display($frame->[1]), length $frame->[1]) if
+                         $debug;
+                my $fun = $process{$frame->[0]} ||
+                    die "No handler for proto '$frame->[0]'";
+                $fun->($line, $frame->[1], $frame->[0]);
+            }
+            @{$line->{commands}} = ();
+        } else {
+            push @{$line->{commands}}, \@frame;
+        }
+
+    }
+}
+
+sub socks_bind {
+    my ($line, $parent_id, $id, $server_port, $server_ip) = @_;
+
+    # Notice that this doesn't actually send any packets, just binds the
+    # destination. This is enough to also set the source
+    my $socket = IO::Socket::INET->new(
+        PeerAddr => inet_ntoa($server_ip),
+        PeerPort => $server_port,
+        Proto    => "udp") || die $@;
+    my $local_addr = $socket->sockname || die "getsockname: $^E";
+    # UDP connect filling in the *local* part of the socket is not documented
+    # in any standard. And indeed it does not work on many old SVR4-derived
+    # kernels like Solaris 2.5. But it works on AIX, HP-UX 11, MacOS X, FreeBSD,
+    # Linux and Solaris 2.6 and later.
+    my $local_host = $socket->sockhost ||
+        die "Assertion: No local IP on connected UDP socket";
+
+    die "UDP connect local not supported" if $local_host eq "0.0.0.0";
+
+    my $connection = Connection::Listener::Forward::SOCKS->new(
+        $line, $parent_id, $id, $local_host, 0, $server_ip);
+    $line->write($SOCKS_ASSOCIATED,
+                 pack("wwna4",
+                      $parent_id, $id,
+                      $connection->{client_port}, $connection->{client_ip}));
+}
+
+sub process_TCP_DATA {
+    my $line  = shift;
+
+    my ($parent_id, $id) = unpack("ww", $_[0]);
+    substr($_[0], 0, length pack("ww", $parent_id, $id), "");
+    my $connection = $line->{connections}{"$parent_id:$id"} ||
+        die "Unknown connection $parent_id:$id";
+    die "Incoming data on closed connection" if
+        defined $connection->{closed_write};
+    $connection->write($_[0]);
+}
+
+sub process_UDP4 {
+    my $line  = shift;
+    my $command = pop;
+
+    my $source = substr($_[0], 0, $command eq $VDP4 ? 14 : 10, "");
+
+    my ($id, $origin, $origin_port, $client_ip) =
+        unpack("Na4na4", $source);
+
+    my $forward = $line->{forwards}{$id} || croak "Unknown forward $id";
+    my $client_port = $forward->{client_port};
+    my $peer = $forward->{server_host} eq "0.0.0.0" ?
+        $client_ip : $forward->{server_ip};
+    my $peer_port = $forward->{server_port};
+
+    my $udp = ToUdp->get($line, $peer, $peer_port, $source);
+    my $nr = $udp->{nr};
+    ::info("queues[%d] socket %d forward %d: 0.0.0.0:%d -> %s:%d: '%s'",
+         scalar @{$udp->{out}}, $nr, $id, $udp->{local_port},
+         inet_ntoa($peer), $peer_port,
+         ::display($_[0])) if $debug;
+    $udp->{socket}->add_write(sub { $udp->server_send }) if !@{$udp->{out}};
+    push @{$udp->{out}}, [$peer, $peer_port, $_[0]];
+}
+
+sub process_UDP4_BACK {
+    my $line  = shift;
+    my $command = pop;
+
+    my $source = substr($_[0], 0, $command eq $VDP4_BACK ? 14 : 10, "");
+    my ($id, $origin, $origin_port, $client_ip) =
+        unpack("Na4na4", $source);
+
+    my $listener_udp = $line->{listeners}{$id} ||
+        croak "Unknown UDP listener id $id";
+    $client_ip ||= $listener_udp->{client_ip};
+    ::info("queues[%d] %s:%d -> %s:%d '%s'",
+         scalar @{$listener_udp->{out}},
+         inet_ntoa($client_ip), $listener_udp->{client_port},
+         inet_ntoa($origin), $origin_port, ::display($_[0])) if $debug;
+    # Actual reply packet processing
+    $listener_udp->{socket}->add_write(sub { $listener_udp->client_send }) if
+        !@{$listener_udp->{out}};
+    push @{$listener_udp->{out}}, [$client_ip, $origin, $origin_port, $_[0]];
+}
+
+sub process_TCP_CONNECT {
+    my $line  = shift;
+
+    my ($parent_id, $id, $client_ip) = unpack("wwa4n", $_[0]);
+    ::info("TCP forward %d:%d: %s ->",
+         $parent_id, $id, inet_ntoa($client_ip)) if $debug;
+    my $forward = $line->{forwards}{$parent_id} ||
+        croak "Unknown forward $parent_id";
+    my $class = sprintf("Connection::%s", ref($forward));
+    $class->connect($line, $parent_id, $id, inet_ntoa($forward->{server_ip}),
+                    $forward->{server_port}, $client_ip);
+}
+
+sub process_TCP_EOF {
+    my $line  = shift;
+
+    my ($parent_id, $id) = unpack("ww", $_[0]);
+    my $tcp_connection =
+        $line->{connections}{"$parent_id:$id"} ||
+        # Can also be a temporary socks listener
+        $line->{listeners}{"$parent_id:$id"} ||
+        die "Unknown connection $parent_id:$id";
+    $tcp_connection->forward_eof;
+}
+
+sub process_TCP_CLOSE {
+    my $line  = shift;
+
+    my ($parent_id, $id, $err) = unpack("wwa*", $_[0]);
+    my $tcp_connection =
+        $line->{connections}{"$parent_id:$id"} ||
+        # Can also be a temporary socks listener
+        $line->{listeners}{"$parent_id:$id"} ||
+        die "Unknown connection $parent_id:$id";
+    $tcp_connection->forward_close($err);
+}
+
+sub process_SOCKS_UDP {
+    my $line    = shift;
+
+    my ($parent_id, $id) = unpack("ww", $_[0]);
+    ::info("SOCKS UDP associate %d:%d", $parent_id, $id) if $debug;
+    my $connection =
+        Connection::Forward::SOCKS::UDP->new($line, $parent_id, $id);
+    $line->write($SOCKS_ASSOCIATED,
+                 pack("wwna4",
+                      $parent_id, $id,
+                      $connection->{client_port}, $connection->{client_ip}));
+}
+
+sub process_SOCKS_CONNECT {
+    my $line    = shift;
+
+    my ($parent_id, $id, $server_port, $server_ip) = unpack("wwna4", $_[0]);
+    ::info("SOCKS TCP connect %d:%d: -> %s:%d",
+           $parent_id, $id, inet_ntoa($server_ip), $server_port) if $debug;
+    Connection::Forward::SOCKS->connect($line, $parent_id, $id, inet_ntoa($server_ip), $server_port);
+}
+
+sub process_SOCKS_CONNECT_NAMED {
+    my $line    = shift;
+
+    my ($parent_id, $id, $server_port, $server_host) = unpack("wwna*", $_[0]);
+    ::info("SOCKS TCP connect %d:%d: -> %s:%d",
+           $parent_id, $id, $server_host, $server_port) if $debug;
+    Connection::Forward::SOCKS->connect($line, $parent_id, $id, $server_host, $server_port);
+}
+
+sub process_SOCKS_BIND {
+    my $line    = shift;
+
+    my ($parent_id, $id, $server_port, $server_ip) = unpack("wwna4", $_[0]);
+    ::info("SOCKS TCP bind %d:%d: <- %s:%d",
+           $parent_id, $id, inet_ntoa($server_ip), $server_port) if $debug;
+    socks_bind($line, $parent_id, $id, $server_port, $server_ip);
+}
+
+sub process_SOCKS_BIND_NAMED {
+    my $line    = shift;
+
+    my ($parent_id, $id, $server_port, $server_host) = unpack("wwna*", $_[0]);
+    ::info("SOCKS TCP bind %d:%d: <- %s:%d",
+           $parent_id, $id, $server_host, $server_port) if $debug;
+    my $server_ip = inet_aton($server_host);
+    socks_bind($line, $parent_id, $id, $server_port, $server_ip);
+}
+
+sub process_SOCKS_ASSOCIATED {
+    my $line    = shift;
+
+    my ($parent_id, $id, $port, $ip, $err) = unpack("wwna4a*", $_[0]);
+    ::info("SOCKS REPLY associated %d:%d: %s:%d ->",
+           $parent_id, $id, inet_ntoa($ip), $port) if $verbose;
+
+    my $connection = $line->{connections}{"$parent_id:$id"} ||
+        die "Unknown connection $parent_id:$id";
+    $connection->{associated} == 1 || $connection->{associated} == 2 ||
+        die "Strange associatiod $connection->{associated}";
+    # Indicates that any errors from the remote we get now is a normal close,
+    ++$connection->{associated};
+    $connection->{socks_timer} = undef if $connection->{associated} == 3;
+
+    if ($connection->{command} == 3) {
+        $connection->udp($ip, $port);
+    } else {
+        my $reply = $connection->{socks} eq "5" ?
+            pack("CCxCa4n", 5, 0, 1, $ip, $port) :
+            pack("CCna4", 0, $err ? 91 : 90, $port, $ip);
+        $connection->write($reply);
+    }
+}
+
+sub process_KEEP {
+    my $line  = shift;
+
+    # Transit time is of course meaningless if the clocks aren't
+    # synchronized very well. offset tries to compensate for that
+
+    my ($ack, $utime, $uoffset) = split " ", $_[0];
+    until ($line->{marker_acked} eq $ack) {
+        ++$line->{marker_acked};
+        exists $line->{saved_frames}{$line->{marker_acked}} ||
+            die "Do not have frame $line->{marker_acked} saved -> $ack";
+        $line->{saved_bytes} -= length $line->{saved_frames}{$line->{marker_acked}};
+        delete $line->{saved_frames}{$line->{marker_acked}};
+    }
+
+    $line->{utime_offset} = (Timer->realtime() - $epoch)*1e6 -$utime || 1;
+    if ($uoffset) {
+        ::info("Keepalive ack=%s, saved bytes=%d, transit=%.3f ms, roundtrip=%.3f ms, offset=%.0f ms",
+             $ack,
+             $line->{saved_bytes},
+             $line->{utime_offset}/1e3,
+             ($line->{utime_offset}+$uoffset)/1e3,
+             ($line->{utime_offset}-$uoffset)/2e3) if $debug;
+    } else {
+        ::info("Keepalive ack=%s, saved bytes=%d, transit=%.3f ms",
+             $ack, $line->{saved_bytes}, $line->{utime_offset}/1e3) if $debug;
+    }
+}
+
+sub process_TCP_LOCAL {
+    my $line  = shift;
+
+    my %forward = (proto => "TCP");
+    weaken($forward{line} = $line);
+    @forward{qw(id server_port server_host)} =
+        unpack("wna*", $_[0]);
+    ::info("TCP forward %d: => %s:%d",
+         $forward{id}, $forward{server_host}, $forward{server_port}) if
+             $debug;
+    $forward{server_ip} = inet_aton($forward{server_host}) ||
+        die "Could not resolve '$forward{server_host}'";
+    die "Duplicate id $forward{id}" if exists $line->{forwards}{$forward{id}};
+    $line->{forwards}{$forward{id}} = bless \%forward, "Forward::TCP";
+}
+
+sub process_TCP_REMOTE {
+    my $line  = shift;
+
+    my ($id, $server_variable, $client_port, $client_host) =
+        unpack("wana*", $_[0]);
+    ::info("TCP reverse %d: <= %s:%d <-",
+         $id, $client_host, $client_port) if $debug;
+    my $listener = Listener::TCP->new($line, $id, $client_host, $client_port);
+    $listener->{server_variable} = $server_variable &&
+        inet_ntoa($listener->{client_ip}) eq "0.0.0.0";
+    # Send back resolved client_host  special id=0
+    $line->write($BIND_REMOTE, pack("wa4n", $id, $listener->{client_ip}, $listener->{client_port}));
+}
+
+sub process_UDP_LOCAL {
+    my $line  = shift;
+
+    my %forward = (proto	=> "UDP");
+    weaken($forward{line} = $line);
+    @forward{qw(id client_port client_ip server_port server_host)} =
+        unpack("wna4na*", $_[0]);
+    ::info("UDP forward %d: -> %s:%d => %s:%d",
+         $forward{id},
+         inet_ntoa($forward{client_ip}), $forward{client_port},
+         $forward{server_host}, $forward{server_port}) if $debug;
+    $forward{server_ip} = inet_aton($forward{server_host}) ||
+        die "Could not resolve '$forward{server_host}'";
+    die "Duplicate id $forward{id}" if exists $line->{forwards}{$forward{id}};
+    $line->{forwards}{$forward{id}} = bless \%forward, "Forward::UDP";
+}
+
+sub process_UDP_REMOTE {
+    my $line  = shift;
+
+    my ($id, $server_variable, $client_port, $client_host) =
+        unpack("wana*", $_[0]);
+    ::info("UDP reverse %d: <= %s:%d <-",
+         $id, $client_host, $client_port) if $debug;
+    my $listener = Listener::UDP->new($line, $id, $client_host, $client_port);
+    $listener->{server_variable} = $server_variable &&
+        inet_ntoa($listener->{client_ip}) eq "0.0.0.0";
+    # Send back resolved client_host  special id=0
+    $line->write($BIND_REMOTE, pack("wa4n", $id, $listener->{client_ip}, $listener->{client_port}));
+}
+
+sub process_SET {
+    my $line  = shift;
+
+    my $i = unpack("C", substr($_[0], 0, 1, ""));
+    my $name = $settings[$i] || die "Unknown variable $i";
+    ${$settings{$name}} = $_[0];
+    ::info("Set %s=%s", $settings[$i], $_[0]) if $debug;
+}
+
+sub process_BIND_REMOTE {
+    my $line  = shift;
+
+    my ($id, $client_ip, $client_port) =
+        unpack("wa4n", $_[0]);
+    # Special message in response to a TCP_REMOTE/UDP_REMOTE
+    $role eq "client" || die "$role should not need remote resolving";
+    my $forward = $line->{forwards}{$id} || die "Unknown forward $id";
+
+    my $client_host = inet_ntoa($client_ip);
+    ::info("Resolved remote bind %d: %s as %s",
+         $id, $forward->{client_host}, $client_host) if $debug;
+
+    if ($forward->{server_host} eq "0.0.0.0" &&
+            $client_host ne "0.0.0.0") {
+        $forward->{server_host} = $client_host;
+        $forward->{server_ip}   = $client_ip;
+    }
+    ::info("%s reverse %d: %s:%d <= %s:%d <-", $forward->proto, $id,
+         $forward->{server_host}, $forward->{server_port},
+         $forward->{client_host}, $client_port) if
+             $verbose || $forward->{client_port} == 0;
+    $forward->{client_ip}   = $client_ip;
+    $forward->{client_port} = $client_port;
+}
+
+sub process_SOCKS_REMOTE {
+    my $line  = shift;
+
+    my ($id, $client_port, $client_host) = unpack("wna*", $_[0]);
+
+    my $listener = Listener::SOCKS->new($line, $id, $client_host, $client_port);
+
+    ::info("SOCKS %d: -> %s:%d =>",
+           $listener->{id}, $listener->{client_host}, $listener->{client_port})
+        if $verbose || $client_port == 0;
+    $listener->announce;
+}
+
+sub process_START {
+    my $line  = shift;
+
+    defined $epoch || die "Lost early epoch message";
+
+    my $ready = "$Script $role $me\@$hostname ready (clock=$CLOCK_TYPE_NAME, pid=$$)";
+    $line->{started} = 1;
+    $line->unsuspend if
+        $line->{pending_length} <= $LOW_WATER && $line->{suspended};
+    if ($role eq "server") {
+        $line->write($START, $verbose ? $ready : "");
+    } else {
+        print STDERR "\n" if $verbose || $_[0];
+        ::server_info($_[0]) if $_[0];
+        ::info("$ready") if $verbose;
+        print STDERR "\n" if $verbose || $_[0];
+    }
+}
+
+sub set_global {
+    my ($line, $name, $value) = @_;
+    for my $i (0..$#settings) {
+        if ($settings[$i] eq $name) {
+            $line->write($SET, pack("C", $i), $value);
+            return;
+        }
+    }
+    croak "Unknown variable $name";
+}
+
+package main;
+use Scalar::Util qw(weaken);
+
+sub _info {
+    local ($!, $^E);
+    my $role = ucfirst(shift);
+    if (!@_) {
+        my (undef, $filename, $line) = caller(1);
+        @_ = ("$filename $line");
+    }
+    my $format = shift;
+    $format =~ s/\n?\z/\n/;
+    if (!@_) {
+        @_ = ($format);
+        $format = "%s";
+    }
+    my $time = Timer->realtime;
+    my $itime = int($time);
+    my ($sec, $min, $hour, $day, $mon, $year) = localtime($itime);
+    my $gtime = timegm($sec, $min, $hour, $day, $mon, $year);
+    my $offset = ($gtime - $itime) / 60;
+    my $sign = "+";
+    if ($offset < 0) {
+        $sign = "-";
+        $offset = -$offset;
+    }
+    my $hoffset = $offset / 60;
+    my $moffset = $offset % 60;
+    printf(STDERR "%04d-%02d-%02d %02d:%02d:%06.3f %s%02d%02d %s: $format",
+           $year+1900, $mon+1, $day, $hour, $min, $time-$itime+$sec,
+           $sign, $hoffset, $moffset,
+           $role, @_);
+}
+
+sub info {
+    _info($role, @_);
+}
+
+sub server_info {
+    _info($role_peer, @_);
+}
+
+sub caller_info {
+    my $format = shift;
+    my (@lines, $line, $i);
+    push @lines, $line while $line = (caller(++$i))[2];
+    if (@_) {
+        info("$format [line %s]", "@lines");
+    } else {
+        info("$format [line @lines]");
+    }
+}
+
+my %display = (
+    "\r"	=> '\r',
+    "\n"	=> '\n',
+    "\t"	=> '\t',
+    "\0"	=> '\0',
+    "\\"	=> '\\',
+    );
+sub display {
+    my ($data) = @_;
+
+    my $long = length $data > 30;
+    $data = substr($data, 0, 37) if $long;
+    # $data =~ s{([^\x20-\x7e])}{sprintf('\x%02x', ord $1)}eg;
+    my $hex = unpack("H*", $data);
+    $data =~ s{([^\x20-\x7e])}{$display{$1} || "."}eg;
+    $data .= " ($hex)";
+    $data .= " ..." if $long;
+    return $data;
+}
+
+sub parse_forward {
+    my ($line, $proto, $forward) = @_;
+
+    my ($client_host, $client_port, $server_host, $server_port) =
+        $forward =~ m{^
+                (?:
+                   (?:
+                      (?:
+                         ([^:]*):
+                      )?
+                      (\d*):
+                   )?
+                   ([^:]*):
+                )?
+                (\d+)$}x or
+                die "Could not parse $proto local forward specification '$forward'\n";
+
+    $client_host = $default_local_bind if !defined $client_host;
+    $client_host = "0.0.0.0" if $client_host eq "" || $client_host eq "*";
+    $client_port = $server_port if !defined $client_port || $client_port eq "";
+    0 < $server_port && $server_port < 65536 ||
+        die "Invalid server port $server_port\n";
+    0 <= $client_port && $client_port < 65536 ||
+        die "Invalid client port $client_port\n";
+
+    my $listener = $proto eq "TCP" ?
+        Listener::TCP->new($line, 0, $client_host, $client_port) :
+        Listener::UDP->new($line, 0, $client_host, $client_port);
+
+    $server_host = "0.0.0.0" if !defined $server_host || $server_host eq "";
+    $server_host = $listener->{client_host} if
+        $server_host eq "0.0.0.0" && $listener->{client_host} ne "0.0.0.0";
+    # Assertion: $server_host = 0.0.0.0 => $client_host = 0.0.0.0
+    #            sH           = 0.0.0.0 => cH           = 0.0.0.0
+    $listener->{server_variable} = $server_host eq "0.0.0.0";
+
+    info("%s forward %d: -> %s:%d => %s:%d",
+         $listener->proto, $listener->{id}, $listener->{client_host}, $listener->{client_port},
+         $server_host, $server_port) if $verbose || $client_port == 0;
+
+    $listener->announce($server_host, $server_port);
+}
+
+sub parse_remote {
+    my ($line, $proto, $remote) = @_;
+
+    my ($client_host, $client_port, $server_host, $server_port) =
+        $remote =~ m{^
+                (?:
+                   (?:
+                      (?:
+                         ([^:]*):
+                      )?
+                      (\d+):
+                   )?
+                   ([^:]*):
+                )?
+                (\d+)$}x or
+                die "Could not parse $proto remote forward specification '$remote'\n";
+
+    $client_host = $default_local_bind if !defined $client_host;
+    $client_host = "0.0.0.0" if $client_host eq "" || $client_host eq "*";
+    $client_port = $server_port if !defined $client_port || $client_port eq "";
+    0 < $server_port && $server_port < 65536 ||
+        die "Invalid server port $server_port\n";
+    0 <= $client_port && $client_port < 65536 ||
+        die "Invalid client port $client_port\n";
+
+    $server_host = "0.0.0.0" if !defined $server_host || $server_host eq "";
+    my $server_ip = inet_aton($server_host) ||
+        die "Could not resolve '$server_host'";
+
+    my $id = $line->id_alloc;
+    die "Duplicate id $id" if exists $line->{forwards}{$id};
+
+    my %forward = (
+        id		=> $id,
+        proto		=> $proto,
+        server_port	=> $server_port,
+        # server_host/server_ip are not yet fully resolved yet. They can be
+        # replaced later by BIND_REMOTE with the remote resolved $client_host.
+        # Only AFTER that replace will the assertion be true
+        # Assertion: $server_host = 0.0.0.0 => $client_host = 0.0.0.0
+        #            ch           = 0.0.0.0 => sh           = 0.0.0.0
+        server_host	=> $server_host,
+        server_ip	=> $server_ip,
+
+        # Purely for debug for TCP. Should not be used in normal operation
+        # Very much used for UDP
+        client_port	=> $client_port,
+        client_host	=> $client_host,
+        );
+    weaken($forward{line} = $line);
+
+    $line->{forwards}{$id} = bless \%forward, "Forward::$proto";
+
+    # $server_host eq "0.0.0.0" can still be changed by BIND_REMOTE
+    $line->write($proto eq "TCP" ? $TCP_REMOTE : $UDP_REMOTE,
+                      pack("wana*", $id, $server_host eq "0.0.0.0" ? 1 : 0,
+                           $client_port, $client_host));
+}
+
+sub parse_socks_forward {
+    my ($line, $socks) = @_;
+
+    my ($client_host, $client_port) =
+        $socks =~ m{
+            ^
+            (?:([^:]*):)?
+            (\d*)
+            $
+        }x or
+        die "Could not parse socks forward specification '$socks'\n";
+
+    $client_host = $default_local_bind if !defined $client_host;
+    $client_host = "0.0.0.0" if $client_host eq "" || $client_host eq "*";
+    $client_port = 1080 if $client_port eq "";
+
+    my $listener = Listener::SOCKS->new($line, 0, $client_host, $client_port);
+
+    info("SOCKS %d: -> %s:%d =>",
+         $listener->{id}, $listener->{client_host}, $listener->{client_port}) if
+             $verbose || $client_port == 0;
+    $listener->announce;
+}
+
+sub parse_socks_remote {
+    my ($line, $socks) = @_;
+
+    my ($client_host, $client_port) =
+        $socks =~ m{
+            ^
+            (?:([^:]*):)?
+            (\d*)
+            $
+        }x or
+        die "Could not parse socks forward specification '$socks'\n";
+
+    $client_host = $default_local_bind if !defined $client_host;
+    $client_host = "0.0.0.0" if $client_host eq "" || $client_host eq "*";
+    $client_port = 1080 if $client_port eq "";
+
+    my $id = $line->id_alloc;
+    $line->write($SOCKS_REMOTE,
+                 pack("wna*", $id, $client_port, $client_host));
+}
+
+sub client {
+    my ($socket_in, $socket_out, $server_debug, $server_verbose) = @_;
+
+    eval {
+        my $line = LineProtocol->new($socket_in, $socket_out);
+
+        $line->set_global(debug      => $server_debug   || 0);
+        $line->set_global(verbose    => $server_verbose || 0);
+        $line->set_global(epoch      => $^T);
+        $line->set_global(TIMEOUT    => $TIMEOUT);
+        $line->set_global(KEEPALIVE  => $KEEPALIVE);
+        $line->set_global(LOW_WATER  => $LOW_WATER);
+        $line->set_global(HIGH_WATER => $HIGH_WATER);
+
+        for my $tcp_local (@tcp_local) {
+            parse_forward($line, "TCP", $tcp_local);
+        }
+        for my $socks_local (@socks_local) {
+            parse_socks_forward($line, $socks_local);
+        }
+        for my $udp_local (@udp_local) {
+            parse_forward($line, "UDP", $udp_local);
+        }
+        for my $tcp_remote (@tcp_remote) {
+            parse_remote($line, "TCP", $tcp_remote);
+        }
+        for my $socks_remote (@socks_remote) {
+            parse_socks_remote($line, $socks_remote);
+        }
+        for my $udp_remote (@udp_remote) {
+            parse_remote($line, "UDP", $udp_remote);
+        }
+
+        $line->write($START);
+
+        Events->mainloop();
+    };
+    die "\u$role: $@" if $@;
+}
+
+sub server {
+    my ($socket_in, $socket_out) = @_;
+    eval {
+        my $line = LineProtocol->new($socket_in, $socket_out);
+
+        $line->set_global(epoch     => $^T);
+
+        Events->mainloop();
+    };
+    die "\u$role: $@" if $@;
+}
+
+if ($role eq "server") {
+    server(\*STDIN, \*STDOUT);
+    die "Assertion: \u$role fell off the mainloop";
+}
+
+my $stuff = 1;
+GetOptions("client_lib=s" => \my @client_lib,
+           "ssh=s"		=> \$ssh,
+           "server_verbose!"	=> \my $server_verbose,
+           "client_verbose!"	=> \my $client_verbose,
+           "verbose!"		=> \$verbose,
+           "server_debug!"	=> \my $server_debug,
+           "client_debug!"	=> \my $client_debug,
+           "debug!"		=> \$debug,
+           "local_bind|bind=s"	=> \$default_local_bind,
+           "remote_bind=s"	=> \$default_remote_bind,
+           "timeout=o"		=> \$TIMEOUT,
+           "keepalive=o"	=> \$KEEPALIVE,
+           "low_water=o"	=> \$LOW_WATER,
+           "high_water=o"	=> \$HIGH_WATER,
+           "L=s"		=> \@tcp_local,
+           "l=s"		=> \@udp_local,
+           "R=s"		=> \@tcp_remote,
+           "r=s"		=> \@udp_remote,
+           "D=s"		=> \@socks_local,
+           "d=s"		=> \@socks_remote,
+           "stuff!"		=> \$stuff,
+           "version!"		=> \my $version,
+           "U|unsafe!"		=> \my $unsafe,
+           "h|help!"		=> \my $help) ||
+    die "Could not parse your command line. Try $Script -h\n";
+
+if ($version) {
+    print<<"EOF";
+sssssh (Ton Utils) $VERSION
+EOF
+    exit 0;
+}
+
+if ($help) {
+    require Config;
+    $ENV{PATH} .= ":" unless $ENV{PATH} eq "";
+    $ENV{PATH} = "$ENV{PATH}$Config::Config{'installscript'}";
+    exec("perldoc", "-F", $unsafe ? "-U" : (), $0) || exit 1;
+    # make parser happy
+    %Config::Config = ();
+}
+
+@ARGV || die "Missing remote host argument, Try $Script -h\n";
+if ($stuff) {
+    @ARGV == 1 || die "Spurious arguments\n";
+}
+
+$verbose        = $debug        if $debug        && !defined $verbose;
+$client_verbose = $client_debug if $client_debug && !defined $client_verbose;
+$server_verbose = $server_debug if $server_debug && !defined $server_verbose;
+
+$server_debug   = $client_debug   = 1 if $debug;
+$server_verbose = $client_verbose = 1 if $verbose;
+
+die "timeout $TIMEOUT must be positive\n" if $TIMEOUT <= 0;
+die "keepalive $KEEPALIVE must be positive\n" if $KEEPALIVE <= 0;
+
+pipe(my $rd0, my $wr0) || die "Could not pipe: $^E";
+pipe(my $rd1, my $wr1) || die "Could not pipe: $^E";
+defined(my $pid = fork()) || die "could not fork: $^E";
+
+if ($pid) {
+    # Parent
+    eval {
+        close $wr0;
+        close $rd1;
+        open(STDIN,  "<&", $rd0) || die "Could not dup STDIN: $^E";
+        close $rd0;
+        open(STDOUT, ">&", $wr1) || die "Could not dup STDOUT: $^E";
+        close $wr1;
+
+        if ($stuff) {
+            # delete @ENV{qw(LANGUAGE LC_ALL LANG)};
+            my $remote_host = shift;
+            exec($ssh, "-e", "none", $remote_host, "/usr/bin/perl") ||
+                die "Could not exec $ssh: $^E";
+        } else {
+            push @ARGV, "$Bin/$Script" if @ARGV == 1;
+            exec($ssh, "-e", "none", @ARGV) ||
+                die "Could not exec $ssh: $^E";
+        }
+    };
+    die $@ || "No error";
+} else {
+    # Child
+    $verbose = $client_verbose;
+    $debug   = $client_debug;
+    close $rd0;
+    close $wr1;
+    $wr0->autoflush(1);
+
+    if ($stuff) {
+        my $self = "$Bin/$Script";
+        open(my $fh, "<", $self) || die "Could not open $self: $^E";
+        my $content = qq(#line 1 "$Bin/$Script"\n);
+        $content .= do { local $/; <$fh> };
+        $content =~ s/\n__END__\n.*/\n/s || die "Could not find __END__";
+        # Remove full line comments, but not #line statements.
+        # Leave the \n so line numbers in error messages keep working
+        $content =~ s/^[^\S\n]*#(?![^\S\n]*line\s).*//mg;
+        # Drop leading spaces. Saves about 20%
+        # (less of course if the ssh does compression, as it does by default)
+        $content =~ s/^[^\S\n]+//mg;
+
+        # Change a few variables in the server code
+        my %replace =
+            (verbose	=> $server_verbose,
+             debug      => $server_debug,
+             role	=> "server");
+        while (my ($name, $value) = each %replace) {
+            local $Data::Dumper::Indent  = 0;
+            local $Data::Dumper::Purity  = 1;
+            local $Data::Dumper::Varname = $name;
+            $value = Dumper($value);
+            $value =~ s/\$\Q$name\E1\b/\$$name/g || die "Assertion: No VAR1";
+            # info("Value=<$value>") if $verbose;
+            $content =~ s{^([^\S\n]*(?:my|our)\s*)\$\Q$name\E\s*=[^;\n]*;[^\S\n]*\n}{$1$value\n}m || die "Could not set $name";
+        }
+
+        print($wr0 $PRE_STUFFER) || die "Write error:$^E";
+        for my $client_lib (map split(/:/), @client_lib) {
+            print($wr0 qq(use lib "$client_lib";\n)) || die "Write error:$^E";
+        }
+        # print($wr0 qq(\$Script="\$Script"\n)) || die "Write error:$^E";
+        print($wr0 $content) || die "Write error:$^E";
+        print($wr0 $POST_STUFFER) || die "Write error:$^E";
+        my $line = "";
+        while (length($line) < 5) {
+            alarm(60);
+            my $rc = sysread($rd1, $line, 5-length $line, length $line);
+            if (!defined $rc) {
+                next if $! == EINTR;
+                die "Read error: $^E";
+            }
+            die "Unexpected EOF" if $rc == 0;
+        }
+        alarm(0);
+        $line eq "GoNow" || die "Bad server confirm $line";
+    }
+    client($rd1, $wr0, $server_debug, $server_verbose);
+}
+
+__END__
+=head1 NAME
+
+sssssh - proxy connections over ssh (Simple Socket Server over SSH)
+
+=head1 SYNOPSIS
+
+    sssssh { tunnel specification } remote_host
+
+    tunnel specification can be:
+       -L local_bind:local_port:remote_host:remote_port
+       -l local_bind:local_port:remote_host:remote_port
+       -R remote_bind:remote_port:local_host:local_port
+       -r remote_bind:remote_port:local_host:local_port
+       -D local_bind:local_port
+       -d remote_bind:remote_port
+
+    sssssh [--version] [--unsafe] [-U] [-h] [--help]
+
+=head1 DESCRIPTION
+
+bla bla bla. To be written
+
+=head1 OPTIONS
+
+=over 4
+
+=item X<ssh>--ssh program
+
+Name of the connection program to use. Defaults to F</usr/bin/ssh>
+
+=item X<verbose>--verbose
+
+Turn on debug messages
+
+=item X<server_verbose>--server_verbose
+
+Turn on debug messages on the server (the remote side of the ssh connection)
+
+=item X<client_verbose>--server_verbose
+
+Turn on debug messages on the client (the local side of the ssh connection)
+
+q=item X<help>-h, --help
+
+Show this help.
+
+=item X<unsafe>-U, --unsafe
+
+Allow even root to run the perldoc.
+Remember, the reason this is off by default is because it B<IS> unsafe.
+
+=item X<version>--version
+
+Print version info.
+
+=back
+
+=head1 EXAMPLE
+
+bla bla. To be written
+
+=head1 SEE ALSO
+
+L<ssh(1)>
+
+=head1 AUTHOR
+
+Ton Hospel, E<lt>sssssh@ton.iguana.beE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 2015 by Ton Hospel
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.6.1 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut
+
+Implementation notes:
+
+c: client
+s: server
+h: host
+p: port
+d: data
+_: protocol (udp, tcp etc)
+
+lower case: source
+upper case: dest
+
+(c_, ch, cp, cH, cP) -> (s_, sh sp, sH, sP)
+     sh, sp determined by server
+     sH = cH if sH=""
+
+(ch,cp,cH,cP,sP)
+
+Server HASH: (sH,sP)(sp) -> (id, ch, cp, cH ?)
+
+cmdline: id -> c_,cH,cP,s_,sH,sP
+
+Line protocol: UDP
+   Forward announce: -> (id cH?, sH, sP) cH only if sH = 0.0.0.0
+   Forward data:     -> (id,ch,cp,cH?,d) cH only if cH = 0.0.0.0
+   Remote announce:  -> (id sh, sp)  [reply with resolved sh, sp]
+   Remote data is just Forward data in the other direction
+                     <- (id,sH,sP,sh?,d) sh only if ch = 0.0.0.0 (=> sh = 0)
+
+Line protocol: TCP
+   Forward announce: -> (id, sH, sP)
+   Forward connect:  -> (id, id*,cH?) cH only if sH = 0.0.0.0
+
+   Remote announce:  -> (id, sh, sp)  [reply with resolved sh, sp]
+   Remote accept is just a Forward connect in the other direction:
+                      <- (id, id*,sh?) sh only if ch = 0.0.0.0 (=> sh = 0)
+   data:     <-> (id*,d)
+   close:    <-> (id*, reason)
+
+# Naming convention:
+xxx_port: numeric port number
+xxx_host: textual host name
+xxx_ip:   packed IP address
+xxx_addr: packed port/ip
