@@ -30,6 +30,8 @@ $SIG{PIPE} = "IGNORE";
 # Unfortunately not a builtin in Socket nor Socket::MsgHdr.
 # This is the linux value, can be different on other systems
 my $IP_PKTINFO = 8;
+# IPPROTO_IP exists in Socket, but not in really old ones
+my $IPPROTO_IP = 0;
 
 my $ssh = "/usr/bin/ssh";
 my $verbose = undef;
@@ -105,6 +107,7 @@ my $MARKER	= "";
 my $ERROR_ECONNREFUSED	= "Connection refused";
 my $ERROR_ENETUNREACH	= "Network is unreachable";
 my $ERROR_ETIMEDOUT	= "Timed out";
+my $ERROR_ERESOLV	= "Could not resolve host";
 
 my $role = @ARGV ? "client" : "server";
 my $role_peer = $role eq "server" ? "client" : "server";
@@ -547,7 +550,7 @@ sub tcp_writer {
 
 package UDP;
 use Errno qw(EINTR EAGAIN EWOULDBLOCK);
-use Socket qw(IPPROTO_IP MSG_TRUNC MSG_CTRUNC
+use Socket qw(MSG_TRUNC MSG_CTRUNC
               pack_sockaddr_in unpack_sockaddr_in inet_ntoa);
 
 sub proto {
@@ -585,7 +588,7 @@ sub client_recv {
         my @cmsg = $msghdr->cmsghdr();
         my $local;
         while (my ($level, $type, $data) = splice(@cmsg, 0, 3)) {
-            $level == IPPROTO_IP && $type == $IP_PKTINFO || next;
+            $level == $IPPROTO_IP && $type == $IP_PKTINFO || next;
             length $data == 12 || die "Unexpected IP_PKTINFO length";
             my ($interface, undef, $to) = unpack("Na4a4", $data);
             $local = $to;
@@ -640,7 +643,7 @@ sub client_send {
     if ($udp->{client_host} eq "0.0.0.0") {
         $msghdr->name($to);
         $msghdr->buf($out->[3]);
-        $msghdr->cmsghdr(IPPROTO_IP, $IP_PKTINFO, pack("NNa4", 0, 0, $out->[0]));
+        $msghdr->cmsghdr($IPPROTO_IP, $IP_PKTINFO, pack("NNa4", 0, 0, $out->[0]));
         $rc = $udp->{socket}->sendmsg($msghdr);
     } else {
         $rc = $udp->{socket}->send($out->[3], 0, $to);
@@ -759,7 +762,7 @@ sub accept : method {
     }, $class;
     weaken($connection->{line} = $line);
 
-    $connection->info("accepted %s (%d on %d)", $description,
+    $connection->info("accepted %s (fd %d on fd %d)", $description,
                       fileno($listener->{socket}), fileno($socket)) if $verbose;
 
     return $connection;
@@ -783,7 +786,7 @@ sub connect : method {
         Proto		=> "tcp") || die $@;
     $socket->setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1) || die "setsockopt: $^E";
 
-    my $description = sprintf("-> %s:%d", inet_ntoa($server_ip), $server_port);
+    my $description = sprintf("-> %s:%d", inet_ntoa($server_ip ? inet_ntoa($server_ip) : $server_host, $server_port);
     my $connection = bless {
         parent_id	=> $parent_id,
         id		=> $id,
@@ -811,7 +814,7 @@ sub connect : method {
 
     if (!$connection->{peer_ip}) {
         delete $connection->{socket};
-        $connection->close("connect failed ->", "Could not resolve host");
+        $connection->close("connect failed ->", $ERROR_ERESOLV);
         return $connection;
     }
 
@@ -874,8 +877,7 @@ sub connected {
                                   fileno($connection->{socket}),
                                   $connection->{description}) if $debug;
                 $connection->{socket}->shutdown(1) ||
-                    $! == ENOTCONN ||
-                    $! == ECONNRESET ||
+                    $! == ENOTCONN || $! == ECONNRESET ||
                     die "shutdown write: $^E";
             }
             $connection->maybe_free;
@@ -1164,8 +1166,7 @@ sub forward_eof {
                           fileno($connection->{socket}),
                           $connection->{description}) if $debug;
         $connection->{socket}->shutdown(1) ||
-            $! == ENOTCONN ||
-            $! == ECONNRESET ||
+            $! == ENOTCONN || $! == ECONNRESET ||
             die "shutdown write: $^E";
     }
     $connection->maybe_free;
@@ -1642,6 +1643,9 @@ sub forward_close {
                 $rc = 3;
             } elsif ($err eq $ERROR_ETIMEDOUT) {
                 $rc = 6;
+            } elsif ($err eq $ERROR_ERESOLV) {
+                # What is the proper error here ?
+                $rc = 4; # host unreachable
             } else {
                 die "Unhandled SOCKS5 close error '$err'";
             }
@@ -2035,7 +2039,7 @@ sub announce {
 }
 
 package Listener::UDP;
-use Socket qw(IPPROTO_IP inet_aton pack_sockaddr_in);
+use Socket qw(inet_aton pack_sockaddr_in);
 use base qw(UDP Listener);
 
 sub init {
@@ -2043,7 +2047,7 @@ sub init {
 
     if  ($udp_listener->{client_host} eq "0.0.0.0") {
         die $msghdr_error if $msghdr_error;
-        setsockopt($udp_listener->{socket}, IPPROTO_IP, $IP_PKTINFO, 1) ||
+        setsockopt($udp_listener->{socket}, $IPPROTO_IP, $IP_PKTINFO, 1) ||
             die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
     }
 }
@@ -2649,7 +2653,7 @@ sub process_TCP_DATA {
     substr($_[0], 0, length pack("ww", $parent_id, $id), "");
     my $connection = $line->{connections}{"$parent_id:$id"} ||
         die "Unknown connection $parent_id:$id";
-    die "Incoming data on closed connection" if
+    die "Incoming data on closed connection $parent_id:$id" if
         defined $connection->{closed_write};
     $connection->write($_[0]);
 }
@@ -3258,8 +3262,11 @@ if ($role eq "server") {
 }
 
 my $stuff = 1;
+my $remote_perl = "/usr/bin/perl";
 GetOptions("client_lib=s" => \my @client_lib,
            "ssh=s"		=> \$ssh,
+           "M|master"		=> \my $ssh_master,
+           "perl=s"		=> \$remote_perl,
            "server_verbose!"	=> \my $server_verbose,
            "client_verbose!"	=> \my $client_verbose,
            "verbose!"		=> \$verbose,
@@ -3332,11 +3339,11 @@ if ($pid) {
         if ($stuff) {
             # delete @ENV{qw(LANGUAGE LC_ALL LANG)};
             my $remote_host = shift;
-            exec($ssh, "-e", "none", $remote_host, "/usr/bin/perl") ||
+            exec($ssh, $ssh_master ? "-M" : (), "-e", "none", $remote_host, $remote_perl) ||
                 die "Could not exec $ssh: $^E";
         } else {
             push @ARGV, "$Bin/$Script" if @ARGV == 1;
-            exec($ssh, "-e", "none", @ARGV) ||
+            exec($ssh, $ssh_master ? "-M" : (), "-e", "none", @ARGV) ||
                 die "Could not exec $ssh: $^E";
         }
     };
@@ -3407,7 +3414,7 @@ sssssh - proxy connections over ssh (Simple Socket Server over SSH)
 
 =head1 SYNOPSIS
 
-    sssssh { tunnel specification } remote_host
+    sssssh remote_host { tunnel specification }
 
     tunnel specification can be:
        -L local_bind:local_port:remote_host:remote_port
@@ -3416,6 +3423,8 @@ sssssh - proxy connections over ssh (Simple Socket Server over SSH)
        -r remote_bind:remote_port:local_host:local_port
        -D local_bind:local_port
        -d remote_bind:remote_port
+
+       -M Pass -M to ssh
 
     sssssh [--version] [--unsafe] [-U] [-h] [--help]
 
@@ -3431,6 +3440,10 @@ bla bla bla. To be written
 
 Name of the connection program to use. Defaults to F</usr/bin/ssh>
 
+=item X<perl>--perl program
+
+Path of the remote perl executable. Defaults to F</usr/bin/perl>.
+
 =item X<verbose>--verbose
 
 Turn on debug messages
@@ -3439,11 +3452,11 @@ Turn on debug messages
 
 Turn on debug messages on the server (the remote side of the ssh connection)
 
-=item X<client_verbose>--server_verbose
+=item X<client_verbose>--client_verbose
 
 Turn on debug messages on the client (the local side of the ssh connection)
 
-q=item X<help>-h, --help
+=item X<help>-h, --help
 
 Show this help.
 
