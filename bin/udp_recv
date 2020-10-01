@@ -1,0 +1,160 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+
+my $VERSION = "1.000";
+
+# modprobe fou
+# ip link add name tun1 type ipip remote 127.0.0.1 local 10.252.3.1 ttl 225 encap fou encap-sport auto encap-dport 5555
+# ip link set tun1 up
+# ip addr add 10.253.4.1/24 dev tun1
+
+# ip link del name tun1
+
+my $IP_VERSION = 4;
+my $PROTO_UDP = 17;
+my $IHL = 5;
+my $UDP_HEADER = 8;
+
+my $FREE_BSD = $^O eq "freebsd";
+# This is the linux value, can be different on other systems
+# FreeBSD uses IP_RECVDSTADDR
+my $IP_PKTINFO = $FREE_BSD ? 7 : 8;
+# IPPROTO_IP exists in Socket, but not in really old ones
+my $IPPROTO_IP = 0;
+
+use Getopt::Long 2.24 qw(:config bundling require_order);
+use IO::Socket::INET;
+use IO::Socket qw(inet_ntoa MSG_TRUNC MSG_CTRUNC);
+use Socket::MsgHdr;
+use Data::Dumper;
+
+my $port = 5555;
+die "Could not parse your command line. Try $0 -h\n" unless
+    GetOptions("p|port=o"	=> \$port,
+               "version!"	=> \my $version,
+               "U|unsafe!"	=> \my $unsafe,
+               "h|help!"	=> \my $help);
+
+
+my $s = IO::Socket::INET->new(
+    Proto	=> "udp",
+    ReUse	=> 1,
+    LocalPort	=> $port) || die "Could not create socket: $!";
+setsockopt($s, $IPPROTO_IP, $IP_PKTINFO, 1) ||
+    die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
+
+# my $buffer = "";
+my $msghdr = Socket::MsgHdr->new();
+print "=" x 25 . "\n";
+while (1) {
+    $msghdr->controllen(256);
+    $msghdr->namelen(256);
+    $msghdr->buflen(2**16);
+    $s->recvmsg($msghdr) || die "Could nor recvmdg: $!";
+    my $buffer = $msghdr->buf;
+
+    die "Yikes! Buffer was truncated\n" if
+        $msghdr->flags & MSG_TRUNC;
+    die "Yikes! Ancillary data was truncated\n" if
+        $msghdr->flags & MSG_CTRUNC;
+
+    my ($local, $msg_dst);
+    my @cmsg = $msghdr->cmsghdr();
+    while (my ($level, $type, $data) = splice(@cmsg, 0, 3)) {
+        $level == $IPPROTO_IP && $type == $IP_PKTINFO || next;
+        if ($FREE_BSD) {
+            length $data == 4 || die "Unexpected IP_RECVDSTADDR length";
+            $local = inet_ntoa($data);
+            $msg_dst = $local;
+        } else {
+            length $data == 12 || die "Unexpected IP_PKTINFO length";
+            my ($interface, $dst, $to) = unpack("Na4a4", $data);
+            $local = inet_ntoa($to);
+            $msg_dst = inet_ntoa($dst);
+        }
+    }
+    $local // die "Assertion: No local addr";
+    my $sender = $msghdr->name;
+    my ($peer_port, $peer) = unpack_sockaddr_in($sender);
+    $peer = inet_ntoa($peer);
+
+    if (1 || $peer ne "127.0.0.1" || $local ne "127.0.0.1") {
+        print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n";
+        print "Received: ", length($buffer), " ", unpack("H*", $buffer), " ", $buffer, "\n";
+        print "=" x 25 . "\n";
+        next;
+    }
+    # $s->sysread($buffer, 2**16);
+    # Must have space for IP header
+    next if length $buffer < 20;
+    my ($ihl, $ecn, $length, $id, $fragment, $ttl, $proto, $chksum, $src, $dst) = unpack("CCnnnCCna4a4", $buffer);
+    # print STDERR "TEMP: IHL=$ihl, ECN=$ecn, LEN=$length, ID=$id, FRAGMENT=$fragment, TTL=$ttl, PROTO=$proto, CHK=$chksum, SRC=$src, DST=$dst\n";
+    my $version = $ihl >> 4;
+    $ihl &= 0xf;
+    my $flags = $fragment >> 13;
+    $fragment &= 0x1fff;
+    # only TCP4
+    $version == $IP_VERSION || next;
+    # Only UDP
+    $proto == $PROTO_UDP || next;
+    # Sanity check on buffer
+    length($buffer) == $length || next;
+    # We don't handle IP options (yet)
+    $ihl == $IHL || next;
+    # Too many hops
+    $ttl || next;
+    # Don't handle fragments (gragment offset)
+    next if $fragment;
+    # Don't handle fragments (MF flag set)
+    next if $flags & 0x4;
+
+    my $pseudo10 = pack("a4a4xC", $src, $dst, $proto);
+
+    $ihl *= 4;
+    my $header = substr($buffer, 0, $ihl, "");
+    $length -= $ihl;
+
+    # No buffer padding needed since length($header) is even
+    my $sum = unpack("%32n*", $header);
+    # We (currently) don't check the header chksum since we assume we only
+    # handle local packets which cannot fail
+    while ($sum > 0xffff) {
+        my $carry = $sum >> 16;
+        $sum &= 0xffff;
+        $sum += $carry;
+    }
+    $sum == 0xffff || next;
+
+    $src = inet_ntoa($src);
+    $dst = inet_ntoa($dst);
+
+    print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n";
+
+    my $dscp = $ecn >> 3;
+    $ecn &= 0x7;
+    print "HEADER: DSCP=$dscp, ECN=$ecn, ID=$id, FLAGS=$flags, FRAGMENT=$fragment, TTL=$ttl, CHKSUM=$chksum, SRC=$src, DST=$dst\n";
+
+    # Must have space for UDP header
+    next if $length < $UDP_HEADER;
+
+    # Pad buffer 0 so a last single byte still gets processed as "n"
+    $sum = unpack("%32n*", $buffer . "\x0") + unpack("%32n*", $pseudo10) + $length;
+    my ($sprt, $dprt, $udp_len, $udp_chksum) = unpack("nnnn", substr($buffer, 0, $UDP_HEADER, ""));
+    $udp_len == $length || die "Inconsistent UDP length";
+    $length -= $UDP_HEADER;
+
+    # We (currently) don't check the UDP chksum since we assume we only
+    # handle local packets which cannot fail
+    while ($sum > 0xffff) {
+        my $carry = $sum >> 16;
+        $sum &= 0xffff;
+        $sum += $carry;
+    }
+    $sum == 0xffff || next;
+
+    print "SPRT=$sprt, DPRT=$dprt, LEN=$udp_len, CHK=$udp_chksum\n";
+
+    print "Received: ", length($buffer), " ", unpack("H*", $buffer), " ", $buffer, "\n";
+    print "=" x 25 . "\n";
+}

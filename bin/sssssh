@@ -54,25 +54,17 @@ my $KEEPALIVE = 300;
 my $LOW_WATER  = 3e6;
 my $HIGH_WATER = 4e6;
 
-my %settings = (
-    debug		=> \$debug,
-    verbose     	=> \$verbose,
-    epoch		=> \my $epoch,
-    TIMEOUT		=> \$TIMEOUT,
-    SOCKS_TIMEOUT	=> \$SOCKS_TIMEOUT,
-    BLOCK_SIZE		=> \$BLOCK_SIZE,
-    LINE_BLOCK_SIZE	=> \$LINE_BLOCK_SIZE,
-    MARKER_BLOCK	=> \$MARKER_BLOCK,
-    KEEPALIVE		=> \$KEEPALIVE,
-    LOW_WATER		=> \$LOW_WATER,
-    HIGH_WATER		=> \$HIGH_WATER,
-    );
-my @settings = sort keys %settings;
+my @settings = sort qw(EPOCH TIMEOUT KEEPALIVE LOW_WATER HIGH_WATER);
+my %settings;
+$settings{$settings[$_]} = $_ for 0..$#settings;
 
 my $STUFFED = "GoNow";
 
 my $KEEP	= "K";  # Keepalive packet/Ack
 my $SET		= "S";	# sets a server variable
+my $START	= "1";
+my $DAEMON	= "2";	# Tell server to daemonize
+my $LINE_EOF	= "0";	# Close a LineProtocol
 my $MARKER	= "";
 
 my $ERROR_ECONNREFUSED	= "Connection refused";
@@ -259,6 +251,8 @@ sub realtime {
     return clock_gettime(CLOCK_REALTIME);
 }
 
+my $BASE_TIME = Timer->realtime();
+
 # Timers are kept in a simple binary heap @timers
 sub new {
     my ($class, $time, $fun) = @_;
@@ -396,6 +390,8 @@ use Carp;
 my %process = (
     $KEEP		=> \&process_KEEP,
     $SET		=> \&process_SET,
+
+    $DAEMON		=> \&process_DAEMON,
 );
 
 sub new {
@@ -422,11 +418,18 @@ sub new {
         marker_out	=> "A",	# last marker sent on output
         marker_acked	=> "A", # Last acknowledged marker
         utime_offset	=> 0,	# Estimated round trip time in microsecond
+
+        EPOCH		=> undef,
+        TIMEOUT		=> $TIMEOUT,
+        KEEPALIVE	=> $KEEPALIVE,
+        LOW_WATER	=> $LOW_WATER,
+        HIGH_WATER	=> $HIGH_WATER,
+
     }, $class;
     # $line->id_init;
 
     $socket_in->add_read(sub { $line->read });
-    $line->{keepalive} = Timer->new($KEEPALIVE, sub { $line->keepalive } );
+    $line->{keepalive} = Timer->new($line->{KEEPALIVE}, sub { $line->keepalive } );
 
     return $line;
 }
@@ -525,12 +528,12 @@ sub line_writer {
         }
         splice(@{$line->{markers}}, 0, $dropped);
 
-        $line->unsuspend if $line->{pending_length} <= $LOW_WATER && $line->{suspended};
+        $line->unsuspend if $line->{pending_length} <= $line->{LOW_WATER} && $line->{suspended};
         if ($line->{pending_length} <= 0) {
             die "Unexpected non empty out" if $line->{out} ne "";
             die "Unexpected negative pending_length" if $line->{pending_length} < 0;
             $line->{keepalive} =
-                Timer->new($KEEPALIVE, sub { $line->keepalive });
+                Timer->new($line->{KEEPALIVE}, sub { $line->keepalive });
             $line->{socket_out}->delete_write;
             return;
         }
@@ -564,11 +567,11 @@ sub write : method {
     }
     $line->{pending_length} += line_message($line->{out}, @_) if @_;
     $line->mark;
-    if ($line->{pending_length} > $HIGH_WATER && !$line->{suspended}) {
+    if ($line->{pending_length} > $line->{HIGH_WATER} && !$line->{suspended}) {
         # Try to pass the buck to the OS
         $line->line_writer;
         # The OS didn't fall for it. Reduce incoming traffic
-        $line->suspend if $line->{pending_length} > $HIGH_WATER && !$line->{suspended};
+        $line->suspend if $line->{pending_length} > $line->{HIGH_WATER} && !$line->{suspended};
     }
 }
 
@@ -578,7 +581,7 @@ sub keepalive {
     $line->{ack_position} = length $line->{out};
     $line->write($KEEP, sprintf("%s %.0f %.0f",
                                 $line->{marker_in},
-                                (Timer->realtime() - $^T)*1e6,
+                                (Timer->realtime() - $BASE_TIME)*1e6,
                                 $line->{utime_offset}));
     if ($line->{ack_position} >= 0) {
         my ($length, $command) = unpack("wa", substr($line->{out}, $line->{ack_position}, 4));
@@ -653,7 +656,7 @@ sub process_KEEP {
         delete $line->{saved_frames}{$line->{marker_acked}};
     }
 
-    $line->{utime_offset} = (Timer->realtime() - $epoch)*1e6 -$utime || 1;
+    $line->{utime_offset} = (Timer->realtime() - $line->{EPOCH})*1e6 -$utime || 1;
     if ($uoffset) {
         ::info("Keepalive ack=%s, saved bytes=%d, transit=%.3f ms, roundtrip=%.3f ms, offset=%.0f ms",
              $ack,
@@ -672,19 +675,20 @@ sub process_SET {
 
     my $i = unpack("C", substr($_[0], 0, 1, ""));
     my $name = $settings[$i] || die "Unknown variable $i";
-    ${$settings{$name}} = $_[0];
-    ::info("Set %s=%s", $settings[$i], $_[0]) if $debug;
+    $line->{$name} = $_[0];
+    ::info("Set %s=%s", $name, $_[0]) if $debug;
+}
+
+sub process_DAEMON {
+    my $line  = shift;
 }
 
 sub set_global {
     my ($line, $name, $value) = @_;
-    for my $i (0..$#settings) {
-        if ($settings[$i] eq $name) {
-            $line->write($SET, pack("C", $i), $value);
-            return;
-        }
-    }
-    croak "Unknown variable $name";
+
+    my $i = $settings{$name};
+    defined $i || croak "Unknown global variable '$name'";
+    $line->write($SET, pack("C", $i), $value);
 }
 
 package main;
@@ -755,13 +759,19 @@ sub display {
 }
 
 sub client {
-    my ($socket_in, $socket_out, $server_debug, $server_verbose) = @_;
+    my ($socket_in, $socket_out) = @_;
 
     eval {
         my $line = LineProtocol->new($socket_in, $socket_out);
-        $line->set_global(debug      => $server_debug   || 0);
-        $line->set_global(verbose    => $server_verbose || 0);
-        $line->set_global(epoch      => $^T);
+        # $line->set_global(debug      => $server_debug   || 0);
+        # $line->set_global(verbose    => $server_verbose || 0);
+        $line->set_global(EPOCH      => $BASE_TIME);
+        $line->set_global(TIMEOUT    => $TIMEOUT);
+        $line->set_global(KEEPALIVE  => $KEEPALIVE);
+        $line->set_global(LOW_WATER  => $LOW_WATER);
+        $line->set_global(HIGH_WATER => $HIGH_WATER);
+
+        $line->write($DAEMON);
 
         Events->mainloop();
 
@@ -774,7 +784,7 @@ sub server {
     eval {
         my $line = LineProtocol->new($socket_in, $socket_out);
 
-        $line->set_global(epoch => $^T);
+        $line->set_global(EPOCH => $BASE_TIME);
 
         Events->mainloop();
     };
@@ -904,7 +914,13 @@ if ($stuff) {
     my %replace =
         (verbose	=> $server_verbose,
          debug		=> $server_debug,
-         role		=> "server");
+         role		=> "server",
+
+         TIMEOUT	=> $TIMEOUT,
+         KEEPALIVE	=> $KEEPALIVE,
+         LOW_WATER	=> $LOW_WATER,
+         HIGH_WATER	=> $HIGH_WATER,
+     );
     while (my ($name, $value) = each %replace) {
         local $Data::Dumper::Indent  = 0;
         local $Data::Dumper::Purity  = 1;
@@ -936,7 +952,7 @@ if ($stuff) {
     $line eq $STUFFED || die "Bad server confirm $line";
     ::info("Remote server received code") if $debug;
 }
-client($rd1, $wr0, $server_debug, $server_verbose);
+client($rd1, $wr0);
 
 #my $ssh_retry = 0;
 #my $ssh_max_retry = 300;
