@@ -10,7 +10,7 @@ our $VERSION = '1.000';
 WriteMakefile
     (NAME		=> 'Sssssh',
      # finds $VERSION, requires EU::MM from perl >= 5.5
-     VERSION_FROM	=> 'bin/sssssh',
+     VERSION_FROM	=> 'lib/Sssssh/Package.pm',
      eval {
          ## no critic (UselessNoCritic MagicNumbers)
          ExtUtils::MakeMaker->VERSION(6.55_01);

@@ -1,7 +1,12 @@
 Changes
 MANIFEST
+MANIFEST.SKIP
 Makefile.PL
 README
 bin/sssssh
+bin/udp_proxy
+bin/udp_recv
+bin/udp_send
+lib/Sssssh/Package.pm
 md5-versions
 t/00_syntax.t
