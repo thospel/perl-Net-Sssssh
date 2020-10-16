@@ -31,7 +31,9 @@ use Data::Dumper;
 
 my $port = 5555;
 die "Could not parse your command line. Try $0 -h\n" unless
-    GetOptions("p|port=o"	=> \$port,
+    GetOptions("fou!"		=> \my $fou,
+               "a|answer!"	=> \my $answer,
+               "p|port=o"	=> \$port,
                "version!"	=> \my $version,
                "U|unsafe!"	=> \my $unsafe,
                "h|help!"	=> \my $help);
@@ -51,7 +53,7 @@ while (1) {
     $msghdr->controllen(256);
     $msghdr->namelen(256);
     $msghdr->buflen(2**16);
-    $s->recvmsg($msghdr) || die "Could nor recvmdg: $!";
+    $s->recvmsg($msghdr) || die "Could nor recvmsg: $!";
     my $buffer = $msghdr->buf;
 
     die "Yikes! Buffer was truncated\n" if
@@ -79,9 +81,15 @@ while (1) {
     my ($peer_port, $peer) = unpack_sockaddr_in($sender);
     $peer = inet_ntoa($peer);
 
-    if (1 || $peer ne "127.0.0.1" || $local ne "127.0.0.1") {
+    if (!$fou) {
         print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n";
-        print "Received: ", length($buffer), " ", unpack("H*", $buffer), " ", $buffer, "\n";
+        print "Received: ", length($buffer), " ", unpack("H*", $buffer), " '", $buffer, "'\n";
+        if ($answer) {
+            $buffer =~ s{\S+}{time()}e if $buffer !~ s/^(\d+)/$1+1/ea;
+            $msghdr->buf($buffer);
+            $s->sendmsg($msghdr) || die "Could not send: $!";
+            print "Sent: ", length($buffer), " ", unpack("H*", $buffer), " '", $buffer, "'\n";
+        }
         print "=" x 25 . "\n";
         next;
     }
@@ -104,7 +112,7 @@ while (1) {
     $ihl == $IHL || next;
     # Too many hops
     $ttl || next;
-    # Don't handle fragments (gragment offset)
+    # Don't handle fragments (fragment offset)
     next if $fragment;
     # Don't handle fragments (MF flag set)
     next if $flags & 0x4;

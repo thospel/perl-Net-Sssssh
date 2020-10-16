@@ -4,9 +4,7 @@ use warnings;
 
 my $VERSION = "1.000";
 
-# ip fou add port 5556 ipproto 4 dev fou0
-# ip link set tunl0 up
-
+# ip fou add port 5556 ipproto 4
 
 # ip fou del port 5556
 
@@ -27,11 +25,12 @@ my $IPPROTO_IP = 0;
 use Getopt::Long 2.24 qw(:config bundling require_order);
 
 use IO::Socket::INET;
-use IO::Socket qw(inet_aton inet_ntoa sockaddr_in);
+use IO::Socket qw(inet_aton inet_ntoa unpack_sockaddr_in pack_sockaddr_in);
 use Socket::MsgHdr;
 
 die "Could not parse your command line. Try $0 -h\n" unless
-    GetOptions("f|foo!"		=> \my $foo,
+    GetOptions("f|fou!"		=> \my $fou,
+               "a|answer!"	=> \my $answer,
                "l|local=s"	=> \my $local,
                "n|nonl!"	=> \my $no_nl,
                "version!"	=> \my $version,
@@ -70,7 +69,7 @@ if (0) {
 }
 
 my $mysockaddr = getsockname($s);
-my ($lport, $laddr) = sockaddr_in($mysockaddr);
+my ($lport, $laddr) = unpack_sockaddr_in($mysockaddr);
 $laddr = inet_ntoa($laddr);
 print STDERR "Local $laddr:$lport\n";
 
@@ -86,12 +85,50 @@ if (0) {
 $txt =~ s/\n?\z/$no_nl\0/;
 chop $txt;
 
-if (!$foo) {
+if (!$fou) {
     if (0) {
         print $s $txt;
     } else {
         $msghdr->buf($txt);
-        $s->sendmsg($msghdr);
+        $s->sendmsg($msghdr) || die "Could not sendmsg(): %!";
+        if ($answer) {
+            setsockopt($s, $IPPROTO_IP, $IP_PKTINFO, 1) ||
+                die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
+            $msghdr->controllen(256);
+            $msghdr->namelen(256);
+            $msghdr->buflen(2**16);
+            $s->recvmsg($msghdr) || die "Could nor recvmsg: $!";
+
+            my $buffer = $msghdr->buf;
+
+            die "Yikes! Buffer was truncated\n" if
+                $msghdr->flags & MSG_TRUNC;
+            die "Yikes! Ancillary data was truncated\n" if
+                $msghdr->flags & MSG_CTRUNC;
+
+            my ($local, $msg_dst);
+            my @cmsg = $msghdr->cmsghdr();
+            while (my ($level, $type, $data) = splice(@cmsg, 0, 3)) {
+                $level == $IPPROTO_IP && $type == $IP_PKTINFO || next;
+                if ($FREE_BSD) {
+                    length $data == 4 || die "Unexpected IP_RECVDSTADDR length";
+                    $local = inet_ntoa($data);
+                    $msg_dst = $local;
+                } else {
+                    length $data == 12 || die "Unexpected IP_PKTINFO length";
+                    my ($interface, $dst, $to) = unpack("Na4a4", $data);
+                    $local = inet_ntoa($to);
+                    $msg_dst = inet_ntoa($dst);
+                }
+            }
+            $local // die "Assertion: No local addr";
+
+            my $sender = $msghdr->name;
+            my ($peer_port, $peer) = unpack_sockaddr_in($sender);
+            $peer = inet_ntoa($peer);
+            print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n";
+            print "Received: ", length($buffer), " ", unpack("H*", $buffer), " '", $buffer, "'\n";
+        }
     }
     exit;
 }
@@ -109,14 +146,17 @@ my $dprt = 1234;
 $src = inet_aton($src) // die "Could not look up $src";
 $dst = inet_aton($dst) // die "Could not look up $dst";
 
-my $id = int rand 2**16;
+my $packet_id = int rand 2**16;
 my $flags = $DF;
+
+my $new_length = $length + $IHL * 4 + $UDP_HEADER;
+die "Packet too long" if $new_length >= 2**16;
 
 my $header = pack("CCnnnCCx2a4a4",
                   $IP_VERSION << 4 | $IHL,
                   0,
-                  $length + $IHL * 4 + $UDP_HEADER,
-                  $id,
+                  $new_length,
+                  $packet_id,
                   $DF << 13 | 0,
                   $TTL,
                   $PROTO_UDP,
@@ -146,7 +186,7 @@ chop $txt;
 my $buffer = $header . $udp_header . pack("n", 0xffff - $sum) . $txt;
 
 if (0) {
-    my ($ihl, $ecn, $length, $id, $fragment, $ttl, $proto, $chksum, $src, $dst) = unpack("CCnnnCCna4a4", $buffer);
+    my ($ihl, $ecn, $length, $packet_id, $fragment, $ttl, $proto, $chksum, $src, $dst) = unpack("CCnnnCCna4a4", $buffer);
     my $version = $ihl >> 4;
     $ihl &= 0xf;
     my $flags = $fragment >> 13;
@@ -162,7 +202,7 @@ if (0) {
     $ihl == $IHL || die "Wrong ihl $ihl";
     # Too many hops
     $ttl || die "Bad TTL $ttl";
-    # Don't handle fragments (gragment offset)
+    # Don't handle fragments (fragment offset)
     die "Unexpected fragment $fragment" if $fragment;
     # Don't handle fragments (MF flag set)
     die "Bad flags $flags" if $flags & 0x4;
@@ -189,7 +229,7 @@ if (0) {
 
     my $dscp = $ecn >> 3;
     $ecn &= 0x7;
-    print "HEADER: DSCP=$dscp, ECN=$ecn, ID=$id, FLAGS=$flags, FRAGMENT=$fragment, TTL=$ttl, CHKSUM=$chksum, SUM=$sum, SRC=$src, DST=$dst\n";
+    print "HEADER: DSCP=$dscp, ECN=$ecn, ID=$packet_id, FLAGS=$flags, FRAGMENT=$fragment, TTL=$ttl, CHKSUM=$chksum, SUM=$sum, SRC=$src, DST=$dst\n";
 
     # Must have space for UDP header
     die "Bad UDP length $length" if $length < $UDP_HEADER;
@@ -215,5 +255,5 @@ if (0) {
     print $s $buffer;
 } else {
     $msghdr->buf($buffer);
-    $s->sendmsg($msghdr);
+    $s->sendmsg($msghdr) || die "Could not sendmsg(): %!";
 }

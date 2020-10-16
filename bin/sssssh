@@ -60,7 +60,7 @@ $settings{$settings[$_]} = $_ for 0..$#settings;
 
 my $STUFFED = "GoNow";
 
-my $KEEP	= "K";  # Keepalive packet/Ack
+my $KEEP	= "K";	# Keepalive packet/Ack
 my $SET		= "S";	# sets a server variable
 my $START	= "1";
 my $DAEMON	= "2";	# Tell server to daemonize

@@ -2,6 +2,15 @@
 use strict;
 use warnings;
 
+# modprobe fou
+# ip link add name fou1 type ipip remote 127.0.0.1 local 127.0.0.1 ttl 225 encap fou encap-sport auto encap-dport 1236
+# ip link set fou1 up
+# ip addr add 10.253.4.1/24 dev fou1
+# ip fou add port 1237 ipproto 4 local 127.0.0.1
+
+# ip fou del port 1237 ipproto 4 local 127.0.0.1
+# ip link del name fou1
+
 our $VERSION = "1.000";
 
 use FindBin qw($Bin $Script);
@@ -10,27 +19,27 @@ use Carp;
 use Sys::Hostname;
 use Errno qw(EINTR);
 use Time::Local qw(timegm);
+use Socket qw(inet_aton unpack_sockaddr_in);
+
 use Data::Dumper;
 $Data::Dumper::Indent   = 1;
 $Data::Dumper::Sortkeys = 1;
 
-my $msghdr_error;
-BEGIN {
-    # Can't use "require" later on since Socket::MsgHdr has INIT blocks
-    eval sprintf(qq(#line %d "%s"\nuse Socket::MsgHdr; 1), __LINE__, __FILE__)
-        or $msghdr_error = $@ || "Unknown error loading Socket::MsgHdr\n";
-}
 ($Bin, $Script) = __FILE__ =~ m{^(.*)/(.+)\z} or
     die "Could not parse ", __FILE__ if $Script eq "-" && __FILE__ ne "-";
 
 $SIG{PIPE} = "IGNORE";
 
-my $FREE_BSD = $^O eq "freebsd";
-# Unfortunately not a builtin in Socket nor Socket::MsgHdr.
-# This is the linux value, can be different on other systems
-my $IP_PKTINFO = $FREE_BSD ? 7 : 8;
-# IPPROTO_IP exists in Socket, but not in really old ones
-my $IPPROTO_IP = 0;
+my $MULTICAST_BEGIN = inet_aton("224.0.0.0") // die "Assertion: Bad address";
+# multicast range *excludes* this END address
+my $MULTICAST_END   = inet_aton("240.0.0.0") // die "Assertion: Bad address";
+
+my $IP_VERSION = 4;
+my $PROTO_UDP = 17;
+my $IHL = 5;
+my $UDP_HEADER = 8;
+my $DF = 2;
+my $TTL = 64;
 
 my $ssh = "/usr/bin/ssh";
 my $verbose = undef;
@@ -45,11 +54,10 @@ my $SOCKS_TIMEOUT = 120;
 # How much we can typically fit into our communication channel
 my $LINE_BLOCK_SIZE = 16384;
 my $BLOCK_SIZE = 65536;
+my $UDP_SIZE = 65536;
 my $LISTEN_BACKLOG = 128;
 my $KEEPALIVE = 300;
-
-my $LOW_WATER  = 3e6;
-my $HIGH_WATER = 4e6;
+my $UDP_MAX = 10;
 
 my @settings = sort qw(EPOCH TIMEOUT KEEPALIVE LOW_WATER HIGH_WATER);
 my %settings;
@@ -60,6 +68,9 @@ my $STUFFED = "GoNow";
 # Line protocol commands
 my $START	= "1";
 my $SET		= "S";	# sets a server variable
+my $UDP_REMOTE	= "r";
+my $DATA	= "D";
+my $RESPONSE	= "d";
 
 my $ERROR_ECONNREFUSED	= "Connection refused";
 my $ERROR_ENETUNREACH	= "Network is unreachable";
@@ -68,8 +79,6 @@ my $ERROR_ERESOLV	= "Could not resolve host";
 
 my $role = @ARGV ? "client" : "server";
 my $role_peer = $role eq "server" ? "client" : "server";
-
-my $msghdr = $msghdr_error ? undef : Socket::MsgHdr->new();
 
 # Determine some system settings
 my $hostname = hostname();
@@ -375,16 +384,334 @@ sub run_now {
     $now = clock_gettime($CLOCK_TYPE);
 }
 
+package Ids;
+# Allocate and free unique numbers
+
+sub id_init {
+    my ($ids) = @_;
+
+    $ids->{free_ids} = [];
+    $ids->{free_id}  = 0;
+}
+
+sub id_alloc {
+    my ($ids) = @_;
+
+    return shift @{$ids->{free_ids}} || ++$ids->{free_id};
+}
+
+sub id_free {
+    my ($ids, $id) = @_;
+
+    push @{$ids->{free_ids}}, $id;
+    # Decrease free_ids some if we are lucky
+    while (@{$ids->{free_ids}}) {
+        if ($ids->{free_ids}[-1] == $ids->{free_id}) {
+            --$ids->{free_id};
+            pop @{$ids->{free_ids}};
+        } elsif ($ids->{free_ids}[0] == $ids->{free_id}) {
+            --$ids->{free_id};
+            shift @{$ids->{free_ids}};
+        } else {
+            last;
+        }
+    }
+}
+
+package Fou::UDP;
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+use Socket qw(PF_INET SOCK_DGRAM inet_aton inet_ntoa pack_sockaddr_in);
+use Scalar::Util qw(weaken);
+
+sub socket_udp_connected {
+    my ($host, $port) = @_;
+
+    socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_UDP) ||
+        die "Could not create UDP socket: $^E";
+    my $addr = inet_aton($host) || die "Could nor resolve '$host'";
+    my $remote = pack_sockaddr_in($port, $addr);
+    connect($socket, $remote) || die "Could not connect socket: $^E";
+    $socket->blocking(0);
+
+    return inet_ntoa($addr), $socket;
+}
+
+sub new {
+    my ($class, $line, $host, $port) = @_;
+
+    my ($h, $socket) = socket_udp_connected($host, $port);
+    my $fou = bless {
+        out	=> [],
+        socket	=> $socket,
+        host	=> $h,
+        port	=> $port,
+    }, $class;
+    weaken($fou->{line} = $line);
+
+    return $fou;
+}
+
+sub write : method {
+    my $fou = shift;
+    $fou->{socket}->add_write(sub { $fou->writer}) if
+        1 == push @{$fou->{out}}, shift;
+}
+
+sub writer {
+    my ($fou) = @_;
+
+    my $rc = syswrite($fou->{socket}, $fou->{out}[0]);
+    if (!defined $rc) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Could not write to Fou UDP socket: $^E";
+    }
+    ::info("Wrote %d bytes to Fou UDP socket %s:%d (%d left): %s",
+           $rc, $fou->{host}, $fou->{port}, length($fou->{out}[0]) - $rc,
+           ::display(substr($fou->{out}[0], 0, $rc))) if $debug;
+    $rc == length($fou->{out}[0]) ||
+    die "Assertion: Incomplete UDP write ($rc of " . length($fou->{out}[0]) . ")";
+    shift @{$fou->{out}};
+    $fou->{socket}->delete_write if !@{$fou->{out}};
+}
+
+package Sender::UDP;
+use Scalar::Util qw(weaken);
+use Socket qw(pack_sockaddr_in unpack_sockaddr_in inet_ntoa);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+
+sub new {
+    my ($class, $line, $id) = @_;
+
+    die "Already have Sender::UDP socket '$id'" if $line->{sockets_udp}{$id};
+
+    my ($host, $port, $socket) = $line->socket_udp("0.0.0.0", 0);
+
+    my $sender = bless {
+        id		=> $id,
+        out		=> [],
+        socket		=> $socket,
+        local_host	=> $host,
+        local_port	=> $port,
+    }, $class;
+    weaken($sender->{line} = $line);
+
+    ::info("Sending on sender UDP socket[$id] '$host:$port'") if $debug;
+    $socket->add_read(sub { $sender->reader });
+
+    $line->{listeners}{$id} = $sender;
+    return $sender;
+}
+
+sub write : method {
+    my $sender = shift;
+    my $addr = shift;
+    my $port = shift;
+    my $to = pack_sockaddr_in($port, $addr);
+    $sender->{socket}->add_write(sub { $sender->writer}) if
+        1 == push @{$sender->{out}}, [$to, shift];
+}
+
+sub writer {
+    my ($sender) = @_;
+
+    my $data = $sender->{out}[0];
+    my $rc = send($sender->{socket}, $data->[1], 0, $data->[0]);
+    if (!defined $rc) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Could not write to sender UDP socket: $^E";
+    }
+    if ($debug) {
+        my ($port, $addr) = unpack_sockaddr_in($data->[0]);
+        my $host = inet_ntoa($addr);
+        ::info("Wrote %d bytes to %s:%d (%d left): %s",
+               $rc, $host, $port, length($data->[1]) - $rc, ::display(substr($data->[0], 0, $rc)));
+    }
+    $rc == length($data->[1]) || die "Assertion: Incomplete UDP write ($rc of " . length($data->[1]) . ")";
+    shift @{$sender->{out}};
+    $sender->{socket}->delete_write if !@{$sender->{out}};
+}
+
+sub reader {
+    my ($sender) = @_;
+
+    my $sockaddr = recv($sender->{socket}, my $buffer, $UDP_SIZE, 0);
+    if (!defined $sockaddr) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Could not read from sending UDP socket: $^E";
+    }
+    # No special handling for length 0.
+    # It's perfectly fine to send and receve empty UDP packets
+    my ($port, $addr) = unpack_sockaddr_in($sockaddr);
+    if ($debug) {
+        my $host = inet_ntoa($addr);
+        ::info("Received %d bytes from %s:%d on sender UDP socket[%d]: %s",
+               length($buffer), $host, $port, $sender->{id}, ::display($buffer));
+    }
+    $sender->{line}->write($RESPONSE, pack("wa4n", $sender->{id}, $addr, $port), $buffer);
+}
+
+package Listener::UDP;
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+use Socket qw(inet_ntoa pack_sockaddr_in);
+use Scalar::Util qw(weaken);
+
+sub new {
+    my ($class, $line, $host, $port) = @_;
+
+    my ($h, $p, $socket) = $line->socket_udp($host, $port);
+    # setsockopt($socket, $IPPROTO_IP, $IP_PKTINFO, 1) ||
+    #    die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
+
+    my $listener = bless {
+        socket		=> $socket,
+        local_host	=> $h,
+        local_port	=> $p,
+    }, $class;
+    weaken($listener->{line} = $line);
+
+    ::info("Listening on UDP socket '$h:$p'") if $debug;
+    $socket->add_read(sub { $listener->reader });
+
+    my $id = $line->id_alloc;
+    $line->{listeners}{$id} = $listener;
+    return $listener;
+}
+
+sub reader {
+    my ($listener) = @_;
+
+    my $rc = $listener->{socket}->sysread(my $buffer, $UDP_SIZE);
+    if (!defined $rc) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Could not read from listening $role UDP socket: $^E";
+    }
+    # No special handling for length 0.
+    # It's perfectly fine to send and receve empty UDP packets
+    my $debug_str = $debug && sprintf("Received %d bytes from $role UDP socket: %s", $rc, ::display($buffer));
+    if (length $buffer < 20) {
+        ::info($debug_str) if $debug_str;
+        return;
+    }
+    my ($ihl, $ecn, $length, $id, $fragment, $ttl, $proto, $chksum, $nsrc, $ndst) = unpack("CCnnnCCna4a4", $buffer);
+    # print STDERR "TEMP: IHL=$ihl, ECN=$ecn, LEN=$length, ID=$id, FRAGMENT=$fragment, TTL=$ttl, PROTO=$proto, CHK=$chksum, SRC=$nsrc, DST=$ndst\n";
+
+    # Don't handle spammy multicast stuff
+    return if $MULTICAST_BEGIN le $ndst && $ndst lt $MULTICAST_END;
+    ::info($debug_str) if $debug_str;
+
+    my $version = $ihl >> 4;
+    $ihl &= 0xf;
+    my $flags = $fragment >> 13;
+    $fragment &= 0x1fff;
+    # only TCP4
+    $version == $IP_VERSION || return;
+    # Only UDP
+    $proto == $PROTO_UDP || return;
+    # Sanity check on buffer
+    length($buffer) == $length || return;
+    # We don't handle IP options (yet)
+    $ihl == $IHL || return;
+    # Too many hops
+    $ttl || return;
+    # Don't handle fragments (fragment offset)
+    return if $fragment;
+    # Don't handle fragments (MF flag set)
+    return if $flags & 0x4;
+
+    my $pseudo10 = pack("a4a4xC", $nsrc, $ndst, $proto);
+
+    $ihl *= 4;
+    my $header = substr($buffer, 0, $ihl, "");
+    $length -= $ihl;
+
+    # No buffer padding needed since length($header) is even
+    my $sum = unpack("%32n*", $header);
+    # We (currently) don't check the header chksum since we assume we only
+    # handle local packets which cannot fail
+    while ($sum > 0xffff) {
+        my $carry = $sum >> 16;
+        $sum &= 0xffff;
+        $sum += $carry;
+    }
+    $sum == 0xffff || return;
+
+    my $src = inet_ntoa($nsrc);
+    my $dst = inet_ntoa($ndst);
+
+    # print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n";
+
+    my $dscp = $ecn >> 3;
+    $ecn &= 0x7;
+    # print "HEADER: DSCP=$dscp, ECN=$ecn, ID=$id, FLAGS=$flags, FRAGMENT=$fragment, TTL=$ttl, CHKSUM=$chksum, SRC=$src, DST=$dst\n";
+
+    # Must have space for UDP header
+    return if $length < $UDP_HEADER;
+
+    # Pad buffer 0 so a last single byte still gets processed as "n"
+    $sum = unpack("%32n*", $buffer . "\x0") + unpack("%32n*", $pseudo10) + $length;
+    my ($sprt, $dprt, $udp_len, $udp_chksum) = unpack("nnnn", substr($buffer, 0, $UDP_HEADER, ""));
+    $udp_len == $length || die "Inconsistent UDP length";
+    $length -= $UDP_HEADER;
+
+    # We (currently) don't check the UDP chksum since we assume we only
+    # handle local packets which cannot fail
+    while ($sum > 0xffff) {
+        my $carry = $sum >> 16;
+        $sum &= 0xffff;
+        $sum += $carry;
+    }
+    $sum == 0xffff || return;
+
+    ::info("FOU decoded %d bytes on $role UDP socket(%s:%d -> %s:%d): %s",
+           length($buffer), $src, $sprt, $dst, $dprt, ::display($buffer)) if
+               $debug;
+
+    my $line = $listener->{line};
+    my $map_src = $line->{map_udp}{"$dst:$dprt"} ||= [
+        0,	# Next seq counter
+        {},	# Map "src:port" to map
+        [],	# Map id to map
+        # $ndst,	# Packed destination address
+        # $dprt,	# Destination Port
+    ];
+    my $map = $map_src->[1]{"$src:$sprt"} ||= {
+        key	=> "$src:$sprt",
+        port	=> $sprt,
+        addr	=> $nsrc,
+    };
+    $map->{seq} = $map_src->[0]++;
+    die "Too many packets to $dst:$dprt" if $map->{seq} == $map_src->[0];
+    $id = $map->{id};
+    if (!defined $id) {
+        $id = @{$map_src->[2]};
+        if ($id >= $UDP_MAX) {
+            my ($least) = sort {$a->{seq} <=> $b->{seq}} %$map_src;
+            $id = $least->{id};
+            delete $map_src->{$least->{key}} == $least ||
+                die "Assertion: Removing unexpected entry";
+        }
+        $map->{id} = $id;
+        $map_src->[2][$id] = $map;
+    }
+    # print STDERR ::Dumper($line->{map_udp});
+    $line->write($DATA, pack("wa4n", $id, $ndst, $dprt), $buffer);
+}
+
 package LineProtocol;
 use Errno qw(EINTR EAGAIN EWOULDBLOCK);
 use Carp;
 use FindBin qw($Script);
+use Socket qw(PF_INET SOCK_DGRAM
+              inet_ntoa inet_aton pack_sockaddr_in unpack_sockaddr_in);
 
-# use base qw(Ids);
+use base qw(Ids);
 
 my %process = (
     $SET		=> \&process_SET,
     $START		=> \&process_START,
+    $UDP_REMOTE		=> \&process_UDP_REMOTE,
+    $DATA		=> \&process_DATA,
+    $RESPONSE		=> \&process_RESPONSE,
 );
 
 sub new {
@@ -403,7 +730,12 @@ sub new {
         out		=> "",	# output buffer
         started		=> undef,	# Normal operations started
         utime_offset	=> 0,	# Estimated round trip time in microsecond
+        listeners	=> {},
+        map_udp		=> {},
+        sockets_udp	=> {},
     }, $class;
+    $line->{fou} = Fou::UDP->new($line, "127.0.0.1", "1237");
+    $line->id_init;
 
     $socket_in->add_read(sub { $line->reader });
 
@@ -421,7 +753,7 @@ sub writer {
             die "Could not write to $role_peer: $^E"
         }
         die "Zero write. Is this even possible ?" if $rc == 0;
-        ::info("wrote %d bytes to %s (%d left): %s",
+        ::info("Wrote %d bytes to %s (%d left): %s",
              $rc, $role_peer, length($line->{out}), ::display(substr($line->{out}, 0, $rc))) if $debug;
         substr($line->{out}, 0, $rc, "");
         if ($line->{out} eq "") {
@@ -469,7 +801,7 @@ sub reader {
         ::info("exit") if $verbose;
         exit 0;
     }
-    ::info("read %d bytes from $role_peer: %s", $rc, ::display(substr($line->{in}, -$rc))) if $debug;
+    ::info("Read %d bytes from $role_peer: %s", $rc, ::display(substr($line->{in}, -$rc))) if $debug;
     while ($line->{in} =~ /^([\x80-\xff]{0,2}[\x00-\x7f].)/s) {
         my ($length, $command) = unpack("wa", $line->{in});
         last if length($line->{in}) < $length;
@@ -495,17 +827,165 @@ sub process_SET {
 sub process_START {
     my $line  = shift;
 
-    my $have_msghdr = $msghdr ? "YES" : "NO";
-    my $ready = "$Script $role $me\@$hostname ready (clock=$CLOCK_TYPE_NAME, Socket::MsgHdr=$have_msghdr, pid=$$)";
+    my $ready = "$Script $role $me\@$hostname ready (clock=$CLOCK_TYPE_NAME, pid=$$)";
     $line->{started} = 1;
     if ($role eq "server") {
         $line->write($START, $verbose ? $ready : "");
     } else {
         print STDERR "\n" if $verbose || $_[0];
-        ::server_info($_[0]) if $_[0];
+        ::peer_info($_[0]) if $_[0];
         ::info("$ready") if $verbose;
         print STDERR "\n" if $verbose || $_[0];
     }
+}
+
+sub process_UDP_REMOTE {
+    my ($line, $port) = @_;
+
+    my $host = $port =~ s{(.*):}{}s ? $1 : $default_local_bind;
+    Listener::UDP->new($line, $host, $port);
+}
+
+sub process_DATA {
+    my $line = shift;
+    my ($id, $dst, $port, $data) = unpack("wa4na*", shift);
+    $id < $UDP_MAX || die "Assertion: Socket id $id >= $UDP_MAX";
+    ::info("Need to send %d bytes of UDP data on socket %d to %s:%d: %s",
+           length($data), $id, inet_ntoa($dst), $port, ::display($data)) if $debug;
+    my $sender = $line->{sockets_udp}{$id} ||= Sender::UDP->new($line, $id);
+    $sender->write($dst, $port, $data);
+}
+
+sub process_RESPONSE {
+    my $line = shift;
+
+    my ($id, $nsrc, $sprt, $data) = unpack("wa4na*", shift);
+    $id < $UDP_MAX || die "Assertion: Socket id $id >= $UDP_MAX";
+    my $src = inet_ntoa($nsrc);
+    ::info("\u$role_peer received %d bytes of UDP data on socket %d from %s:%d: %s",
+           length($data), $id, $src, $sprt, ::display($data)) if $debug;
+    my $map_src = $line->{map_udp}{"$src:$sprt"};
+    if (!$map_src) {
+        ::info("No map for $src:$sprt. Dropping packet");
+        return;
+    }
+    my $map = $map_src->[2][$id] || die "Assertion: No Sender socket[$id]";
+    my $ndst  = $map->{addr};
+    my $dprt = $map->{port};
+
+    # Build FOU IP packet
+
+    # Packet ID is meaningless for atomic packets (RFC 6864)
+    my $packet_id = int rand 2**16;
+    my $flags = $DF;
+
+    my $length = length($data);
+    my $new_length = $length + $IHL * 4 + $UDP_HEADER;
+    # Currently we don't handle overly large FOU packets
+    die "Packet too long" if $new_length >= 2**16;
+
+    my $header = pack("CCnnnCCx2a4a4",
+                      $IP_VERSION << 4 | $IHL,
+                      0,
+                      $new_length,
+                      $packet_id,
+                      $DF << 13 | 0,
+                      $TTL,
+                      $PROTO_UDP,
+                      $nsrc,
+                      $ndst,
+                  );
+    my $sum = unpack("%32n*", $header);
+    while ($sum > 0xffff) {
+        my $carry = $sum >> 16;
+        $sum &= 0xffff;
+        $sum += $carry;
+    }
+    substr($header, 10, 2, pack("n", 0xffff - $sum));
+
+    my $pseudo10 = pack("a4a4xC", $nsrc, $ndst, $PROTO_UDP);
+    my $udp_header = pack("nnn", $sprt, $dprt, $length + $UDP_HEADER);
+    # Temporarily add a 0 byte so we can do even padding
+    $data .= "\0";
+
+    $sum = unpack("%32n*", $pseudo10) + unpack("%32n*", $udp_header) + unpack("%32n*", $data) + $length + $UDP_HEADER;
+
+    while ($sum > 0xffff) {
+        my $carry = $sum >> 16;
+        $sum &= 0xffff;
+        $sum += $carry;
+    }
+    chop $data;
+    my $buffer = $header . $udp_header . pack("n", 0xffff - $sum) . $data;
+
+    if (0) {
+        # For FOU packet construction debug
+        my ($ihl, $ecn, $length, $packet_id, $fragment, $ttl, $proto, $chksum, $src, $dst) = unpack("CCnnnCCna4a4", $buffer);
+        my $version = $ihl >> 4;
+        $ihl &= 0xf;
+        my $flags = $fragment >> 13;
+        $fragment &= 0x1fff;
+        # only TCP4
+        $version == $IP_VERSION || die "Wrong version $version";
+        # Only UDP
+        $proto == $PROTO_UDP || die "Wrong proto $proto";
+        # Sanity check on buffer
+        length($buffer) == $length ||
+            die "Wrong length ", length($buffer);
+        # We don't handle IP options (yet)
+        $ihl == $IHL || die "Wrong ihl $ihl";
+        # Too many hops
+        $ttl || die "Bad TTL $ttl";
+        # Don't handle fragments (fragment offset)
+        die "Unexpected fragment $fragment" if $fragment;
+        # Don't handle fragments (MF flag set)
+        die "Bad flags $flags" if $flags & 0x4;
+
+        my $pseudo10 = pack("a4a4xC", $src, $dst, $proto);
+
+        $ihl *= 4;
+        my $header = substr($buffer, 0, $ihl, "");
+        $length -= $ihl;
+
+        # No buffer padding needed since length($header) is even
+        my $sum = unpack("%32n*", $header);
+        # We (currently) don't check the header chksum since we assume we only
+        # handle local packets which cannot fail
+        while ($sum > 0xffff) {
+            my $carry = $sum >> 16;
+            $sum &= 0xffff;
+            $sum += $carry;
+        }
+        $sum == 0xffff || die "Bad UDP checksum $sum";
+
+        $src = inet_ntoa($src);
+        $dst = inet_ntoa($dst);
+
+        my $dscp = $ecn >> 3;
+        $ecn &= 0x7;
+        ::info("HEADER: DSCP=$dscp, ECN=$ecn, ID=$packet_id, FLAGS=$flags, FRAGMENT=$fragment, TTL=$ttl, CHKSUM=$chksum, SUM=$sum, SRC=$src, DST=$dst");
+
+        # Must have space for UDP header
+        die "Bad UDP length $length" if $length < $UDP_HEADER;
+
+        # Pad buffer 0 so a last single byte still gets processed as "n"
+        $sum = unpack("%32n*", $buffer . "\x0") + unpack("%32n*", $pseudo10) + $length;
+        my ($sprt, $dprt, $udp_len, $udp_chksum) = unpack("nnnn", substr($buffer, 0, $UDP_HEADER, ""));
+        $udp_len == $length || die "Inconsistent UDP length";
+        $length -= $UDP_HEADER;
+
+        # We (currently) don't check the UDP chksum since we assume we only
+        # handle local packets which cannot fail
+        while ($sum > 0xffff) {
+            my $carry = $sum >> 16;
+            $sum &= 0xffff;
+            $sum += $carry;
+        }
+        $sum == 0xffff || die "Bad UDP chksum $sum";
+
+        ::info("SPRT=$sprt, DPRT=$dprt, LEN=$udp_len, CHK=$udp_chksum");
+    }
+    $line->{fou}->write($buffer);
 }
 
 sub set_global {
@@ -514,6 +994,25 @@ sub set_global {
     my $i = $settings{$name};
     defined $i || croak "Unknown global variable '$name'";
     $line->write($SET, pack("C", $i), $value);
+}
+
+sub socket_udp {
+    my ($class, $host, $port) = @_;
+
+    socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_UDP) ||
+        die "Could not create UDP socket: $^E";
+    my $addr = inet_aton($host) || die "Could nor resolve '$host'";
+    my $local = pack_sockaddr_in($port, $addr);
+    bind($socket, $local) || die "Could not bind socket: $^E";
+    $socket->blocking(0);
+
+    wantarray || return $socket;
+
+    my $sockaddr = getsockname($socket) ||
+        die "Assertion: Could not getsockname: $^E";
+    my ($p, $address) = unpack_sockaddr_in($sockaddr);
+    my $h = inet_ntoa($address);
+    return $h, $p, $socket;
 }
 
 package main;
@@ -554,7 +1053,7 @@ sub info {
     _info($role, @_);
 }
 
-sub server_info {
+sub peer_info {
     _info($role_peer, @_);
 }
 
@@ -590,18 +1089,27 @@ sub display {
 }
 
 sub client {
-    my ($socket_in, $socket_out) = @_;
+    my ($socket_in, $socket_out, $udp_locals, $udp_remotes) = @_;
 
     eval {
         my $line = LineProtocol->new($socket_in, $socket_out);
+
+        for my $port (@$udp_locals) {
+            my $host = $port =~ s{(.*):}{}s ? $1 : $default_local_bind;
+            Listener::UDP->new($line, $host, $port);
+        }
 
         # $line->set_global(debug      => $server_debug   || 0);
         # $line->set_global(verbose    => $server_verbose || 0);
         $line->set_global(EPOCH      => $BASE_TIME);
         $line->set_global(TIMEOUT    => $TIMEOUT);
         $line->set_global(KEEPALIVE  => $KEEPALIVE);
-        $line->set_global(LOW_WATER  => $LOW_WATER);
-        $line->set_global(HIGH_WATER => $HIGH_WATER);
+        # $line->set_global(LOW_WATER  => $LOW_WATER);
+        # $line->set_global(HIGH_WATER => $HIGH_WATER);
+
+        for my $str (@$udp_remotes) {
+            $line->write($UDP_REMOTE, $str);
+        }
 
         $line->write($START);
 
@@ -642,9 +1150,9 @@ GetOptions("client_lib=s" => \my @client_lib,
            "client_debug!"	=> \my $client_debug,
            "debug!"		=> \$debug,
            "timeout=o"		=> \$TIMEOUT,
-           "low_water=o"	=> \$LOW_WATER,
-           "high_water=o"	=> \$HIGH_WATER,
            "stuff!"		=> \$stuff,
+           "l=s"		=> \my @udp_local,
+           "r=s"		=> \my @udp_remote,
            "version!"		=> \my $version,
            "U|unsafe!"		=> \my $unsafe,
            "h|help!"		=> \my $help) ||
@@ -687,6 +1195,7 @@ defined(my $pid = fork()) || die "could not fork: $^E";
 
 if ($pid) {
     # Parent
+    # This side does the ssh connection so that ^C goes to ssh
     eval {
         close $wr0;
         close $rd1;
@@ -707,69 +1216,69 @@ if ($pid) {
         }
     };
     die $@ || "No error";
-} else {
-    # Child
-    close $rd0;
-    close $wr1;
-    $wr0->autoflush(1);
-
-    if ($stuff) {
-        my $self = "$Bin/$Script";
-        open(my $fh, "<", $self) || die "Could not open $self: $^E";
-        my $content = qq(#line 1 "$Bin/$Script"\n);
-        $content .= do { local $/; <$fh> };
-        $content =~ s/\n__END__\n.*/\n/s || die "Could not find __END__";
-        # Remove full line comments, but not #line statements.
-        # Leave the \n so line numbers in error messages keep working
-        $content =~ s/^[^\S\n]*#(?![^\S\n]*line\s).*//mg;
-        # Drop leading spaces. Saves about 20%
-        # (less of course if the ssh does compression, as it does by default)
-        $content =~ s/^[^\S\n]+//mg;
-
-
-        # Change a few variables in the server code
-        my %replace =
-            (verbose	=> $server_verbose,
-             debug	=> $server_debug,
-             role	=> "server",
-
-             TIMEOUT	=> $TIMEOUT,
-             KEEPALIVE	=> $KEEPALIVE,
-             LOW_WATER	=> $LOW_WATER,
-             HIGH_WATER	=> $HIGH_WATER,
-         );
-        while (my ($name, $value) = each %replace) {
-            local $Data::Dumper::Indent  = 0;
-            local $Data::Dumper::Purity  = 1;
-            local $Data::Dumper::Varname = $name;
-            $value = Dumper($value);
-            $value =~ s/\$\Q$name\E1\b/\$$name/g || die "Assertion: No VAR1";
-            # info("Value=<$value>") if $verbose;
-            $content =~ s{^([^\S\n]*(?:my|our)\s*)\$\Q$name\E\s*=[^;\n]*;[^\S\n]*\n}{$1$value\n}m || die "Could not set $name";
-        }
-
-        print($wr0 $PRE_STUFFER) || die "Write error:$^E";
-        for my $client_lib (map split(/:/), @client_lib) {
-            print($wr0 qq(use lib "$client_lib";\n)) || die "Write error:$^E";
-        }
-        # print($wr0 qq(\$Script="\$Script"\n)) || die "Write error:$^E";
-        print($wr0 $content) || die "Write error:$^E";
-        print($wr0 $POST_STUFFER) || die "Write error:$^E";
-        my $line = "";
-        while (length($line) < length($STUFFED)) {
-            alarm(60);
-            my $rc = sysread($rd1, $line, length($STUFFED)-length $line, length $line);
-            if (!defined $rc) {
-                next if $! == EINTR;
-                die "Read error: $^E";
-            }
-            die "Unexpected EOF" if $rc == 0;
-        }
-        alarm(0);
-        $line eq $STUFFED || die "Bad server confirm $line";
-    }
-    client($rd1, $wr0, $server_debug, $server_verbose);
 }
+
+# Child
+close $rd0;
+close $wr1;
+$wr0->autoflush(1);
+
+if ($stuff) {
+    my $self = "$Bin/$Script";
+    open(my $fh, "<", $self) || die "Could not open $self: $^E";
+    my $content = qq(#line 1 "$Bin/$Script"\n);
+    $content .= do { local $/; <$fh> };
+    $content =~ s/\n__END__\n.*/\n/s || die "Could not find __END__";
+    # Remove full line comments, but not #line statements.
+    # Leave the \n so line numbers in error messages keep working
+    $content =~ s/^[^\S\n]*#(?![^\S\n]*line\s).*//mg;
+    # Drop leading spaces. Saves about 20%
+    # (less of course if the ssh does compression, as it does by default)
+    $content =~ s/^[^\S\n]+//mg;
+
+
+    # Change a few variables in the server code
+    my %replace =
+        (verbose	=> $server_verbose,
+         debug	=> $server_debug,
+         role	=> "server",
+
+         TIMEOUT	=> $TIMEOUT,
+         KEEPALIVE	=> $KEEPALIVE,
+         # LOW_WATER	=> $LOW_WATER,
+         # HIGH_WATER	=> $HIGH_WATER,
+     );
+    while (my ($name, $value) = each %replace) {
+        local $Data::Dumper::Indent  = 0;
+        local $Data::Dumper::Purity  = 1;
+        local $Data::Dumper::Varname = $name;
+        $value = Dumper($value);
+        $value =~ s/\$\Q$name\E1\b/\$$name/g || die "Assertion: No VAR1";
+        # info("Value=<$value>") if $verbose;
+        $content =~ s{^([^\S\n]*(?:my|our)\s*)\$\Q$name\E\s*=[^;\n]*;[^\S\n]*\n}{$1$value\n}m || die "Could not set $name";
+    }
+
+    print($wr0 $PRE_STUFFER) || die "Write error:$^E";
+    for my $client_lib (map split(/:/), @client_lib) {
+        print($wr0 qq(use lib "$client_lib";\n)) || die "Write error:$^E";
+    }
+    # print($wr0 qq(\$Script="\$Script"\n)) || die "Write error:$^E";
+    print($wr0 $content) || die "Write error:$^E";
+    print($wr0 $POST_STUFFER) || die "Write error:$^E";
+    my $line = "";
+    while (length($line) < length($STUFFED)) {
+        alarm(60);
+        my $rc = sysread($rd1, $line, length($STUFFED)-length $line, length $line);
+        if (!defined $rc) {
+            next if $! == EINTR;
+            die "Read error: $^E";
+        }
+        die "Unexpected EOF" if $rc == 0;
+    }
+    alarm(0);
+    $line eq $STUFFED || die "Bad server confirm $line";
+}
+client($rd1, $wr0, \@udp_local, \@udp_remote);
 
 __END__
 Implementation notes:
