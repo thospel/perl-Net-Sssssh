@@ -8,6 +8,17 @@ use warnings;
 # ip addr add 10.253.4.1/24 dev fou1
 # ip fou add port 1237 ipproto 4 local 127.0.0.1
 
+# Redirect packets to port 1234 into the fou1 tunnel:
+# iptables -t mangle -N LOG_FWMARK2
+# iptables -t mangle -A LOG_FWMARK2 -j LOG --log-prefix 'iptables-mark2: ' --log-level info
+# iptables -t mangle -A LOG_FWMARK2 -j MARK --set-mark 17
+# iptables -t mangle -A OUTPUT -p udp --dport 1234 -j LOG_FWMARK2
+# ip rule add fwmark 17 lookup 101
+# ip route add default via 10.253.4.1 table 101
+
+# sysctl -w net.ipv4.conf.all.rp_filter=0
+# sysctl -w net.ipv4.conf.fou1.rp_filter=0
+
 # ip fou del port 1237 ipproto 4 local 127.0.0.1
 # ip link del name fou1
 
@@ -49,19 +60,22 @@ my $default_remote_bind = "127.0.0.1";
 
 # How long a server UDP socket lingers without traffic
 # How long an errored TCP connection tries to push lingering output
-my $TIMEOUT = 120;
 my $SOCKS_TIMEOUT = 120;
 # How much we can typically fit into our communication channel
 my $LINE_BLOCK_SIZE = 16384;
 my $BLOCK_SIZE = 65536;
 my $UDP_SIZE = 65536;
 my $LISTEN_BACKLOG = 128;
-my $KEEPALIVE = 300;
-my $UDP_MAX = 10;
 
-my @settings = sort qw(EPOCH TIMEOUT KEEPALIVE LOW_WATER HIGH_WATER);
-my %settings;
-$settings{$settings[$_]} = $_ for 0..$#settings;
+my %settings = (
+    EPOCH	=> undef,
+    TIMEOUT	=> 120,
+    KEEPALIVE	=> 300,
+    UDP_MAX	=> 4,
+);
+my @setting_ids = sort keys %settings;
+my %setting_ids;
+$setting_ids{$setting_ids[$_]} = $_ for 0..$#setting_ids;
 
 my $STUFFED = "GoNow";
 
@@ -71,6 +85,7 @@ my $SET		= "S";	# sets a server variable
 my $UDP_REMOTE	= "r";
 my $DATA	= "D";
 my $RESPONSE	= "d";
+my $KEEP	= "K";	# Keepalive packet
 
 my $ERROR_ECONNREFUSED	= "Connection refused";
 my $ERROR_ENETUNREACH	= "Network is unreachable";
@@ -252,6 +267,10 @@ sub realtime {
     return clock_gettime(CLOCK_REALTIME);
 }
 
+sub time : method {
+    return clock_gettime($CLOCK_TYPE);
+}
+
 my $BASE_TIME = Timer->realtime();
 
 # Timers are kept in a simple binary heap @timers
@@ -418,62 +437,6 @@ sub id_free {
     }
 }
 
-package Fou::UDP;
-use Errno qw(EINTR EAGAIN EWOULDBLOCK);
-use Socket qw(PF_INET SOCK_DGRAM inet_aton inet_ntoa pack_sockaddr_in);
-use Scalar::Util qw(weaken);
-
-sub socket_udp_connected {
-    my ($host, $port) = @_;
-
-    socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_UDP) ||
-        die "Could not create UDP socket: $^E";
-    my $addr = inet_aton($host) || die "Could nor resolve '$host'";
-    my $remote = pack_sockaddr_in($port, $addr);
-    connect($socket, $remote) || die "Could not connect socket: $^E";
-    $socket->blocking(0);
-
-    return inet_ntoa($addr), $socket;
-}
-
-sub new {
-    my ($class, $line, $host, $port) = @_;
-
-    my ($h, $socket) = socket_udp_connected($host, $port);
-    my $fou = bless {
-        out	=> [],
-        socket	=> $socket,
-        host	=> $h,
-        port	=> $port,
-    }, $class;
-    weaken($fou->{line} = $line);
-
-    return $fou;
-}
-
-sub write : method {
-    my $fou = shift;
-    $fou->{socket}->add_write(sub { $fou->writer}) if
-        1 == push @{$fou->{out}}, shift;
-}
-
-sub writer {
-    my ($fou) = @_;
-
-    my $rc = syswrite($fou->{socket}, $fou->{out}[0]);
-    if (!defined $rc) {
-        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
-        die "Could not write to Fou UDP socket: $^E";
-    }
-    ::info("Wrote %d bytes to Fou UDP socket %s:%d (%d left): %s",
-           $rc, $fou->{host}, $fou->{port}, length($fou->{out}[0]) - $rc,
-           ::display(substr($fou->{out}[0], 0, $rc))) if $debug;
-    $rc == length($fou->{out}[0]) ||
-    die "Assertion: Incomplete UDP write ($rc of " . length($fou->{out}[0]) . ")";
-    shift @{$fou->{out}};
-    $fou->{socket}->delete_write if !@{$fou->{out}};
-}
-
 package Sender::UDP;
 use Scalar::Util qw(weaken);
 use Socket qw(pack_sockaddr_in unpack_sockaddr_in inet_ntoa);
@@ -492,6 +455,7 @@ sub new {
         socket		=> $socket,
         local_host	=> $host,
         local_port	=> $port,
+        timeout		=> undef,
     }, $class;
     weaken($sender->{line} = $line);
 
@@ -502,13 +466,21 @@ sub new {
     return $sender;
 }
 
+sub timeout {
+    my ($sender) = @_;
+
+    die "Timeout. Could not UDP send[$sender->{id}";
+}
+
 sub write : method {
     my $sender = shift;
     my $addr = shift;
     my $port = shift;
     my $to = pack_sockaddr_in($port, $addr);
-    $sender->{socket}->add_write(sub { $sender->writer}) if
-        1 == push @{$sender->{out}}, [$to, shift];
+    if (1 == push @{$sender->{out}}, [$to, shift]) {
+        $sender->{socket}->add_write(sub { $sender->writer});
+        $sender->{timeout} = Timer->new($settings{TIMEOUT}, sub { $sender->timeout } );
+    }
 }
 
 sub writer {
@@ -528,7 +500,12 @@ sub writer {
     }
     $rc == length($data->[1]) || die "Assertion: Incomplete UDP write ($rc of " . length($data->[1]) . ")";
     shift @{$sender->{out}};
-    $sender->{socket}->delete_write if !@{$sender->{out}};
+    if (@{$sender->{out}}) {
+        $sender->{timeout} = Timer->new($settings{TIMEOUT}, sub { $sender->timeout } );
+    } else {
+        $sender->{socket}->delete_write;
+        $sender->{timeout} = undef;
+    }
 }
 
 sub reader {
@@ -573,8 +550,13 @@ sub new {
     $socket->add_read(sub { $listener->reader });
 
     my $id = $line->id_alloc;
+    $listener->{id} = $id;
     $line->{listeners}{$id} = $listener;
     return $listener;
+}
+
+sub id {
+    return shift->{id};
 }
 
 sub reader {
@@ -674,21 +656,37 @@ sub reader {
         # $ndst,	# Packed destination address
         # $dprt,	# Destination Port
     ];
-    my $map = $map_src->[1]{"$src:$sprt"} ||= {
-        key	=> "$src:$sprt",
+    # For now we have exactly one fou per listener, even if the fou are the same
+    my $fou_id = $listener->{id};
+    my $key = "$src:$sprt:$fou_id";
+    my $map = $map_src->[1]{$key} ||= {
+        key	=> $key,
         port	=> $sprt,
+        host	=> $src,
         addr	=> $nsrc,
+        fou_id	=> $fou_id,
     };
     $map->{seq} = $map_src->[0]++;
     die "Too many packets to $dst:$dprt" if $map->{seq} == $map_src->[0];
     $id = $map->{id};
     if (!defined $id) {
-        $id = @{$map_src->[2]};
-        if ($id >= $UDP_MAX) {
-            my ($least) = sort {$a->{seq} <=> $b->{seq}} %$map_src;
-            $id = $least->{id};
-            delete $map_src->{$least->{key}} == $least ||
+        if (values %{$map_src->[1]} > $settings{UDP_MAX}) {
+            my @old = sort {$a->{seq} <=> $b->{seq}} values %{$map_src->[1]};
+            pop @old;
+            for my $old (@old) {
+                if ($line->socket_udp($old->{host}, $old->{port}, 1)) {
+                    ::info("Releasing map '$key' (socket not in use any more)") if $debug;
+                    $id = $old->{id};
+                    last;
+                }
+            }
+            $id // die "Assertion: no Free id's";
+            # $id //= $old[0]{id} // die "Assertion: no Free id's";
+            my $remove = $map_src->[2][$id];
+            delete $map_src->[1]{$remove->{key}} == $remove ||
                 die "Assertion: Removing unexpected entry";
+        } else {
+            $id = @{$map_src->[2]};
         }
         $map->{id} = $id;
         $map_src->[2][$id] = $map;
@@ -697,8 +695,81 @@ sub reader {
     $line->write($DATA, pack("wa4n", $id, $ndst, $dprt), $buffer);
 }
 
-package LineProtocol;
+package Fou::UDP;
 use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+use Socket qw(PF_INET SOCK_DGRAM inet_aton inet_ntoa pack_sockaddr_in);
+use Scalar::Util qw(weaken);
+
+sub socket_udp_connected {
+    my ($host, $port) = @_;
+
+    socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_UDP) ||
+        die "Could not create UDP socket: $^E";
+    my $addr = inet_aton($host) || die "Could nor resolve '$host'";
+    my $remote = pack_sockaddr_in($port, $addr);
+    connect($socket, $remote) || die "Could not connect socket: $^E";
+    $socket->blocking(0);
+
+    return inet_ntoa($addr), $socket;
+}
+
+sub new {
+    my ($class, $line, $id, $host, $port) = @_;
+
+    die "Assertion: fou id $id already exists" if exists $line->{fou}{$id};
+    my ($h, $socket) = socket_udp_connected($host, $port);
+    my $fou = bless {
+        id	=> $id,
+        out	=> [],
+        socket	=> $socket,
+        host	=> $h,
+        port	=> $port,
+        timeout	=> undef,
+    }, $class;
+    weaken($fou->{line} = $line);
+    $line->{fou}{$id} = $fou;
+
+    return $fou;
+}
+
+sub timeout {
+    my ($fou) = @_;
+
+    die "Timeout. Could not FOU send[$fou->{id}";
+}
+
+sub write : method {
+    my $fou = shift;
+    if (1 == push @{$fou->{out}}, shift) {
+        $fou->{socket}->add_write(sub { $fou->writer});
+        $fou->{timeout} = Timer->new($settings{TIMEOUT}, sub { $fou->timeout } );
+    }
+}
+
+sub writer {
+    my ($fou) = @_;
+
+    my $rc = syswrite($fou->{socket}, $fou->{out}[0]);
+    if (!defined $rc) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Could not write to Fou UDP socket: $^E";
+    }
+    ::info("Wrote %d bytes to Fou UDP socket %s:%d (%d left): %s",
+           $rc, $fou->{host}, $fou->{port}, length($fou->{out}[0]) - $rc,
+           ::display(substr($fou->{out}[0], 0, $rc))) if $debug;
+    $rc == length($fou->{out}[0]) ||
+        die "Assertion: Incomplete UDP write ($rc of " . length($fou->{out}[0]) . ")";
+    shift @{$fou->{out}};
+    if (@{$fou->{out}}) {
+        $fou->{timeout} = Timer->new($settings{TIMEOUT}, sub { $fou->timeout } );
+    } else {
+        $fou->{socket}->delete_write;
+        $fou->{timeout} = undef;
+    }
+}
+
+package LineProtocol;
+use Errno qw(EINTR EAGAIN EWOULDBLOCK EADDRINUSE);
 use Carp;
 use FindBin qw($Script);
 use Socket qw(PF_INET SOCK_DGRAM
@@ -709,6 +780,7 @@ use base qw(Ids);
 my %process = (
     $SET		=> \&process_SET,
     $START		=> \&process_START,
+    $KEEP		=> \&process_KEEP,
     $UDP_REMOTE		=> \&process_UDP_REMOTE,
     $DATA		=> \&process_DATA,
     $RESPONSE		=> \&process_RESPONSE,
@@ -730,11 +802,14 @@ sub new {
         out		=> "",	# output buffer
         started		=> undef,	# Normal operations started
         utime_offset	=> 0,	# Estimated round trip time in microsecond
+        keepalive	=> undef,
+        timeout		=> undef,
         listeners	=> {},
+        fou		=> {},
         map_udp		=> {},
         sockets_udp	=> {},
+        utime_offset	=> 0,	# Estimated round trip time in microsecond
     }, $class;
-    $line->{fou} = Fou::UDP->new($line, "127.0.0.1", "1237");
     $line->id_init;
 
     $socket_in->add_read(sub { $line->reader });
@@ -748,19 +823,37 @@ sub writer {
     while (1) {
         my $rc = $line->{socket_out}->syswrite($line->{out}, $BLOCK_SIZE);
         if (!defined $rc) {
-            return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+            if ($! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK) {
+                $line->{timeout} //= Timer->new($settings{TIMEOUT}, sub { $line->timeout } );
+                return;
+            }
             $line->{socket_out}->delete_write;
             die "Could not write to $role_peer: $^E"
         }
         die "Zero write. Is this even possible ?" if $rc == 0;
         ::info("Wrote %d bytes to %s (%d left): %s",
-             $rc, $role_peer, length($line->{out}), ::display(substr($line->{out}, 0, $rc))) if $debug;
+             $rc, $role_peer, length($line->{out})-$rc, ::display(substr($line->{out}, 0, $rc))) if $debug;
+
         substr($line->{out}, 0, $rc, "");
+        $line->{timeout} = undef;
         if ($line->{out} eq "") {
             $line->{socket_out}->delete_write;
+            $line->{keepalive} = Timer->new($settings{KEEPALIVE}, sub { $line->keepalive } );
             return;
         }
     }
+}
+
+sub keepalive {
+    my ($line) = @_;
+
+    $line->write($KEEP, sprintf("%.0f %.0f",
+                                (Timer->realtime() - $BASE_TIME)*1e6,
+                                $line->{utime_offset}));
+}
+
+sub timeout {
+    die "Timeout. Could not write to $role_peer";
 }
 
 sub line_message {
@@ -785,8 +878,11 @@ sub write : method {
     my $line = shift;
 
     my $length = line_message($line->{out}, @_);
-    $line->{socket_out}->add_write(sub { $line->writer }) if
-        $length == length $line->{out};
+    if ($length == length $line->{out}) {
+        $line->{socket_out}->add_write(sub { $line->writer });
+        $line->{keepalive} = undef;
+        $line->{timeout} = Timer->new($settings{TIMEOUT}, sub { $line->timeout } );
+    }
 }
 
 sub reader {
@@ -819,37 +915,71 @@ sub process_SET {
     my $line  = shift;
 
     my $i = unpack("C", substr($_[0], 0, 1, ""));
-    my $name = $settings[$i] || die "Unknown variable $i";
-    $line->{$name} = $_[0];
-    ::info("Set %s=%s", $settings[$i], $_[0]) if $debug;
+    my $name = $setting_ids[$i] || die "Unknown variable $i";
+    $settings{$name} = $_[0];
+    ::info("Set %s=%s", $name, $_[0]) if $debug;
 }
 
 sub process_START {
     my $line  = shift;
 
+    defined $settings{EPOCH} || die "Lost early epoch message";
+
     my $ready = "$Script $role $me\@$hostname ready (clock=$CLOCK_TYPE_NAME, pid=$$)";
     $line->{started} = 1;
+
     if ($role eq "server") {
         $line->write($START, $verbose ? $ready : "");
     } else {
         print STDERR "\n" if $verbose || $_[0];
         ::peer_info($_[0]) if $_[0];
-        ::info("$ready") if $verbose;
+        ::info($ready) if $verbose;
         print STDERR "\n" if $verbose || $_[0];
     }
 }
 
-sub process_UDP_REMOTE {
-    my ($line, $port) = @_;
+sub process_KEEP {
+    my $line  = shift;
 
-    my $host = $port =~ s{(.*):}{}s ? $1 : $default_local_bind;
-    Listener::UDP->new($line, $host, $port);
+    # Transit time is of course meaningless if the clocks aren't
+    # synchronized very well. offset tries to compensate for that
+
+    my ($utime, $uoffset) = split " ", $_[0];
+
+    # uoffset has     peertime - mytime + transit_time (me -> peer)
+    # This calculates mytme - peertime  + transit time (peer -> me)
+    $line->{utime_offset} = (Timer->realtime() - $settings{EPOCH})*1e6 -$utime || 1;
+    if ($uoffset) {
+        ::info("Keepalive transit=%.3f ms, roundtrip=%.3f ms, offset=%.0f ms",
+               $line->{utime_offset}/1e3,
+               ($line->{utime_offset}+$uoffset)/1e3,
+               ($line->{utime_offset}-$uoffset)/2e3) if $debug;
+    } else {
+        ::info("Keepalive transit=%.3f ms",
+               $line->{utime_offset}/1e3) if $debug;
+    }
+}
+
+sub process_UDP_REMOTE {
+    my ($line, $udp) = @_;
+
+    my ($from_port, $to_port) = $udp =~ m{^([^/]+)/([^/]+)\z} or
+        die "Invalid udp_local '$udp'";
+    my $from_host = $from_port =~ s{(.*):}{}s ? $1 :
+        $default_local_bind;
+    my $to_host   = $to_port   =~ s{(.*):}{}s ? $1 :
+        $default_local_bind;
+
+    my $listener = Listener::UDP->new($line, $from_host, $from_port);
+    # For now we have exactly one fou per listener, even if the fou are the same
+    Fou::UDP->new($line, $listener->id, $to_host, $to_port);
 }
 
 sub process_DATA {
     my $line = shift;
     my ($id, $dst, $port, $data) = unpack("wa4na*", shift);
-    $id < $UDP_MAX || die "Assertion: Socket id $id >= $UDP_MAX";
+    $id < $settings{UDP_MAX} ||
+        die "Assertion: Socket id $id >= $settings{UDP_MAX}";
     ::info("Need to send %d bytes of UDP data on socket %d to %s:%d: %s",
            length($data), $id, inet_ntoa($dst), $port, ::display($data)) if $debug;
     my $sender = $line->{sockets_udp}{$id} ||= Sender::UDP->new($line, $id);
@@ -860,7 +990,8 @@ sub process_RESPONSE {
     my $line = shift;
 
     my ($id, $nsrc, $sprt, $data) = unpack("wa4na*", shift);
-    $id < $UDP_MAX || die "Assertion: Socket id $id >= $UDP_MAX";
+    $id < $settings{UDP_MAX} ||
+        die "Assertion: Socket id $id >= $settings{UDP_MAX}";
     my $src = inet_ntoa($nsrc);
     ::info("\u$role_peer received %d bytes of UDP data on socket %d from %s:%d: %s",
            length($data), $id, $src, $sprt, ::display($data)) if $debug;
@@ -870,7 +1001,11 @@ sub process_RESPONSE {
         return;
     }
     my $map = $map_src->[2][$id] || die "Assertion: No Sender socket[$id]";
-    my $ndst  = $map->{addr};
+    $map->{seq} = $map_src->[0]++;
+    die "Too many packets from $src:$sprt" if $map->{seq} == $map_src->[0];
+    my $fou = $line->{fou}{$map->{fou_id}} ||
+        die "Assertion: No Fou::UDP with id '$map->{fou_id}'";
+    my $ndst = $map->{addr};
     my $dprt = $map->{port};
 
     # Build FOU IP packet
@@ -985,27 +1120,34 @@ sub process_RESPONSE {
 
         ::info("SPRT=$sprt, DPRT=$dprt, LEN=$udp_len, CHK=$udp_chksum");
     }
-    $line->{fou}->write($buffer);
+    ::info("Queue packet for FOU[%d]: %s:%d -> %s:%d",
+           $map->{fou_id}, $src, $sprt, $map->{host}, $map->{port}) if $debug;
+    $fou->write($buffer);
 }
 
-sub set_global {
+sub set_peer {
     my ($line, $name, $value) = @_;
 
-    my $i = $settings{$name};
+    my $i = $setting_ids{$name};
     defined $i || croak "Unknown global variable '$name'";
-    $line->write($SET, pack("C", $i), $value);
+    $value //= $settings{$name} // die "Assertion: Setting '$name' to undef";
+    $line->write($SET, pack("w", $i), $value);
 }
 
 sub socket_udp {
-    my ($class, $host, $port) = @_;
+    my ($class, $host, $port, $probe) = @_;
 
     socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_UDP) ||
         die "Could not create UDP socket: $^E";
     my $addr = inet_aton($host) || die "Could nor resolve '$host'";
     my $local = pack_sockaddr_in($port, $addr);
+    if ($probe) {
+        return 1 if bind($socket, $local);
+        $! == EADDRINUSE || die "Could not bind socket: $^E";
+        return 0;
+    }
     bind($socket, $local) || die "Could not bind socket: $^E";
     $socket->blocking(0);
-
     wantarray || return $socket;
 
     my $sockaddr = getsockname($socket) ||
@@ -1094,21 +1236,28 @@ sub client {
     eval {
         my $line = LineProtocol->new($socket_in, $socket_out);
 
-        for my $port (@$udp_locals) {
-            my $host = $port =~ s{(.*):}{}s ? $1 : $default_local_bind;
-            Listener::UDP->new($line, $host, $port);
+        for my $udp (@$udp_locals) {
+            my ($from_port, $to_port) = $udp =~ m{^([^/]+)/([^/]+)\z} or
+                die "Invalid udp_local '$udp'";
+            my $from_host = $from_port =~ s{(.*):}{}s ? $1 :
+                $default_local_bind;
+            my $to_host   = $to_port   =~ s{(.*):}{}s ? $1 :
+                $default_local_bind;
+            my $listener = Listener::UDP->new($line, $from_host, $from_port, $to_host, $to_port);
+            # For now we have exactly one fou per listener,
+            # even if the fou are the same
+            Fou::UDP->new($line, $listener->id, $to_host, $to_port);
         }
 
-        # $line->set_global(debug      => $server_debug   || 0);
-        # $line->set_global(verbose    => $server_verbose || 0);
-        $line->set_global(EPOCH      => $BASE_TIME);
-        $line->set_global(TIMEOUT    => $TIMEOUT);
-        $line->set_global(KEEPALIVE  => $KEEPALIVE);
-        # $line->set_global(LOW_WATER  => $LOW_WATER);
-        # $line->set_global(HIGH_WATER => $HIGH_WATER);
+        $line->set_peer(EPOCH      => $BASE_TIME);
+        $line->set_peer(TIMEOUT    => $settings{TIMEOUT});
+        $line->set_peer(KEEPALIVE  => $settings{KEEPALIVE});
+        # $line->set_peer(LOW_WATER  => $settings{LOW_WATER});
+        # $line->set_peer(HIGH_WATER => $settings{HIGH_WATER});
 
-        for my $str (@$udp_remotes) {
-            $line->write($UDP_REMOTE, $str);
+        for my $udp (@$udp_remotes) {
+            $udp =~ m{^[^/]+/[^/]+\z} or die "Invalid udp remote '$udp'";
+            $line->write($UDP_REMOTE, $udp);
         }
 
         $line->write($START);
@@ -1123,7 +1272,7 @@ sub server {
     eval {
         my $line = LineProtocol->new($socket_in, $socket_out);
 
-        $line->set_global(EPOCH => $BASE_TIME);
+        $line->set_peer(EPOCH => $BASE_TIME);
 
         Events->mainloop();
     };
@@ -1149,7 +1298,8 @@ GetOptions("client_lib=s" => \my @client_lib,
            "server_debug!"	=> \my $server_debug,
            "client_debug!"	=> \my $client_debug,
            "debug!"		=> \$debug,
-           "timeout=o"		=> \$TIMEOUT,
+           "keepalive=o"	=> \$settings{KEEPALIVE},
+           "timeout=o"		=> \$settings{TIMEOUT},
            "stuff!"		=> \$stuff,
            "l=s"		=> \my @udp_local,
            "r=s"		=> \my @udp_remote,
@@ -1186,8 +1336,8 @@ $server_verbose = $server_debug if $server_debug && !defined $server_verbose;
 $server_debug   = $client_debug   = 1 if $debug;
 $server_verbose = $client_verbose = 1 if $verbose;
 
-die "timeout $TIMEOUT must be positive\n" if $TIMEOUT <= 0;
-die "keepalive $KEEPALIVE must be positive\n" if $KEEPALIVE <= 0;
+die "timeout $settings{TIMEOUT} must be positive\n" if $settings{TIMEOUT} <= 0;
+die "keepalive $settings{KEEPALIVE} must be positive\n" if $settings{KEEPALIVE} <= 0;
 
 pipe(my $rd0, my $wr0) || die "Could not pipe: $^E";
 pipe(my $rd1, my $wr1) || die "Could not pipe: $^E";
@@ -1236,17 +1386,11 @@ if ($stuff) {
     # (less of course if the ssh does compression, as it does by default)
     $content =~ s/^[^\S\n]+//mg;
 
-
     # Change a few variables in the server code
     my %replace =
         (verbose	=> $server_verbose,
-         debug	=> $server_debug,
-         role	=> "server",
-
-         TIMEOUT	=> $TIMEOUT,
-         KEEPALIVE	=> $KEEPALIVE,
-         # LOW_WATER	=> $LOW_WATER,
-         # HIGH_WATER	=> $HIGH_WATER,
+         debug		=> $server_debug,
+         role		=> "server",
      );
     while (my ($name, $value) = each %replace) {
         local $Data::Dumper::Indent  = 0;

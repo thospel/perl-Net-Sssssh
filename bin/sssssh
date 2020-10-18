@@ -683,7 +683,7 @@ sub process_DAEMON {
     my $line  = shift;
 }
 
-sub set_global {
+sub set_peer {
     my ($line, $name, $value) = @_;
 
     my $i = $settings{$name};
@@ -763,13 +763,13 @@ sub client {
 
     eval {
         my $line = LineProtocol->new($socket_in, $socket_out);
-        # $line->set_global(debug      => $server_debug   || 0);
-        # $line->set_global(verbose    => $server_verbose || 0);
-        $line->set_global(EPOCH      => $BASE_TIME);
-        $line->set_global(TIMEOUT    => $TIMEOUT);
-        $line->set_global(KEEPALIVE  => $KEEPALIVE);
-        $line->set_global(LOW_WATER  => $LOW_WATER);
-        $line->set_global(HIGH_WATER => $HIGH_WATER);
+        # $line->set_peer(debug      => $server_debug   || 0);
+        # $line->set_peer(verbose    => $server_verbose || 0);
+        $line->set_peer(EPOCH      => $BASE_TIME);
+        $line->set_peer(TIMEOUT    => $TIMEOUT);
+        $line->set_peer(KEEPALIVE  => $KEEPALIVE);
+        $line->set_peer(LOW_WATER  => $LOW_WATER);
+        $line->set_peer(HIGH_WATER => $HIGH_WATER);
 
         $line->write($DAEMON);
 
@@ -783,7 +783,7 @@ sub server {
     eval {
         my $line = LineProtocol->new($socket_in, $socket_out);
 
-        $line->set_global(EPOCH => $BASE_TIME);
+        $line->set_peer(EPOCH => $BASE_TIME);
 
         Events->mainloop();
     };

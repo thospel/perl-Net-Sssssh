@@ -126,7 +126,7 @@ if (!$fou) {
             my $sender = $msghdr->name;
             my ($peer_port, $peer) = unpack_sockaddr_in($sender);
             $peer = inet_ntoa($peer);
-            print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n";
+            print "Answer: Sender $peer:$peer_port, Receiver $local [$msg_dst]\n";
             print "Received: ", length($buffer), " ", unpack("H*", $buffer), " '", $buffer, "'\n";
         }
     }
