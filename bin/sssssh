@@ -72,10 +72,9 @@ my $ERROR_ENETUNREACH	= "Network is unreachable";
 my $ERROR_ETIMEDOUT	= "Timed out";
 my $ERROR_ERESOLV	= "Could not resolve host";
 
-my $role = @ARGV ? "client" : "server";
-my $role_peer = $role eq "server" ? "client" : "server";
+my $role = "client";
 my (@tcp_local, @udp_local, @tcp_remote, @udp_remote);
-my (@socks_local, @socks_remote);
+my (@socks_local, @socks_remote, $ole_peer);
 
 my $msghdr = $msghdr_error ? undef : Socket::MsgHdr->new();
 
@@ -819,16 +818,10 @@ sub run {
     return $wr0, $rd1;
 }
 
-if ($role eq "server") {
-    server(\*STDIN, \*STDOUT);
-    die "Assertion: \u$role fell off the mainloop";
-}
-
-# From here on we are the client
-
 my $stuff = 1;
 my $remote_perl = "/usr/bin/perl";
-GetOptions("client_lib=s" => \my @client_lib,
+GetOptions("server!"		=> \my $server,
+           "client_lib=s" => \my @client_lib,
            "ssh=s"		=> \$ssh,
            "M|master"		=> \my $ssh_master,
            "perl=s"		=> \$remote_perl,
@@ -871,6 +864,16 @@ if ($help) {
     # make parser happy
     %Config::Config = ();
 }
+
+$role = "server" if $server;
+$role_peer = $role eq "server" ? "client" : "server";
+
+if ($role eq "server") {
+    server(\*STDIN, \*STDOUT);
+    die "Assertion: \u$role fell off the mainloop";
+}
+
+# From here on we are the client
 
 @ARGV || die "Missing remote host argument, Try $Script -h\n";
 if ($stuff) {
