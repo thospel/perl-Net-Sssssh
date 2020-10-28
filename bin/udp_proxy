@@ -16,6 +16,11 @@ use warnings;
 # ip rule add fwmark 17 lookup 101
 # ip route add default via 10.253.4.1 table 101
 
+# Avoid other stuff sneaking into the tunnel
+# (not sure how, but when using deluge (torrent): external traffic not on the marked port gets into the tunnel)
+# iptables -t mangle -A INPUT -d 10.253.4.1 -j DROP
+# iptables -t mangle -A OUTPUT -s 10.253.4.1 -j DROP
+
 # sysctl -w net.ipv4.conf.all.rp_filter=0
 # sysctl -w net.ipv4.conf.fou1.rp_filter=0
 
@@ -35,6 +40,7 @@ use Socket qw(inet_aton unpack_sockaddr_in);
 use Data::Dumper;
 $Data::Dumper::Indent   = 1;
 $Data::Dumper::Sortkeys = 1;
+$Data::Dumper::Useqq	= 1;
 
 ($Bin, $Script) = __FILE__ =~ m{^(.*)/(.+)\z} or
     die "Could not parse ", __FILE__ if $Script eq "-" && __FILE__ ne "-";
@@ -111,6 +117,7 @@ if ($^O eq "MSWin32") {
 }
 die "Can't determine who I am" if !$me;
 
+die "Bad file '", __FILE__, "'" if __FILE__ =~ /["\n\0]/;
 # Client stuffer
 my $POST_STUFFER = sprintf(qq(#line %d "%s"\n%s),
                            __LINE__, __FILE__, '
@@ -141,11 +148,10 @@ package Events;
 use Carp;
 use Errno qw(EINTR);
 
-my @timers = (undef);
 my $read_mask  = "";
 my $write_mask = "";
 my $error_mask = "";
-my (%read_refs, %write_refs, %error_refs, @immediate, $now);
+my (%read_refs, %write_refs, %error_refs);
 
 sub add_read(*$ ) {
     defined(my $fd = fileno(shift)) || croak "Not a filehandle";
@@ -175,7 +181,7 @@ sub delete_read(*) {
     defined(my $fd = fileno(shift)) || croak "Not a filehandle";
     ::caller_info("delete_read $fd") if $debug;
     croak "Descriptor $fd wasn't selected for read" unless $read_refs{$fd};
-    # This strange assign before delete is to poison the reference @work in
+    # This strange assign before delete is to poison the reference the for in
     # sub mainloop may still have
     $read_refs{$fd} = undef;
     delete $read_refs{$fd};
@@ -190,8 +196,8 @@ sub delete_read(*) {
 sub delete_write(*) {
     defined(my $fd = fileno(shift)) || croak "Not a filehandle";
     ::caller_info("delete_write $fd") if $debug;
-    croak "Descriptor $fd wasn't selected for write " unless $write_refs{$fd};
-    # This strange assign before delete is to poison the reference @work in
+    croak "Descriptor $fd wasn't selected for write" unless $write_refs{$fd};
+    # This strange assign before delete is to poison the reference the for in
     # sub mainloop may still have
     $write_refs{$fd} = undef;
     delete $write_refs{$fd};
@@ -206,8 +212,8 @@ sub delete_write(*) {
 sub delete_error(*) {
     defined(my $fd = fileno(shift)) || croak "Not a filehandle";
     ::caller_info("delete_error $fd") if $debug;
-    croak "Descriptor $fd wasn't selected for error " unless $error_refs{$fd};
-    # This strange assign before delete is to poison the reference @work in
+    croak "Descriptor $fd wasn't selected for error" unless $error_refs{$fd};
+    # This strange assign before delete is to poison the reference the for in
     # sub mainloop may still have
     $error_refs{$fd} = undef;
     delete $error_refs{$fd};
@@ -230,21 +236,21 @@ sub delete_error(*) {
 }
 
 sub mainloop {
+    ::info("Entering mainloop") if $verbose || $debug;
     while (1) {
-        Timer::run_now() if @timers > 1 || @immediate;
-        my $timeout = @timers > 1 ?
-            $timers[1][0]-$now > 0 ? $timers[1][0]-$now : 0 :
-            %read_refs || %write_refs || %error_refs ? undef : last;
-        if ((select(my $r = $read_mask, my $w = $write_mask, my $e = $error_mask, $timeout) || next) > 0) {
+        my $timeout = Timer::timers_collect();
+        $timeout // (%read_refs || %write_refs || %error_refs || last);
+        if ((select(my $r = $read_mask, my $w = $write_mask, my $e = $error_mask, $timeout) || (Timer::timers_run(), next)) > 0) {
             $$_ && $$_->() for
                 \@read_refs{ grep vec($r, $_, 1), keys %read_refs},
                 \@write_refs{grep vec($w, $_, 1), keys %write_refs},
                 \@error_refs{grep vec($e, $_, 1), keys %error_refs};
+            Timer::timers_run();
         } elsif ($! != EINTR) {
             die "Select failed: $^E";
         }
     }
-    ::info("Exiting mainloop") if $verbose;
+    ::info("Exiting mainloop") if $verbose || $debug;
 }
 
 package Timer;
@@ -256,6 +262,10 @@ use Time::HiRes qw(clock_gettime CLOCK_REALTIME CLOCK_MONOTONIC );
 sub TIME	() { 0 };
 sub INDEX	() { 1 };
 sub CODE	() { 2 };	# Must come after INDEX
+
+# @immediate must be persistent so no timers get lost if a callback dies
+my @immediate;
+my @timers = (undef);
 
 my $CLOCK_TYPE;
 my $CLOCK_TYPE_NAME =
@@ -277,9 +287,7 @@ my $BASE_TIME = Timer->realtime();
 sub new {
     my ($class, $time, $fun) = @_;
 
-    $now = clock_gettime($CLOCK_TYPE);
-    $time = $time + $now;
-    $time = 0.5+1/3-$time if $time < 1;
+    $time += clock_gettime($CLOCK_TYPE);
     my $i = @timers;
     while ($i > 1 && $time < $timers[$i >> 1][TIME]) {
         weaken($timers[$i] = $timers[$i >> 1]);
@@ -296,7 +304,7 @@ sub delete : method {
     my $i = $timer->[INDEX];
     if (!$i) {
         croak "Not a timer reference" unless defined($i) && $i == 0;
-        # Could be a timer sitting on the expired queue in run_now
+        # Could be a timer sitting on the expired queue @immediate
         $#$timer = INDEX if @$timer > INDEX;
         return;
     }
@@ -352,13 +360,16 @@ sub DESTROY {
     shift->delete;
 }
 
-sub run_now {
-    # @immediate must be persistent so no timers get lost if a callback dies
-    goto EXPIRED if @timers <= 1 ||
-        $timers[1][TIME] > ($now = clock_gettime($CLOCK_TYPE));
+sub timers_collect {
+    return @immediate ? 0 : undef if @timers <= 1;
+    my $now = clock_gettime($CLOCK_TYPE);
+    return @immediate ? 0 : $timers[1][TIME] - $now if $timers[1][TIME] > $now;
+
+    # We will expire at least 1 timer
+    # @timers > 2 makes sure that if we pop @timers we don't remove $timers[1]
     while (@timers > 2) {
-        push @immediate, $timers[1];
         $timers[1][INDEX] = 0;
+        weaken($immediate[@immediate] = $timers[1]);
 
         my $time = $timers[-1][TIME];
         my $n = @timers-2;
@@ -391,16 +402,21 @@ sub run_now {
         }
         weaken($timers[$i] = pop @timers);
         $timers[$i][INDEX] = $i;
-        goto EXPIRED if $timers[1][TIME] > $now;
+        return 0 if $timers[1][TIME] > $now;
     }
     if (@timers == 2) {
         $timers[1][INDEX] = 0;
-        push @immediate, pop @timers;
+        weaken($immediate[@immediate] = pop @timers);
     }
-  EXPIRED:
+    return 0;
+}
+
+sub timers_run {
+    @expired || return;
     my $fun;
-    $fun->[CODE] && $fun->[CODE]->() while $fun = shift @immediate;
-    $now = clock_gettime($CLOCK_TYPE);
+
+    # Using while instead of for in case a callback dies
+    ($fun = shift @expired) && $fun->[CODE] && $fun->[CODE]->() while @expired;
 }
 
 package Ids;
@@ -569,7 +585,7 @@ sub reader {
     }
     # No special handling for length 0.
     # It's perfectly fine to send and receve empty UDP packets
-    my $debug_str = $debug && sprintf("Received %d bytes from $role UDP socket: %s", $rc, ::display($buffer));
+    my $debug_str = $debug && sprintf("Received %d bytes on $role UDP socket: %s", $rc, ::display($buffer));
     if (length $buffer < 20) {
         ::info($debug_str) if $debug_str;
         return;
@@ -1204,7 +1220,7 @@ sub caller_info {
     my (@lines, $line, $i);
     push @lines, $line while $line = (caller(++$i))[2];
     if (@_) {
-        info("$format [line %s]", "@lines");
+        info("$format [line %s]", @_, "@lines");
     } else {
         info("$format [line @lines]");
     }

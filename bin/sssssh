@@ -14,6 +14,8 @@ use Time::Local qw(timegm);
 use Data::Dumper;
 $Data::Dumper::Indent   = 1;
 $Data::Dumper::Sortkeys = 1;
+$Data::Dumper::Useqq	= 1;
+
 my ($msghdr_error, $IPPROTO_IP);
 BEGIN {
     # Can't use "require" later on since Socket::MsgHdr has INIT blocks
@@ -124,11 +126,10 @@ package Events;
 use Carp;
 use Errno qw(EINTR);
 
-my @timers = (undef);
 my $read_mask  = "";
 my $write_mask = "";
 my $error_mask = "";
-my (%read_refs, %write_refs, %error_refs, @immediate, $now);
+my (%read_refs, %write_refs, %error_refs);
 
 sub add_read(*$ ) {
     defined(my $fd = fileno(shift)) || croak "Not a filehandle";
@@ -158,7 +159,7 @@ sub delete_read(*) {
     defined(my $fd = fileno(shift)) || croak "Not a filehandle";
     ::caller_info("delete_read $fd") if $debug;
     croak "Descriptor $fd wasn't selected for read" unless $read_refs{$fd};
-    # This strange assign before delete is to poison the reference @work in
+    # This strange assign before delete is to poison the reference the for in
     # sub mainloop may still have
     $read_refs{$fd} = undef;
     delete $read_refs{$fd};
@@ -173,8 +174,8 @@ sub delete_read(*) {
 sub delete_write(*) {
     defined(my $fd = fileno(shift)) || croak "Not a filehandle";
     ::caller_info("delete_write $fd") if $debug;
-    croak "Descriptor $fd wasn't selected for write " unless $write_refs{$fd};
-    # This strange assign before delete is to poison the reference @work in
+    croak "Descriptor $fd wasn't selected for write" unless $write_refs{$fd};
+    # This strange assign before delete is to poison the reference the for in
     # sub mainloop may still have
     $write_refs{$fd} = undef;
     delete $write_refs{$fd};
@@ -189,8 +190,8 @@ sub delete_write(*) {
 sub delete_error(*) {
     defined(my $fd = fileno(shift)) || croak "Not a filehandle";
     ::caller_info("delete_error $fd") if $debug;
-    croak "Descriptor $fd wasn't selected for error " unless $error_refs{$fd};
-    # This strange assign before delete is to poison the reference @work in
+    croak "Descriptor $fd wasn't selected for error" unless $error_refs{$fd};
+    # This strange assign before delete is to poison the reference the for in
     # sub mainloop may still have
     $error_refs{$fd} = undef;
     delete $error_refs{$fd};
@@ -213,21 +214,21 @@ sub delete_error(*) {
 }
 
 sub mainloop {
+    ::info("Entering mainloop") if $verbose || $debug;
     while (1) {
-        Timer::run_now() if @timers > 1 || @immediate;
-        my $timeout = @timers > 1 ?
-            $timers[1][0]-$now > 0 ? $timers[1][0]-$now : 0 :
-            %read_refs || %write_refs || %error_refs ? undef : last;
-        if ((select(my $r = $read_mask, my $w = $write_mask, my $e = $error_mask, $timeout) || next) > 0) {
+        my $timeout = Timer::timers_collect();
+        $timeout // (%read_refs || %write_refs || %error_refs || last);
+        if ((select(my $r = $read_mask, my $w = $write_mask, my $e = $error_mask, $timeout) || (Timer::timers_run(), next)) > 0) {
             $$_ && $$_->() for
                 \@read_refs{ grep vec($r, $_, 1), keys %read_refs},
                 \@write_refs{grep vec($w, $_, 1), keys %write_refs},
                 \@error_refs{grep vec($e, $_, 1), keys %error_refs};
+            Timer::timers_run();
         } elsif ($! != EINTR) {
             die "Select failed: $^E";
         }
     }
-    ::info("Exiting mainloop") if $verbose;
+    ::info("Exiting mainloop") if $verbose || $debug;
 }
 
 package Timer;
@@ -239,6 +240,10 @@ use Time::HiRes qw(clock_gettime CLOCK_REALTIME CLOCK_MONOTONIC );
 sub TIME	() { 0 };
 sub INDEX	() { 1 };
 sub CODE	() { 2 };	# Must come after INDEX
+
+# @immediate must be persistent so no timers get lost if a callback dies
+my @immediate;
+my @timers = (undef);
 
 my $CLOCK_TYPE;
 my $CLOCK_TYPE_NAME =
@@ -256,8 +261,7 @@ my $BASE_TIME = Timer->realtime();
 sub new {
     my ($class, $time, $fun) = @_;
 
-    $now = clock_gettime($CLOCK_TYPE);
-    $time = $time + $now;
+    $time = $time + clock_gettime($CLOCK_TYPE);
     $time = 0.5+1/3-$time if $time < 1;
     my $i = @timers;
     while ($i > 1 && $time < $timers[$i >> 1][TIME]) {
@@ -275,7 +279,7 @@ sub delete : method {
     my $i = $timer->[INDEX];
     if (!$i) {
         croak "Not a timer reference" unless defined($i) && $i == 0;
-        # Could be a timer sitting on the expired queue in run_now
+        # Could be a timer sitting on the expired queue @immediate
         $#$timer = INDEX if @$timer > INDEX;
         return;
     }
@@ -331,13 +335,16 @@ sub DESTROY {
     shift->delete;
 }
 
-sub run_now {
-    # @immediate must be persistent so no timers get lost if a callback dies
-    goto EXPIRED if @timers <= 1 ||
-        $timers[1][TIME] > ($now = clock_gettime($CLOCK_TYPE));
+sub timers_collect {
+    return @immediate ? 0 : undef if @timers <= 1;
+    my $now = clock_gettime($CLOCK_TYPE);
+    return @immediate ? 0 : $timers[1][TIME] - $now if $timers[1][TIME] > $now;
+
+    # We will expire at least 1 timer
+    # @timers > 2 makes sure that if we pop @timers we don't remove $timers[1]
     while (@timers > 2) {
-        push @immediate, $timers[1];
         $timers[1][INDEX] = 0;
+        weaken($immediate[@immediate] = $timers[1]);
 
         my $time = $timers[-1][TIME];
         my $n = @timers-2;
@@ -370,16 +377,21 @@ sub run_now {
         }
         weaken($timers[$i] = pop @timers);
         $timers[$i][INDEX] = $i;
-        goto EXPIRED if $timers[1][TIME] > $now;
+        return 0 if $timers[1][TIME] > $now;
     }
     if (@timers == 2) {
         $timers[1][INDEX] = 0;
-        push @immediate, pop @timers;
+        weaken($immediate[@immediate] = pop @timers);
     }
-  EXPIRED:
+    return 0;
+}
+
+sub timers_run {
+    @expired || return;
     my $fun;
-    $fun->[CODE] && $fun->[CODE]->() while $fun = shift @immediate;
-    $now = clock_gettime($CLOCK_TYPE);
+
+    # Using while instead of for in case a callback dies
+    ($fun = shift @expired) && $fun->[CODE] && $fun->[CODE]->() while @expired;
 }
 
 package LineProtocol;
@@ -731,7 +743,7 @@ sub caller_info {
     my (@lines, $line, $i);
     push @lines, $line while $line = (caller(++$i))[2];
     if (@_) {
-        info("$format [line %s]", "@lines");
+        info("$format [line %s]", @_, "@lines");
     } else {
         info("$format [line @lines]");
     }
