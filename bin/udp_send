@@ -9,7 +9,7 @@ my $VERSION = "1.000";
 # ip fou del port 5556
 
 my $IP_VERSION = 4;
-my $PROTO_UDP = 17;
+my $PROTO_UDP = getprotobyname("udp") // die "Unknown protocol UDP";
 my $IHL = 5;
 my $UDP_HEADER = 8;
 my $DF = 2;
@@ -30,6 +30,7 @@ use Socket::MsgHdr;
 
 die "Could not parse your command line. Try $0 -h\n" unless
     GetOptions("f|fou!"		=> \my $fou,
+               "d|debug!",	=> \my $debug,
                "a|answer!"	=> \my $answer,
                "l|local=s"	=> \my $local,
                "n|nonl!"	=> \my $no_nl,
@@ -45,13 +46,12 @@ my $s;
 if (0) {
     $s = IO::Socket::INET->new(
         # The Peer options trigger a connect which in turn forces a bind
-        Proto	=> "udp",
+        Proto		=> "udp",
         PeerHost	=> $host,
         PeerPort	=> $port) || die "Could not create socket: $!";
 } else {
     $s = IO::Socket::INET->new(
-	# Trick to force a bind
-        # (The first send would cause a bind anyways)
+	# Trick to force a bind (The first send would cause a bind anyways)
         LocalPort	=> "00",
         Proto		=> "udp") || die "Could not create socket: $!";
     my $to = pack_sockaddr_in($port, inet_aton($host));
@@ -90,7 +90,7 @@ if (!$fou) {
         print $s $txt;
     } else {
         $msghdr->buf($txt);
-        $s->sendmsg($msghdr) || die "Could not sendmsg(): %!";
+        $s->sendmsg($msghdr) || die "Could not sendmsg(): $!";
         if ($answer) {
             setsockopt($s, $IPPROTO_IP, $IP_PKTINFO, 1) ||
                 die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
@@ -139,8 +139,8 @@ my $length = length $txt;
 #my $sprt = 49154;
 #my $dprt = 1234;
 my $src = "1.2.3.4";
-my $dst = "10.253.0.8";
 my $sprt = 49154;
+my $dst = "10.253.0.8";
 my $dprt = 1234;
 
 $src = inet_aton($src) // die "Could not look up $src";
@@ -183,10 +183,11 @@ while ($sum > 0xffff) {
     $sum += $carry;
 }
 chop $txt;
-my $buffer = $header . $udp_header . pack("n", 0xffff - $sum) . $txt;
+my $buffer = $header . $udp_header . pack("n", 0xffff - $sum || 0xffff) . $txt;
 
-if (0) {
-    my ($ihl, $ecn, $length, $packet_id, $fragment, $ttl, $proto, $chksum, $src, $dst) = unpack("CCnnnCCna4a4", $buffer);
+if ($debug) {
+    my $buf = $buffer;
+    my ($ihl, $ecn, $length, $packet_id, $fragment, $ttl, $proto, $chksum, $src, $dst) = unpack("CCnnnCCna4a4", $buf);
     my $version = $ihl >> 4;
     $ihl &= 0xf;
     my $flags = $fragment >> 13;
@@ -196,8 +197,7 @@ if (0) {
     # Only UDP
     $proto == $PROTO_UDP || die "Wrong proto $proto";
     # Sanity check on buffer
-    length($buffer) == $length ||
-        die "Wrong length ", length($buffer);
+    length($buf) == $length || die "Wrong length ", length($buf);
     # We don't handle IP options (yet)
     $ihl == $IHL || die "Wrong ihl $ihl";
     # Too many hops
@@ -210,19 +210,17 @@ if (0) {
     my $pseudo10 = pack("a4a4xC", $src, $dst, $proto);
 
     $ihl *= 4;
-    my $header = substr($buffer, 0, $ihl, "");
+    my $header = substr($buf, 0, $ihl, "");
     $length -= $ihl;
 
     # No buffer padding needed since length($header) is even
     my $sum = unpack("%32n*", $header);
-    # We (currently) don't check the header chksum since we assume we only
-    # handle local packets which cannot fail
     while ($sum > 0xffff) {
         my $carry = $sum >> 16;
         $sum &= 0xffff;
         $sum += $carry;
     }
-    $sum == 0xffff || die "Bad UDP checksum $sum";
+    $sum == 0xffff || die "Bad IP checksum $sum";
 
     $src = inet_ntoa($src);
     $dst = inet_ntoa($dst);
@@ -235,19 +233,19 @@ if (0) {
     die "Bad UDP length $length" if $length < $UDP_HEADER;
 
     # Pad buffer 0 so a last single byte still gets processed as "n"
-    $sum = unpack("%32n*", $buffer . "\x0") + unpack("%32n*", $pseudo10) + $length;
-    my ($sprt, $dprt, $udp_len, $udp_chksum) = unpack("nnnn", substr($buffer, 0, $UDP_HEADER, ""));
+    $sum = unpack("%32n*", $buf . "\x0") + unpack("%32n*", $pseudo10) + $length;
+    my ($sprt, $dprt, $udp_len, $udp_chksum) = unpack("nnnn", substr($buf, 0, $UDP_HEADER, ""));
     $udp_len == $length || die "Inconsistent UDP length";
     $length -= $UDP_HEADER;
 
-    # We (currently) don't check the UDP chksum since we assume we only
-    # handle local packets which cannot fail
-    while ($sum > 0xffff) {
-        my $carry = $sum >> 16;
-        $sum &= 0xffff;
-        $sum += $carry;
+    if ($udp_chksum) {
+        while ($sum > 0xffff) {
+            my $carry = $sum >> 16;
+            $sum &= 0xffff;
+            $sum += $carry;
+        }
+        $sum == 0xffff || die "Bad UDP chksum $sum";
     }
-    $sum == 0xffff || die "Bad UDP chksum $sum";
 
     print "SPRT=$sprt, DPRT=$dprt, LEN=$udp_len, CHK=$udp_chksum\n";
 }

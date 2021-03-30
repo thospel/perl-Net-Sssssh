@@ -1,5 +1,5 @@
 Revision history for Perl extension Sssssh.
 
-1.000	2020-11-11 17:38:45 UT
+1.000	2021-03-30 22:32:01 UT
 	- original version; created by h2xs 1.23 with options
 		-X -n Sssssh

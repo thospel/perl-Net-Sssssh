@@ -12,7 +12,7 @@ my $VERSION = "1.000";
 # ip link del name tun1
 
 my $IP_VERSION = 4;
-my $PROTO_UDP = 17;
+my $PROTO_UDP = getprotobyname("udp") // die "Unknown protocol UDP";
 my $IHL = 5;
 my $UDP_HEADER = 8;
 
@@ -42,6 +42,7 @@ die "Could not parse your command line. Try $0 -h\n" unless
 my $s = IO::Socket::INET->new(
     Proto	=> "udp",
     ReUse	=> 1,
+    # LocalHost	=> "127.0.0.1",
     LocalPort	=> $port) || die "Could not create socket: $!";
 setsockopt($s, $IPPROTO_IP, $IP_PKTINFO, 1) ||
     die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
@@ -125,8 +126,6 @@ while (1) {
 
     # No buffer padding needed since length($header) is even
     my $sum = unpack("%32n*", $header);
-    # We (currently) don't check the header chksum since we assume we only
-    # handle local packets which cannot fail
     while ($sum > 0xffff) {
         my $carry = $sum >> 16;
         $sum &= 0xffff;
@@ -152,14 +151,14 @@ while (1) {
     $udp_len == $length || die "Inconsistent UDP length";
     $length -= $UDP_HEADER;
 
-    # We (currently) don't check the UDP chksum since we assume we only
-    # handle local packets which cannot fail
-    while ($sum > 0xffff) {
-        my $carry = $sum >> 16;
-        $sum &= 0xffff;
-        $sum += $carry;
+    if ($udp_chksum) {
+        while ($sum > 0xffff) {
+            my $carry = $sum >> 16;
+            $sum &= 0xffff;
+            $sum += $carry;
+        }
+        $sum == 0xffff || next;
     }
-    $sum == 0xffff || next;
 
     print "SPRT=$sprt, DPRT=$dprt, LEN=$udp_len, CHK=$udp_chksum\n";
 
