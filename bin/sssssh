@@ -387,11 +387,11 @@ sub timers_collect {
 }
 
 sub timers_run {
-    @expired || return;
+    @immediate || return;
     my $fun;
 
     # Using while instead of for in case a callback dies
-    ($fun = shift @expired) && $fun->[CODE] && $fun->[CODE]->() while @expired;
+    ($fun = shift @immediate) && $fun->[CODE] && $fun->[CODE]->() while @immediate;
 }
 
 package LineProtocol;

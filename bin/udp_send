@@ -19,10 +19,13 @@ my $FREE_BSD = $^O eq "freebsd";
 # This is the linux value, can be different on other systems
 # FreeBSD uses IP_RECVDSTADDR
 my $IP_PKTINFO = $FREE_BSD ? 7 : 8;
+my $IP_RECVTTL = 12;
+my $IP_TTL = 2;
 # IPPROTO_IP exists in Socket, but not in really old ones
 my $IPPROTO_IP = 0;
 
 use Getopt::Long 2.24 qw(:config bundling require_order);
+use Data::Dumper;
 
 use IO::Socket::INET;
 use IO::Socket qw(inet_aton inet_ntoa unpack_sockaddr_in pack_sockaddr_in);
@@ -39,7 +42,20 @@ die "Could not parse your command line. Try $0 -h\n" unless
                "h|help!"	=> \my $help);
 $no_nl = $no_nl ? "" : "\n";
 
+@ARGV == 3 || die "Syntax: udp_send [options] host port text\n";
 my ($host, $port, $txt) = @ARGV;
+
+sub string_from_value {
+    local $Data::Dumper::Indent	  = 0;
+    local $Data::Dumper::Sortkeys = 1;
+    local $Data::Dumper::Useqq	  = 1;
+    local $Data::Dumper::Trailingcomma = 0;
+    # local $Data::Dumper::Varname  = "VAR";
+    local $Data::Dumper::Terse = 1;
+    local $Data::Dumper::Quotekeys = 0;
+    local $Data::Dumper::Sparseseen = 1;
+    return Dumper(shift);
+}
 
 my $msghdr = Socket::MsgHdr->new();
 my $s;
@@ -71,7 +87,7 @@ if (0) {
 my $mysockaddr = getsockname($s);
 my ($lport, $laddr) = unpack_sockaddr_in($mysockaddr);
 $laddr = inet_ntoa($laddr);
-print STDERR "Local $laddr:$lport\n";
+print STDERR "Sent from $laddr:$lport\n";
 
 if (0) {
     my $s1 = IO::Socket::INET->new(
@@ -94,6 +110,8 @@ if (!$fou) {
         if ($answer) {
             setsockopt($s, $IPPROTO_IP, $IP_PKTINFO, 1) ||
                 die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
+            setsockopt($s, $IPPROTO_IP, $IP_RECVTTL, 1) ||
+                die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
             $msghdr->controllen(256);
             $msghdr->namelen(256);
             $msghdr->buflen(2**16);
@@ -106,28 +124,38 @@ if (!$fou) {
             die "Yikes! Ancillary data was truncated\n" if
                 $msghdr->flags & MSG_CTRUNC;
 
-            my ($local, $msg_dst);
+            my ($local, $msg_dst, $ttl);
             my @cmsg = $msghdr->cmsghdr();
             while (my ($level, $type, $data) = splice(@cmsg, 0, 3)) {
-                $level == $IPPROTO_IP && $type == $IP_PKTINFO || next;
-                if ($FREE_BSD) {
-                    length $data == 4 || die "Unexpected IP_RECVDSTADDR length";
-                    $local = inet_ntoa($data);
-                    $msg_dst = $local;
-                } else {
-                    length $data == 12 || die "Unexpected IP_PKTINFO length";
-                    my ($interface, $dst, $to) = unpack("Na4a4", $data);
-                    $local = inet_ntoa($to);
-                    $msg_dst = inet_ntoa($dst);
+                $level == $IPPROTO_IP || next;
+                if ($type == $IP_PKTINFO) {
+                    if ($FREE_BSD) {
+                        length $data == 4 ||
+                            die "Unexpected IP_RECVDSTADDR length";
+                        $local = inet_ntoa($data);
+                        $msg_dst = $local;
+                    } else {
+                        length $data == 12 ||
+                            die "Unexpected IP_PKTINFO length";
+                        my ($interface, $dst, $to) = unpack("Ia4a4", $data);
+                        $local = inet_ntoa($to);
+                        $msg_dst = inet_ntoa($dst);
+                    }
+                } elsif ($type == $IP_TTL) {
+                    length $data == 4 || die "Unexpected IP_TTL length";
+                    $ttl = unpack("I", $data);
                 }
             }
+
             $local // die "Assertion: No local addr";
+            $ttl // die "Assertion: No TTL";
 
             my $sender = $msghdr->name;
             my ($peer_port, $peer) = unpack_sockaddr_in($sender);
             $peer = inet_ntoa($peer);
-            print "Answer: Sender $peer:$peer_port, Receiver $local [$msg_dst]\n";
-            print "Received: ", length($buffer), " ", unpack("H*", $buffer), " '", $buffer, "'\n";
+            print "Answer: From $peer:$peer_port, To $local [$msg_dst]\n";
+            print "Received: TTL $ttl, ", length($buffer), " bytes ",
+                string_from_value($buffer), "\n";
         }
     }
     exit;

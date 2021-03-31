@@ -12,7 +12,7 @@ use warnings;
 
 # Redirect packets to port 1234 into the fou1 tunnel:
 # iptables -t mangle -N LOG_FWMARK2
-# iptables -t mangle -A LOG_FWMARK2 -j LOG --log-prefix 'iptables-mark2: ' --log-level info
+# # iptables -t mangle -A LOG_FWMARK2 -j LOG --log-prefix 'iptables-mark2: ' --log-level info
 # iptables -t mangle -A LOG_FWMARK2 -j MARK --set-mark 17
 # iptables -t mangle -A OUTPUT -p udp --dport 1234 -j LOG_FWMARK2
 # ip rule add fwmark 17 lookup 101
@@ -414,11 +414,11 @@ sub timers_collect {
 }
 
 sub timers_run {
-    @expired || return;
+    @immediate || return;
     my $fun;
 
     # Using while instead of for in case a callback dies
-    ($fun = shift @expired) && $fun->[CODE] && $fun->[CODE]->() while @expired;
+    ($fun = shift @immediate) && $fun->[CODE] && $fun->[CODE]->() while @immediate;
 }
 
 package Ids;

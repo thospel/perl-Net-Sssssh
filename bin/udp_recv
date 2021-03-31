@@ -20,6 +20,8 @@ my $FREE_BSD = $^O eq "freebsd";
 # This is the linux value, can be different on other systems
 # FreeBSD uses IP_RECVDSTADDR
 my $IP_PKTINFO = $FREE_BSD ? 7 : 8;
+my $IP_RECVTTL = 12;
+my $IP_TTL = 2;
 # IPPROTO_IP exists in Socket, but not in really old ones
 my $IPPROTO_IP = 0;
 
@@ -39,6 +41,18 @@ die "Could not parse your command line. Try $0 -h\n" unless
                "h|help!"	=> \my $help);
 
 
+sub string_from_value {
+    local $Data::Dumper::Indent	  = 0;
+    local $Data::Dumper::Sortkeys = 1;
+    local $Data::Dumper::Useqq	  = 1;
+    local $Data::Dumper::Trailingcomma = 0;
+    # local $Data::Dumper::Varname  = "VAR";
+    local $Data::Dumper::Terse = 1;
+    local $Data::Dumper::Quotekeys = 0;
+    local $Data::Dumper::Sparseseen = 1;
+    return Dumper(shift);
+}
+
 my $s = IO::Socket::INET->new(
     Proto	=> "udp",
     ReUse	=> 1,
@@ -46,6 +60,8 @@ my $s = IO::Socket::INET->new(
     LocalPort	=> $port) || die "Could not create socket: $!";
 setsockopt($s, $IPPROTO_IP, $IP_PKTINFO, 1) ||
     die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
+setsockopt($s, $IPPROTO_IP, $IP_RECVTTL, 1) ||
+    die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
 
 # my $buffer = "";
 my $msghdr = Socket::MsgHdr->new();
@@ -62,34 +78,48 @@ while (1) {
     die "Yikes! Ancillary data was truncated\n" if
         $msghdr->flags & MSG_CTRUNC;
 
-    my ($local, $msg_dst);
+    my ($local, $msg_dst, $ttl);
     my @cmsg = $msghdr->cmsghdr();
-    while (my ($level, $type, $data) = splice(@cmsg, 0, 3)) {
-        $level == $IPPROTO_IP && $type == $IP_PKTINFO || next;
-        if ($FREE_BSD) {
-            length $data == 4 || die "Unexpected IP_RECVDSTADDR length";
-            $local = inet_ntoa($data);
-            $msg_dst = $local;
-        } else {
-            length $data == 12 || die "Unexpected IP_PKTINFO length";
-            my ($interface, $dst, $to) = unpack("Na4a4", $data);
-            $local = inet_ntoa($to);
-            $msg_dst = inet_ntoa($dst);
+    for my $i (0 .. $#cmsg / 3) {
+        $i *= 3;
+        my ($level, $type, $data) = @cmsg[$i..$i+2];
+        $level == $IPPROTO_IP || next;
+        if ($type == $IP_PKTINFO) {
+            if ($FREE_BSD) {
+                length $data == 4 || die "Unexpected IP_RECVDSTADDR length";
+                $local = inet_ntoa($data);
+                $msg_dst = $local;
+            } else {
+                length $data == 12 || die "Unexpected IP_PKTINFO length";
+                my ($interface, $dst, $to) = unpack("Ia4a4", $data);
+                $local = inet_ntoa($to);
+                $msg_dst = inet_ntoa($dst);
+            }
+        } elsif ($type == $IP_TTL) {
+            length $data == 4 || die "Unexpected IP_TTL length";
+            $ttl = unpack("I", $data);
+            $cmsg[$i+2] = pack("I", $ttl-1);
         }
     }
     $local // die "Assertion: No local addr";
+    $ttl // die "Assertion: No TTL";
     my $sender = $msghdr->name;
     my ($peer_port, $peer) = unpack_sockaddr_in($sender);
     $peer = inet_ntoa($peer);
 
     if (!$fou) {
         print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n";
-        print "Received: ", length($buffer), " ", unpack("H*", $buffer), " '", $buffer, "'\n";
+        print "Received: TTL $ttl, ", length($buffer), " bytes ", string_from_value($buffer), "'\n";
         if ($answer) {
-            $buffer =~ s{\S+}{time()}e if $buffer !~ s/^(\d+)/$1+1/ea;
-            $msghdr->buf($buffer);
-            $s->sendmsg($msghdr) || die "Could not send: $!";
-            print "Sent: ", length($buffer), " ", unpack("H*", $buffer), " '", $buffer, "'\n";
+            if ($ttl > 0) {
+                $msghdr->cmsghdr(@cmsg);
+                $buffer =~ s{\S+}{time()}e if $buffer !~ s/^(\d+)/$1+1/ea;
+                $msghdr->buf($buffer);
+                $s->sendmsg($msghdr) || die "Could not send: $!";
+                print "Sent: ", length($buffer), " bytes ", string_from_value($buffer), "'\n";
+            } else {
+                print "Sent nothing (TTL=$ttl)\n";
+            }
         }
         print "=" x 25 . "\n";
         next;
@@ -97,8 +127,8 @@ while (1) {
     # $s->sysread($buffer, 2**16);
     # Must have space for IP header
     next if length $buffer < 20;
-    my ($ihl, $ecn, $length, $id, $fragment, $ttl, $proto, $chksum, $src, $dst) = unpack("CCnnnCCna4a4", $buffer);
-    # print STDERR "TEMP: IHL=$ihl, ECN=$ecn, LEN=$length, ID=$id, FRAGMENT=$fragment, TTL=$ttl, PROTO=$proto, CHK=$chksum, SRC=$src, DST=$dst\n";
+    my ($ihl, $ecn, $length, $id, $fragment, $udp_ttl, $proto, $chksum, $src, $dst) = unpack("CCnnnCCna4a4", $buffer);
+    # print STDERR "TEMP: IHL=$ihl, ECN=$ecn, LEN=$length, ID=$id, FRAGMENT=$fragment, TTL=$udp_ttl, PROTO=$proto, CHK=$chksum, SRC=$src, DST=$dst\n";
     my $version = $ihl >> 4;
     $ihl &= 0xf;
     my $flags = $fragment >> 13;
@@ -112,7 +142,7 @@ while (1) {
     # We don't handle IP options (yet)
     $ihl == $IHL || next;
     # Too many hops
-    $ttl || next;
+    $udp_ttl || next;
     # Don't handle fragments (fragment offset)
     next if $fragment;
     # Don't handle fragments (MF flag set)
@@ -140,7 +170,7 @@ while (1) {
 
     my $dscp = $ecn >> 3;
     $ecn &= 0x7;
-    print "HEADER: DSCP=$dscp, ECN=$ecn, ID=$id, FLAGS=$flags, FRAGMENT=$fragment, TTL=$ttl, CHKSUM=$chksum, SRC=$src, DST=$dst\n";
+    print "HEADER: DSCP=$dscp, ECN=$ecn, ID=$id, FLAGS=$flags, FRAGMENT=$fragment, TTL=$udp_ttl, CHKSUM=$chksum, SRC=$src, DST=$dst\n";
 
     # Must have space for UDP header
     next if $length < $UDP_HEADER;

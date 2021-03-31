@@ -20,6 +20,7 @@ WriteMakefile
          "Test::More"	=> "0.01",
      }) : (),
      PREREQ_PM		=> {
+         "Socket::MsgHdr"	=> "0.04",
      },
      ABSTRACT		=> 'Simple Socket Server over SSH',
      AUTHOR		=> 'Ton Hospel <sssssh@ton.iguana.be>',
