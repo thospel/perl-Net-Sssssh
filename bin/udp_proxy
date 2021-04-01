@@ -70,9 +70,9 @@ my $default_remote_bind = "127.0.0.1";
 # How long an errored TCP connection tries to push lingering output
 my $SOCKS_TIMEOUT = 120;
 # How much we can typically fit into our communication channel
-my $LINE_BLOCK_SIZE = 16384;
-my $BLOCK_SIZE = 65536;
-my $UDP_SIZE = 65536;
+my $LINE_BLOCK_SIZE = int(2**14);
+my $BLOCK_SIZE = int(2**16);
+my $UDP_SIZE = int(2**16);
 my $LISTEN_BACKLOG = 128;
 
 my %settings = (
@@ -99,6 +99,32 @@ my $ERROR_ECONNREFUSED	= "Connection refused";
 my $ERROR_ENETUNREACH	= "Network is unreachable";
 my $ERROR_ETIMEDOUT	= "Timed out";
 my $ERROR_ERESOLV	= "Could not resolve host";
+
+my $msghdr_error;
+BEGIN {
+    # Can't use "require" later on since Socket::MsgHdr has INIT blocks
+    eval sprintf(qq(#line %d "%s"\nuse Socket::MsgHdr qw(pack_cmsghdr unpack_cmsghdr sendmsg recvmsg); 1), __LINE__, __FILE__)
+        or $msghdr_error = $@ || "Unknown error loading Socket::MsgHdr\n";
+    $msghdr_error =~ s/^BEGIN faile.*\n\z// if $msghdr_error;
+}
+
+my $FREE_BSD = $^O eq "freebsd";
+# IPPROTO_IP exists in Socket, but not in really old ones
+my $IPPROTO_IP = 0;
+my ($IP_RECVTTL, $IP_TTL, $IP_PKTINFO);
+if (!$msghdr_error) {
+    if (0 && $FREE_BSD) {
+        # FreeBSD uses IP_RECVDSTADDR
+        $IP_PKTINFO = 7;
+    } elsif ($^O eq "linux") {
+        $IP_PKTINFO = 8;
+        $IP_RECVTTL = 12;
+        $IP_TTL = 2;
+    } else {
+        $msghdr_error = "Socket::MsgHdr constants for OS $^O not implemented (yet)\n";
+    }
+}
+my $msghdr = $msghdr_error ? undef : Socket::MsgHdr->new();
 
 my $role = "client";
 my $role_peer;
@@ -238,6 +264,7 @@ sub delete_error(*) {
 }
 
 sub mainloop {
+    ::info($msghdr_error) if $msghdr_error && ($verbose || $debug);
     ::info("Entering mainloop") if $verbose || $debug;
     while (1) {
         my $timeout = Timer::timers_collect();
@@ -256,6 +283,7 @@ sub mainloop {
 }
 
 package Timer;
+# A small timer core
 use Scalar::Util qw(weaken);
 use Carp;
 use Time::HiRes qw(clock_gettime CLOCK_REALTIME CLOCK_MONOTONIC);
@@ -456,8 +484,10 @@ sub id_free {
 }
 
 package Sender::UDP;
+# Send out packets at the remote side (and wait for replies)
 use Scalar::Util qw(weaken);
-use Socket qw(pack_sockaddr_in unpack_sockaddr_in inet_ntoa);
+use Socket qw(pack_sockaddr_in unpack_sockaddr_in inet_ntoa
+              MSG_TRUNC MSG_CTRUNC);
 use Errno qw(EINTR EAGAIN EWOULDBLOCK);
 
 sub new {
@@ -466,6 +496,8 @@ sub new {
     die "Already have Sender::UDP socket '$id'" if $line->{sockets_udp}{$id};
 
     my ($host, $port, $socket) = $line->socket_udp("0.0.0.0", 0);
+    !$msghdr || setsockopt($socket, $IPPROTO_IP, $IP_RECVTTL, 1) ||
+        die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
 
     my $sender = bless {
         id		=> $id,
@@ -492,10 +524,14 @@ sub timeout {
 
 sub write : method {
     my $sender = shift;
-    my $addr = shift;
-    my $port = shift;
-    my $to = pack_sockaddr_in($port, $addr);
-    if (1 == push @{$sender->{out}}, [$to, shift]) {
+    if (1 == push @{$sender->{out}}, $msghdr ?
+        bless {
+            name => pack_sockaddr_in(shift, shift),
+            buf  => shift,
+            control => ::pack_cmsghdr($IPPROTO_IP, $IP_TTL, pack("I", shift)),
+            flags => 0,
+        }, "Socket::MsgHdr" :
+        [pack_sockaddr_in(shift, shift), shift]) {
         $sender->{socket}->add_write(sub { $sender->writer});
         $sender->{timeout} = Timer->new($settings{TIMEOUT}, sub { $sender->timeout } );
     }
@@ -505,18 +541,34 @@ sub writer {
     my ($sender) = @_;
 
     my $data = $sender->{out}[0];
-    my $rc = send($sender->{socket}, $data->[1], 0, $data->[0]);
-    if (!defined $rc) {
-        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
-        die "Could not write to sender UDP socket: $^E";
+    if ($msghdr) {
+        my $rc = ::sendmsg($sender->{socket}, $data);
+        if (!defined $rc) {
+            return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+            die "Could not write to sender UDP socket: $^E";
+        }
+        if ($debug) {
+            my ($port, $addr) = unpack_sockaddr_in($data->{name});
+            my $host = inet_ntoa($addr);
+            ::info("Wrote %d bytes to %s:%d (%d left): %s",
+                   $rc, $host, $port, length($data->{buf}) - $rc, ::display(substr($data->{buf}, 0, $rc)));
+        }
+        $rc == length($data->{buf}) || die "Assertion: Incomplete UDP write ($rc of " . length($data->{buf}) . ")";
+    } else {
+        my $rc = send($sender->{socket}, $data->[1], 0, $data->[0]);
+        if (!defined $rc) {
+            return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+            die "Could not write to sender UDP socket: $^E";
+        }
+        if ($debug) {
+            my ($port, $addr) = unpack_sockaddr_in($data->[0]);
+            my $host = inet_ntoa($addr);
+            ::info("Wrote %d bytes to %s:%d (%d left): %s",
+                   $rc, $host, $port, length($data->[1]) - $rc, ::display(substr($data->[1], 0, $rc)));
+        }
+        $rc == length($data->[1]) || die "Assertion: Incomplete UDP write ($rc of " . length($data->[1]) . ")";
     }
-    if ($debug) {
-        my ($port, $addr) = unpack_sockaddr_in($data->[0]);
-        my $host = inet_ntoa($addr);
-        ::info("Wrote %d bytes to %s:%d (%d left): %s",
-               $rc, $host, $port, length($data->[1]) - $rc, ::display(substr($data->[0], 0, $rc)));
-    }
-    $rc == length($data->[1]) || die "Assertion: Incomplete UDP write ($rc of " . length($data->[1]) . ")";
+
     shift @{$sender->{out}};
     if (@{$sender->{out}}) {
         $sender->{timeout} = Timer->new($settings{TIMEOUT}, sub { $sender->timeout } );
@@ -529,7 +581,32 @@ sub writer {
 sub reader {
     my ($sender) = @_;
 
-    my $sockaddr = recv($sender->{socket}, my $buffer, $UDP_SIZE, 0);
+    my ($sockaddr, $buffer, $ttl);
+    if ($msghdr) {
+        $msghdr->{name} = "\0" x 256;
+        $msghdr->{buf}  = "\0" x $UDP_SIZE;
+        $msghdr->{control} = "\0" x 256;
+        $msghdr->{flags} = 0;
+        if (defined ::recvmsg($sender->{socket}, $msghdr)) {
+            # I suspect Socket::MsgHdr has a bug so that flags is never set
+            die "Yikes! Buffer was truncated\n" if
+                $msghdr->flags & MSG_TRUNC;
+            die "Yikes! Ancillary data was truncated\n" if
+                $msghdr->flags & MSG_CTRUNC;
+            $buffer = $msghdr->{buf};
+            $sockaddr = $msghdr->{name};
+            my ($level, $type, $data) = ::unpack_cmsghdr($msghdr->{control}) or
+                die "No ancillary data from socket";
+            $level == $IPPROTO_IP ||
+                die "Unexpected level in ancillary data from socket";
+            $type == $IP_TTL ||
+                die "Unexpected type in ancillary data from socket";
+            $ttl = unpack("I", $data);
+        }
+    } else {
+        $sockaddr = recv($sender->{socket}, $buffer, $UDP_SIZE, 0);
+        $ttl = $TTL;
+    }
     if (!defined $sockaddr) {
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
         die "Could not read from sending UDP socket: $^E";
@@ -539,23 +616,24 @@ sub reader {
     my ($port, $addr) = unpack_sockaddr_in($sockaddr);
     if ($debug) {
         my $host = inet_ntoa($addr);
-        ::info("Received %d bytes from %s:%d on sender UDP socket[%d]: %s",
-               length($buffer), $host, $port, $sender->{id}, ::display($buffer));
+        ::info("Received %d bytes %sfrom %s:%d on sender UDP socket[%d]: %s",
+               length($buffer), $msghdr ? "(TTL $ttl) " : "",
+               $host, $port, $sender->{id}, ::display($buffer));
     }
-    $sender->{line}->write($RESPONSE, pack("wa4n", $sender->{id}, $addr, $port), $buffer);
+    $sender->{line}->write($RESPONSE, pack("wa4nC", $sender->{id}, $addr, $port, $ttl-1), $buffer) if $ttl;
 }
 
 package Listener::UDP;
+# Wait for packets at the local (client) side
 use Errno qw(EINTR EAGAIN EWOULDBLOCK);
-use Socket qw(inet_ntoa pack_sockaddr_in);
+use Socket qw(inet_ntoa pack_sockaddr_in
+              MSG_TRUNC MSG_CTRUNC);
 use Scalar::Util qw(weaken);
 
 sub new {
     my ($class, $line, $host, $port) = @_;
 
     my ($h, $p, $socket) = $line->socket_udp($host, $port);
-    # setsockopt($socket, $IPPROTO_IP, $IP_PKTINFO, 1) ||
-    #    die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
 
     my $listener = bless {
         socket		=> $socket,
@@ -708,10 +786,11 @@ sub reader {
         $map_src->[2][$id] = $map;
     }
     # print STDERR ::Dumper($line->{map_udp});
-    $line->write($DATA, pack("wa4n", $id, $ndst, $dprt), $buffer);
+    $line->write($DATA, pack("wa4nC", $id, $ndst, $dprt, $ttl-1), $buffer);
 }
 
 package Fou::UDP;
+# Send out proxied packets at the local (client) side
 use Errno qw(EINTR EAGAIN EWOULDBLOCK);
 use Socket qw(PF_INET SOCK_DGRAM inet_aton inet_ntoa pack_sockaddr_in);
 use Scalar::Util qw(weaken);
@@ -765,16 +844,28 @@ sub write : method {
 sub writer {
     my ($fou) = @_;
 
-    my $rc = syswrite($fou->{socket}, $fou->{out}[0]);
+    my $rc = $msghdr ?
+        ::sendmsg($fou->{socket}, $fou->{out}[0]) :
+        syswrite($fou->{socket}, $fou->{out}[0]);
     if (!defined $rc) {
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
         die "Could not write to Fou UDP socket: $^E";
     }
-    ::info("Wrote %d bytes to Fou UDP socket %s:%d (%d left): %s",
-           $rc, $fou->{host}, $fou->{port}, length($fou->{out}[0]) - $rc,
-           ::display(substr($fou->{out}[0], 0, $rc))) if $debug;
-    $rc == length($fou->{out}[0]) ||
-        die "Assertion: Incomplete UDP write ($rc of " . length($fou->{out}[0]) . ")";
+    if ($msghdr) {
+        ::info("Wrote %d bytes (TTL %d) to Fou UDP socket %s:%d (%d left): %s",
+               $rc,
+               unpack("I", (::unpack_cmsghdr($fou->{out}[0]->{control}))[2]),
+               $fou->{host}, $fou->{port}, length($fou->{out}[0]{buf}) - $rc,
+               ::display(substr($fou->{out}[0]{buf}, 0, $rc))) if $debug;
+        $rc == length($fou->{out}[0]{buf}) ||
+            die "Assertion: Incomplete UDP write ($rc of " . length($fou->{out}[0]{buf}) . ")";
+    } else {
+        ::info("Wrote %d bytes to Fou UDP socket %s:%d (%d left): %s",
+               $rc, $fou->{host}, $fou->{port}, length($fou->{out}[0]) - $rc,
+               ::display(substr($fou->{out}[0], 0, $rc))) if $debug;
+        $rc == length($fou->{out}[0]) ||
+            die "Assertion: Incomplete UDP write ($rc of " . length($fou->{out}[0]) . ")";
+    }
     shift @{$fou->{out}};
     if (@{$fou->{out}}) {
         $fou->{timeout} = Timer->new($settings{TIMEOUT}, sub { $fou->timeout } );
@@ -785,6 +876,7 @@ sub writer {
 }
 
 package LineProtocol;
+# Handle traffic between client and server
 use Errno qw(EINTR EAGAIN EWOULDBLOCK EADDRINUSE);
 use Carp;
 use FindBin qw($Script);
@@ -993,19 +1085,19 @@ sub process_UDP_REMOTE {
 
 sub process_DATA {
     my $line = shift;
-    my ($id, $dst, $port, $data) = unpack("wa4na*", shift);
+    my ($id, $dst, $port, $ttl, $data) = unpack("wa4nCa*", shift);
     $id < $settings{UDP_MAX} ||
         die "Assertion: Socket id $id >= $settings{UDP_MAX}";
-    ::info("Need to send %d bytes of UDP data on socket %d to %s:%d: %s",
-           length($data), $id, inet_ntoa($dst), $port, ::display($data)) if $debug;
+    ::info("Need to send %d bytes of UDP data (TTL %d) on socket %d to %s:%d: %s",
+           length($data), $ttl, $id, inet_ntoa($dst), $port, ::display($data)) if $debug;
     my $sender = $line->{sockets_udp}{$id} ||= Sender::UDP->new($line, $id);
-    $sender->write($dst, $port, $data);
+    $sender->write($port, $dst, $data, $ttl);
 }
 
 sub process_RESPONSE {
     my $line = shift;
 
-    my ($id, $nsrc, $sprt, $data) = unpack("wa4na*", shift);
+    my ($id, $nsrc, $sprt, $ttl, $data) = unpack("wa4nCa*", shift);
     $id < $settings{UDP_MAX} ||
         die "Assertion: Socket id $id >= $settings{UDP_MAX}";
     my $src = inet_ntoa($nsrc);
@@ -1041,7 +1133,7 @@ sub process_RESPONSE {
                       $new_length,
                       $packet_id,
                       $DF << 13 | 0,
-                      $TTL,
+                      $ttl,
                       $PROTO_UDP,
                       $nsrc,
                       $ndst,
@@ -1135,9 +1227,19 @@ sub process_RESPONSE {
 
         ::info("SPRT=$sprt, DPRT=$dprt, LEN=$udp_len, CHK=$udp_chksum");
     }
-    ::info("Queue packet for FOU[%d]: %s:%d -> %s:%d",
-           $map->{fou_id}, $src, $sprt, $map->{host}, $map->{port}) if $debug;
-    $fou->write($buffer);
+    ::info("Queue packet (TTL %d) for FOU[%d]: %s:%d -> %s:%d",
+           $ttl, $map->{fou_id}, $src, $sprt, $map->{host}, $map->{port}) if
+               $debug;
+    if ($msghdr) {
+        $fou->write(bless {
+            name => "",
+            buf  => $buffer,
+            control => ::pack_cmsghdr($IPPROTO_IP, $IP_TTL, pack("I", $ttl)),
+            flags => 0,
+        }, "Socket::MsgHdr");
+    } else {
+        $fou->write($buffer);
+    }
 }
 
 sub set_peer {
