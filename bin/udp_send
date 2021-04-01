@@ -18,9 +18,9 @@ my $TTL = 64;
 my $FREE_BSD = $^O eq "freebsd";
 # This is the linux value, can be different on other systems
 # FreeBSD uses IP_RECVDSTADDR
-my $IP_PKTINFO = $FREE_BSD ? 7 : 8;
-my $IP_RECVTTL = 12;
-my $IP_TTL = 2;
+my $IP_PKTINFO = $FREE_BSD ?  7 :  8;
+my $IP_RECVTTL = $FREE_BSD ? 65 : 12;
+my $IP_TTL     = $FREE_BSD ?  4 :  2;
 # IPPROTO_IP exists in Socket, but not in really old ones
 my $IPPROTO_IP = 0;
 
@@ -233,7 +233,7 @@ if ($debug) {
     # Don't handle fragments (fragment offset)
     die "Unexpected fragment $fragment" if $fragment;
     # Don't handle fragments (MF flag set)
-    die "Bad flags $flags" if $flags & 0x4;
+    die "Bad flags $flags" if $flags & 0x1;
 
     my $pseudo10 = pack("a4a4xC", $src, $dst, $proto);
 

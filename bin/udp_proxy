@@ -105,7 +105,7 @@ BEGIN {
     # Can't use "require" later on since Socket::MsgHdr has INIT blocks
     eval sprintf(qq(#line %d "%s"\nuse Socket::MsgHdr qw(pack_cmsghdr unpack_cmsghdr sendmsg recvmsg); 1), __LINE__, __FILE__)
         or $msghdr_error = $@ || "Unknown error loading Socket::MsgHdr\n";
-    $msghdr_error =~ s/^BEGIN faile.*\n\z// if $msghdr_error;
+    $msghdr_error =~ s/^BEGIN failed.*\n\z// if $msghdr_error;
 }
 
 my $FREE_BSD = $^O eq "freebsd";
@@ -115,11 +115,13 @@ my ($IP_RECVTTL, $IP_TTL, $IP_PKTINFO);
 if (!$msghdr_error) {
     if (0 && $FREE_BSD) {
         # FreeBSD uses IP_RECVDSTADDR
-        $IP_PKTINFO = 7;
+        $IP_PKTINFO	=  7;
+        $IP_RECVTTL	= 65;
+        $IP_TTL		=  4;
     } elsif ($^O eq "linux") {
-        $IP_PKTINFO = 8;
-        $IP_RECVTTL = 12;
-        $IP_TTL = 2;
+        $IP_PKTINFO	=  8;
+        $IP_RECVTTL	= 12;
+        $IP_TTL		=  2;
     } else {
         $msghdr_error = "Socket::MsgHdr constants for OS $^O not implemented (yet)\n";
     }
@@ -528,7 +530,10 @@ sub write : method {
         bless {
             name => pack_sockaddr_in(shift, shift),
             buf  => shift,
-            control => ::pack_cmsghdr($IPPROTO_IP, $IP_TTL, pack("I", shift)),
+            control => ::pack_cmsghdr(
+                $IPPROTO_IP,
+                $IP_TTL,
+                pack("I", shift || die "Assertion: TTL 0")),
             flags => 0,
         }, "Socket::MsgHdr" :
         [pack_sockaddr_in(shift, shift), shift]) {
@@ -620,7 +625,7 @@ sub reader {
                length($buffer), $msghdr ? "(TTL $ttl) " : "",
                $host, $port, $sender->{id}, ::display($buffer));
     }
-    $sender->{line}->write($RESPONSE, pack("wa4nC", $sender->{id}, $addr, $port, $ttl-1), $buffer) if $ttl;
+    $sender->{line}->write($RESPONSE, pack("wa4nC", $sender->{id}, $addr, $port, $ttl-1), $buffer) if $ttl > 1;
 }
 
 package Listener::UDP;
@@ -690,11 +695,11 @@ sub reader {
     # We don't handle IP options (yet)
     $ihl == $IHL || return;
     # Too many hops
-    $ttl || return;
+    $ttl > 1 || return;
     # Don't handle fragments (fragment offset)
     return if $fragment;
     # Don't handle fragments (MF flag set)
-    return if $flags & 0x4;
+    return if $flags & 0x1;
 
     my $pseudo10 = pack("a4a4xC", $nsrc, $ndst, $proto);
 
@@ -726,7 +731,7 @@ sub reader {
     # Pad buffer 0 so a last single byte still gets processed as "n"
     $sum = unpack("%32n*", $buffer . "\x0") + unpack("%32n*", $pseudo10) + $length;
     my ($sprt, $dprt, $udp_len, $udp_chksum) = unpack("nnnn", substr($buffer, 0, $UDP_HEADER, ""));
-    $udp_len == $length || die "Inconsistent UDP length";
+    $udp_len == $length || die "Inconsistent UDP length (inner UDP payload length: $udp_len, Inner IP packet length - inner UDP header length $ihl = $length)";
     $length -= $UDP_HEADER;
 
     if ($udp_chksum) {
@@ -738,9 +743,9 @@ sub reader {
         $sum == 0xffff || return;
     }
 
-    ::info("FOU decoded %d bytes on $role UDP socket(%s:%d -> %s:%d): %s",
-           length($buffer), $src, $sprt, $dst, $dprt, ::display($buffer)) if
-               $debug;
+    ::info("FOU decoded %d bytes (TTL %d) on $role UDP socket(%s:%d -> %s:%d): %s",
+           length($buffer), $ttl, $src, $sprt, $dst, $dprt,
+           ::display($buffer)) if $debug;
 
     my $line = $listener->{line};
     my $map_src = $line->{map_udp}{"$dst:$dprt"} ||= [
@@ -790,7 +795,7 @@ sub reader {
 }
 
 package Fou::UDP;
-# Send out proxied packets at the local (client) side
+# Send out proxied packets at the local (client) side usinga FOU tunnel
 use Errno qw(EINTR EAGAIN EWOULDBLOCK);
 use Socket qw(PF_INET SOCK_DGRAM inet_aton inet_ntoa pack_sockaddr_in);
 use Scalar::Util qw(weaken);
@@ -1125,7 +1130,10 @@ sub process_RESPONSE {
     my $length = length($data);
     my $new_length = $length + $IHL * 4 + $UDP_HEADER;
     # Currently we don't handle overly large FOU packets
-    die "Packet too long" if $new_length >= 2**16;
+    if ($new_length >= 2**16) {
+        ::info("Packet too long");
+        return;
+    }
 
     my $header = pack("CCnnnCCx2a4a4",
                       $IP_VERSION << 4 | $IHL,
@@ -1183,7 +1191,7 @@ sub process_RESPONSE {
         # Don't handle fragments (fragment offset)
         die "Unexpected fragment $fragment" if $fragment;
         # Don't handle fragments (MF flag set)
-        die "Bad flags $flags" if $flags & 0x4;
+        die "Bad flags $flags" if $flags & 0x1;
 
         my $pseudo10 = pack("a4a4xC", $src, $dst, $proto);
 
@@ -1234,7 +1242,10 @@ sub process_RESPONSE {
         $fou->write(bless {
             name => "",
             buf  => $buffer,
-            control => ::pack_cmsghdr($IPPROTO_IP, $IP_TTL, pack("I", $ttl)),
+            control => ::pack_cmsghdr(
+                $IPPROTO_IP,
+                $IP_TTL,
+                pack("I", $ttl || die "Assertion: TTL 0")),
             flags => 0,
         }, "Socket::MsgHdr");
     } else {

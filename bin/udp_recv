@@ -19,9 +19,9 @@ my $UDP_HEADER = 8;
 my $FREE_BSD = $^O eq "freebsd";
 # This is the linux value, can be different on other systems
 # FreeBSD uses IP_RECVDSTADDR
-my $IP_PKTINFO = $FREE_BSD ? 7 : 8;
-my $IP_RECVTTL = 12;
-my $IP_TTL = 2;
+my $IP_PKTINFO = $FREE_BSD ?  7 :  8;
+my $IP_RECVTTL = $FREE_BSD ? 65 : 12;
+my $IP_TTL     = $FREE_BSD ?  4 :  2;
 # IPPROTO_IP exists in Socket, but not in really old ones
 my $IPPROTO_IP = 0;
 
@@ -109,16 +109,17 @@ while (1) {
 
     if (!$fou) {
         print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n";
-        print "Received: TTL $ttl, ", length($buffer), " bytes ", string_from_value($buffer), "'\n";
+        print "Received: ", length($buffer), " bytes (TTL $ttl) ", string_from_value($buffer), "'\n";
         if ($answer) {
-            if ($ttl > 0) {
+            if ($ttl > 1) {
                 $msghdr->cmsghdr(@cmsg);
-                $buffer =~ s{\S+}{time()}e if $buffer !~ s/^(\d+)/$1+1/ea;
+                $buffer = time() . ": " . $buffer if $buffer !~ s/^(\d+)/$1+1/ea;
                 $msghdr->buf($buffer);
                 $s->sendmsg($msghdr) || die "Could not send: $!";
-                print "Sent: ", length($buffer), " bytes ", string_from_value($buffer), "'\n";
+                printf("Sent: %d bytes (TTL %d) %s\n",
+                       length($buffer), $ttl-1, string_from_value($buffer));
             } else {
-                print "Sent nothing (TTL=$ttl)\n";
+                print "Sent nothing (received TTL=$ttl)\n";
             }
         }
         print "=" x 25 . "\n";
@@ -146,7 +147,7 @@ while (1) {
     # Don't handle fragments (fragment offset)
     next if $fragment;
     # Don't handle fragments (MF flag set)
-    next if $flags & 0x4;
+    next if $flags & 0x1;
 
     my $pseudo10 = pack("a4a4xC", $src, $dst, $proto);
 
