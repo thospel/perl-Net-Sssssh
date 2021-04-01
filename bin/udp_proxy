@@ -490,7 +490,7 @@ package Sender::UDP;
 use Scalar::Util qw(weaken);
 use Socket qw(pack_sockaddr_in unpack_sockaddr_in inet_ntoa
               MSG_TRUNC MSG_CTRUNC);
-use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK EMSGSIZE);
 
 sub new {
     my ($class, $line, $id) = @_;
@@ -550,6 +550,10 @@ sub writer {
         my $rc = ::sendmsg($sender->{socket}, $data);
         if (!defined $rc) {
             return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+            if ($! == EMSGSIZE) {
+                ::info("Cannot send oversized UDP packet. Dropped") if $debug;
+                goto DROP;
+            }
             die "Could not write to sender UDP socket: $^E";
         }
         if ($debug) {
@@ -563,6 +567,10 @@ sub writer {
         my $rc = send($sender->{socket}, $data->[1], 0, $data->[0]);
         if (!defined $rc) {
             return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+            if ($! == EMSGSIZE) {
+                ::info("Cannot send oversized UDP packet. Dropped") if $debug;
+                goto DROP;
+            }
             die "Could not write to sender UDP socket: $^E";
         }
         if ($debug) {
@@ -574,6 +582,7 @@ sub writer {
         $rc == length($data->[1]) || die "Assertion: Incomplete UDP write ($rc of " . length($data->[1]) . ")";
     }
 
+  DROP:
     shift @{$sender->{out}};
     if (@{$sender->{out}}) {
         $sender->{timeout} = Timer->new($settings{TIMEOUT}, sub { $sender->timeout } );
@@ -796,7 +805,7 @@ sub reader {
 
 package Fou::UDP;
 # Send out proxied packets at the local (client) side usinga FOU tunnel
-use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK EMSGSIZE);
 use Socket qw(PF_INET SOCK_DGRAM inet_aton inet_ntoa pack_sockaddr_in);
 use Scalar::Util qw(weaken);
 
@@ -854,6 +863,10 @@ sub writer {
         syswrite($fou->{socket}, $fou->{out}[0]);
     if (!defined $rc) {
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        if ($! == EMSGSIZE) {
+            ::info("Cannot send oversized FOU packet. Dropped") if $debug;
+            goto DROP;
+        }
         die "Could not write to Fou UDP socket: $^E";
     }
     if ($msghdr) {
@@ -871,6 +884,7 @@ sub writer {
         $rc == length($fou->{out}[0]) ||
             die "Assertion: Incomplete UDP write ($rc of " . length($fou->{out}[0]) . ")";
     }
+  DROP:
     shift @{$fou->{out}};
     if (@{$fou->{out}}) {
         $fou->{timeout} = Timer->new($settings{TIMEOUT}, sub { $fou->timeout } );
@@ -1131,7 +1145,7 @@ sub process_RESPONSE {
     my $new_length = $length + $IHL * 4 + $UDP_HEADER;
     # Currently we don't handle overly large FOU packets
     if ($new_length >= 2**16) {
-        ::info("Packet too long");
+        ::info("Cannot build oversized FOU packet. Dropped") if $debug;
         return;
     }
 
