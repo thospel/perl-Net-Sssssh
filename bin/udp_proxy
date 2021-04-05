@@ -11,10 +11,10 @@ use warnings;
 # ip fou add port 1237 ipproto 4 local 127.0.0.1
 
 # Redirect packets to port 1234 into the fou1 tunnel:
-# iptables -t mangle -N LOG_FWMARK2
-# # iptables -t mangle -A LOG_FWMARK2 -j LOG --log-prefix 'iptables-mark2: ' --log-level info
-# iptables -t mangle -A LOG_FWMARK2 -j MARK --set-mark 17
-# iptables -t mangle -A OUTPUT -p udp --dport 1234 -j LOG_FWMARK2
+# iptables -t mangle -N FWMARK2
+# # iptables -t mangle -A FWMARK2 -j LOG --log-prefix 'iptables-mark2: ' --log-level info
+# iptables -t mangle -A FWMARK2 -j MARK --set-mark 17
+# iptables -t mangle -A OUTPUT -p udp --dport 1234 -j FWMARK2
 # ip rule add fwmark 17 lookup 101
 # ip route add default via 10.253.4.1 table 101
 
@@ -37,7 +37,7 @@ use Carp;
 use Sys::Hostname;
 use Errno qw(EINTR);
 use Time::Local qw(timegm);
-use Socket qw(inet_aton unpack_sockaddr_in);
+use Socket qw(inet_aton inet_ntoa unpack_sockaddr_in);
 
 use Data::Dumper;
 $Data::Dumper::Indent   = 1;
@@ -55,6 +55,7 @@ my $MULTICAST_END   = inet_aton("240.0.0.0") // die "Assertion: Bad address";
 
 my $IP_VERSION = 4;
 my $PROTO_UDP = getprotobyname("udp") // die "Unknown protocol UDP";
+my $PROTO_TCP = getprotobyname("tcp") // die "Unknown protocol TCP";
 my $IHL = 5;
 my $UDP_HEADER = 8;
 my $DF = 2;
@@ -806,7 +807,8 @@ sub reader {
 package Fou::UDP;
 # Send out proxied packets at the local (client) side usinga FOU tunnel
 use Errno qw(EINTR EAGAIN EWOULDBLOCK EMSGSIZE);
-use Socket qw(PF_INET SOCK_DGRAM inet_aton inet_ntoa pack_sockaddr_in);
+use Socket qw(PF_INET SOCK_DGRAM
+              inet_aton inet_ntoa pack_sockaddr_in);
 use Scalar::Util qw(weaken);
 
 sub socket_udp_connected {
@@ -899,7 +901,7 @@ package LineProtocol;
 use Errno qw(EINTR EAGAIN EWOULDBLOCK EADDRINUSE);
 use Carp;
 use FindBin qw($Script);
-use Socket qw(PF_INET SOCK_DGRAM
+use Socket qw(PF_INET SOCK_DGRAM SOCK_STREAM SOL_SOCKET SO_REUSEADDR
               inet_ntoa inet_aton pack_sockaddr_in unpack_sockaddr_in);
 
 use base qw(Ids);
@@ -1056,13 +1058,10 @@ sub process_START {
     $line->{started} = 1;
 
     if ($role eq "server") {
-        $line->write($START, $verbose ? $ready : "");
-    } else {
-        print STDERR "\n" if $verbose || $_[0];
-        ::peer_info($_[0]) if $_[0];
-        ::info($ready) if $verbose;
-        print STDERR "\n" if $verbose || $_[0];
+        $line->write($START, $ready);
     }
+    ::info($ready);
+    print STDERR "\n";
 }
 
 sub process_KEEP {
@@ -1279,9 +1278,11 @@ sub set_peer {
 sub socket_udp {
     my ($class, $host, $port, $probe) = @_;
 
+    $port = $port =~ /^0\z|^[1-9][0-9]*\z/ ? int($port) :
+        getservbyname($port, "udp") || die "Unknown UDP service '$port'";
+    my $addr = inet_aton($host) || die "Could nor resolve '$host'";
     socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_UDP) ||
         die "Could not create UDP socket: $^E";
-    my $addr = inet_aton($host) || die "Could nor resolve '$host'";
     my $local = pack_sockaddr_in($port, $addr);
     if ($probe) {
         return 1 if bind($socket, $local);
@@ -1289,6 +1290,34 @@ sub socket_udp {
         return 0;
     }
     bind($socket, $local) || die "Could not bind socket: $^E";
+    $socket->blocking(0);
+    wantarray || return $socket;
+
+    my $sockaddr = getsockname($socket) ||
+        die "Assertion: Could not getsockname: $^E";
+    my ($p, $address) = unpack_sockaddr_in($sockaddr);
+    my $h = inet_ntoa($address);
+    return $h, $p, $socket;
+}
+
+sub socket_tcp {
+    my ($class, $host, $port, $listen) = @_;
+
+    $port = $port =~ /^0\z|^[1-9][0-9]*\z/ ? int($port) :
+        getservbyname($port, "tcp") || die "Unknown TCP service '$port'";
+    $host = "0.0.0.0" if $host eq "";
+    my $addr = inet_aton($host) || die "Could nor resolve '$host'";
+    socket(my $socket, PF_INET, SOCK_STREAM, $PROTO_TCP) ||
+        die "Could not create TCP socket: $^E";
+    my $local = pack_sockaddr_in($port, $addr);
+    if ($listen) {
+        setsockopt($socket, SOL_SOCKET, SO_REUSEADDR, 1) ||
+            die "Assertion: Could not setsockopt(SOL_SOCKET, SO_REUSEADDR): $^E";
+        bind($socket, $local) || die "Could not bind socket: $^E";
+        listen($socket, $LISTEN_BACKLOG) || die "Could not listen: $^E";
+    } else {
+        connect($socket, $local) || die "Could not connect to $host:$port: $^E";
+    }
     $socket->blocking(0);
     wantarray || return $socket;
 
@@ -1421,10 +1450,10 @@ sub server {
     die "\u$role: $@" if $@;
 }
 
-my $stuff = 1;
 my $remote_perl = "/usr/bin/perl";
-GetOptions("server!"		=> \my $server,
-           "client_lib=s"	=> \my @client_lib,
+GetOptions("server:s"		=> \my $server,
+           "client=s"		=> \my $client,
+           "server_lib=s"	=> \my @server_lib,
            "ssh=s"		=> \$ssh,
            "M|master"		=> \my $ssh_master,
            "perl=s"		=> \$remote_perl,
@@ -1436,7 +1465,7 @@ GetOptions("server!"		=> \my $server,
            "debug!"		=> \$debug,
            "keepalive=o"	=> \$settings{KEEPALIVE},
            "timeout=o"		=> \$settings{TIMEOUT},
-           "stuff!"		=> \$stuff,
+           "stuff!"		=> \my $stuff,
            "l=s"		=> \my @udp_local,
            "r=s"		=> \my @udp_remote,
            "version!"		=> \my $version,
@@ -1460,19 +1489,44 @@ if ($help) {
     %Config::Config = ();
 }
 
-$role = "server" if $server;
+$role = "server" if defined $server;
 $role_peer = $role eq "server" ? "client" : "server";
 
 if ($role eq "server") {
-    server(\*STDIN, \*STDOUT);
+    die "Cannot be both server and client" if defined $client;
+    die "Cannot have stuff in server mode" if $stuff;
+
+    my $socket_in  = \*STDIN;
+    my $socket_out = \*STDOUT;
+    if (defined $server && $server ne "") {
+        my $host = $server =~ s{(.*):}{}s ? $1 :
+            $default_local_bind;
+        my ($h, $p, $socket) = LineProtocol->socket_tcp($host, $server, 1);
+        $socket->blocking(1);
+        ::info("Listening on port $p") if $server eq "0";
+        my $from = accept(my $accepted, $socket) || die "Accept failed: $^E";
+        if ($debug || $verbose) {
+            my ($port, $addr) = unpack_sockaddr_in($from);
+            my $host = inet_ntoa($addr);
+            ::info("Accepted TCP line connection from %s:%d", $host, $port);
+        }
+        $socket_in = $socket_out = $accepted;
+    }
+    server($socket_in, $socket_out);
     die "Assertion: \u$role fell off the mainloop";
 }
 
 # From here on we are the client
 
-@ARGV || die "Missing remote host argument, Try $Script -h\n";
-if ($stuff) {
-    @ARGV == 1 || die "Spurious arguments\n";
+if (defined $client) {
+    die "Cannot have arguments in client mode" if @ARGV;
+    die "Cannot have stuff in client mode" if $stuff;
+} else {
+    @ARGV || die "Missing remote host argument, Try $Script -h\n";
+    $stuff //= 1;
+    if ($stuff) {
+        @ARGV == 1 || die "Spurious arguments\n";
+    }
 }
 
 $verbose        = $debug        if $debug        && !defined $verbose;
@@ -1484,6 +1538,13 @@ $server_verbose = $client_verbose = 1 if $verbose;
 
 die "timeout $settings{TIMEOUT} must be positive\n" if $settings{TIMEOUT} <= 0;
 die "keepalive $settings{KEEPALIVE} must be positive\n" if $settings{KEEPALIVE} <= 0;
+
+if ($client) {
+    my $host = $client =~ s{(.*):}{}s ? $1 : "127.0.0.1";
+    my $socket = LineProtocol->socket_tcp($host, $client);
+    client($socket, $socket, \@udp_local, \@udp_remote);
+    die "Assertion: \u$role fell off the mainloop";
+}
 
 pipe(my $rd0, my $wr0) || die "Could not pipe: $^E";
 pipe(my $rd1, my $wr1) || die "Could not pipe: $^E";
@@ -1549,8 +1610,8 @@ if ($stuff) {
     }
 
     print($wr0 $PRE_STUFFER) || die "Write error:$^E";
-    for my $client_lib (map split(/:/), @client_lib) {
-        print($wr0 qq(use lib "$client_lib";\n)) || die "Write error:$^E";
+    for my $server_lib (map split(/:/), @server_lib) {
+        print($wr0 qq(use lib "$server_lib";\n)) || die "Write error:$^E";
     }
     # print($wr0 qq(\$Script="\$Script"\n)) || die "Write error:$^E";
     print($wr0 $content) || die "Write error:$^E";
@@ -1569,6 +1630,7 @@ if ($stuff) {
     $line eq $STUFFED || die "Bad server confirm $line";
 }
 client($rd1, $wr0, \@udp_local, \@udp_remote);
+die "Assertion: \u$role fell off the mainloop";
 
 __END__
 Implementation notes:
