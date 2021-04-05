@@ -455,6 +455,12 @@ sub timers_run {
 package Ids;
 # Allocate and free unique numbers
 
+sub new {
+    my $ids = bless {}, shift;
+    $ids->id_init;
+    return $ids;
+}
+
 sub id_init {
     my ($ids) = @_;
 
@@ -512,10 +518,10 @@ sub new {
     }, $class;
     weaken($sender->{line} = $line);
 
-    ::info("Sending on sender UDP socket[$id] '$host:$port'") if $debug;
+    ::info("Creating new Sender::UDP socket[$id] '$host:$port'") if $debug;
     $socket->add_read(sub { $sender->reader });
 
-    $line->{listeners}{$id} = $sender;
+    $line->{sockets_udp}{$id} = $sender;
     return $sender;
 }
 
@@ -646,11 +652,12 @@ use Socket qw(inet_ntoa pack_sockaddr_in
 use Scalar::Util qw(weaken);
 
 sub new {
-    my ($class, $line, $host, $port) = @_;
+    my ($class, $line, $host, $port, $fou) = @_;
 
     my ($h, $p, $socket) = $line->socket_udp($host, $port);
 
     my $listener = bless {
+        fou_id		=> $fou->id,
         socket		=> $socket,
         local_host	=> $h,
         local_port	=> $p,
@@ -758,15 +765,16 @@ sub reader {
            ::display($buffer)) if $debug;
 
     my $line = $listener->{line};
+    # On the remote side we will be able to distinguish packets coming back from
+    # ($dst, $dport) so we can share a single Sender::UDP for a given ($src,$port)
     my $map_src = $line->{map_udp}{"$dst:$dprt"} ||= [
-        0,	# Next seq counter
-        {},	# Map "src:port" to map
-        [],	# Map id to map
+        0,		# Next seq counter
+        {},		# Map "src:port" to map
+        [undef],	# Map id to map (the undef makes id start at 1)
         # $ndst,	# Packed destination address
         # $dprt,	# Destination Port
     ];
-    # For now we have exactly one fou per listener, even if the fou are the same
-    my $fou_id = $listener->{id};
+    my $fou_id = $listener->{fou_id};
     my $key = "$src:$sprt:$fou_id";
     my $map = $map_src->[1]{$key} ||= {
         key	=> $key,
@@ -776,13 +784,26 @@ sub reader {
         fou_id	=> $fou_id,
     };
     $map->{seq} = $map_src->[0]++;
+    # We should be able to handle many billions of packets before this overflows
     die "Too many packets to $dst:$dprt" if $map->{seq} == $map_src->[0];
     $id = $map->{id};
     if (!defined $id) {
+        # A source we haven't saeen befre or we have forgotten
         if (values %{$map_src->[1]} > $settings{UDP_MAX}) {
             my @old = sort {$a->{seq} <=> $b->{seq}} values %{$map_src->[1]};
+            # Ignore the map we just added (it will have the highest packet number)
             pop @old;
             for my $old (@old) {
+                # Try to allocate the socket. If we can that means the
+                # ($src,$port) combination is not in local use anymore and we
+                # can completely drop it
+                # Notice if we receive FOU packets from a remote host we also
+                # won't be able to bind(), so this works out OK. There is a
+                # problem if we share IP addresses with the sender of the FOU
+                # packets though. So we probably need an option to turn this
+                # off and have another strategy to free up entries
+                # (e.g. a timeout)
+                # print STDERR "Probe $old->{host}, $old->{port}\n";
                 if ($line->socket_udp($old->{host}, $old->{port}, 1)) {
                     ::info("Releasing map '$key' (socket not in use any more)") if $debug;
                     $id = $old->{id};
@@ -800,53 +821,48 @@ sub reader {
         $map->{id} = $id;
         $map_src->[2][$id] = $map;
     }
-    # print STDERR ::Dumper($line->{map_udp});
+    # print STDERR ::Dumper($id, $line->{map_udp});
     $line->write($DATA, pack("wa4nC", $id, $ndst, $dprt, $ttl-1), $buffer);
 }
 
 package Fou::UDP;
 # Send out proxied packets at the local (client) side usinga FOU tunnel
 use Errno qw(EINTR EAGAIN EWOULDBLOCK EMSGSIZE);
-use Socket qw(PF_INET SOCK_DGRAM
-              inet_aton inet_ntoa pack_sockaddr_in);
 use Scalar::Util qw(weaken);
 
-sub socket_udp_connected {
-    my ($host, $port) = @_;
+my @FOU;
+{
+    my %fou;
+    my $fou_ids = Ids->new;
+    sub new {
+        my ($class, $host, $port) = @_;
 
-    socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_UDP) ||
-        die "Could not create UDP socket: $^E";
-    my $addr = inet_aton($host) || die "Could nor resolve '$host'";
-    my $remote = pack_sockaddr_in($port, $addr);
-    connect($socket, $remote) || die "Could not connect socket: $^E";
-    $socket->blocking(0);
+        my ($h, $p, $socket) = LineProtocol->socket_udp_connected($host, $port);
+        return $fou{"$h:$p"} if exists $fou{"$h:$p"};
 
-    return inet_ntoa($addr), $socket;
-}
+        my $id = $fou_ids->id_alloc;
+        my $fou = bless {
+            id		=> $id,
+            out		=> [],
+            socket	=> $socket,
+            host	=> $h,
+            port	=> $p,
+            timeout	=> undef,
+        }, $class;
+        $fou{"$h:$p"} = $FOU[$id] = $fou;
 
-sub new {
-    my ($class, $line, $id, $host, $port) = @_;
-
-    die "Assertion: fou id $id already exists" if exists $line->{fou}{$id};
-    my ($h, $socket) = socket_udp_connected($host, $port);
-    my $fou = bless {
-        id	=> $id,
-        out	=> [],
-        socket	=> $socket,
-        host	=> $h,
-        port	=> $port,
-        timeout	=> undef,
-    }, $class;
-    weaken($fou->{line} = $line);
-    $line->{fou}{$id} = $fou;
-
-    return $fou;
+        return $fou;
+    }
 }
 
 sub timeout {
     my ($fou) = @_;
 
     die "Timeout. Could not FOU send[$fou->{id}";
+}
+
+sub id {
+    return shift->{id};
 }
 
 sub write : method {
@@ -896,6 +912,27 @@ sub writer {
     }
 }
 
+package LineProtocol0;
+use base qw(Ids);
+
+my $LINE = __PACKAGE__->new;
+sub new {
+    my ($class) = @_;
+
+    my $line = bless {
+        started		=> undef,	# Normal operations started
+        utime_offset	=> 0,	# Estimated round trip time in microsecond
+        keepalive	=> undef,
+        timeout		=> undef,
+        listeners	=> {},
+        map_udp		=> {},
+        sockets_udp	=> {},
+    }, $class;
+    $line->id_init;
+
+    return $line;
+}
+
 package LineProtocol;
 # Handle traffic between client and server
 use Errno qw(EINTR EAGAIN EWOULDBLOCK EADDRINUSE);
@@ -904,7 +941,7 @@ use FindBin qw($Script);
 use Socket qw(PF_INET SOCK_DGRAM SOCK_STREAM SOL_SOCKET SO_REUSEADDR
               inet_ntoa inet_aton pack_sockaddr_in unpack_sockaddr_in);
 
-use base qw(Ids);
+use base qw(LineProtocol0);
 
 my %process = (
     $SET		=> \&process_SET,
@@ -924,22 +961,12 @@ sub new {
     $socket_in ->blocking(0);
     $socket_out->blocking(0);
 
-    my $line = bless {
-        socket_in	=> $socket_in,
-        socket_out	=> $socket_out,
-        in		=> "",	# input buffer
-        out		=> "",	# output buffer
-        started		=> undef,	# Normal operations started
-        utime_offset	=> 0,	# Estimated round trip time in microsecond
-        keepalive	=> undef,
-        timeout		=> undef,
-        listeners	=> {},
-        fou		=> {},
-        map_udp		=> {},
-        sockets_udp	=> {},
-        utime_offset	=> 0,	# Estimated round trip time in microsecond
-    }, $class;
-    $line->id_init;
+    my $line = $class->SUPER::new();
+
+    $line->{socket_in}  = $socket_in;
+    $line->{socket_out} = $socket_out;
+    $line->{in}  = "";
+    $line->{out} = "";
 
     $socket_in->add_read(sub { $line->reader });
 
@@ -1089,26 +1116,28 @@ sub process_KEEP {
 sub process_UDP_REMOTE {
     my ($line, $udp) = @_;
 
-    my ($from_port, $to_port) = $udp =~ m{^([^/]+)/([^/]+)\z} or
-        die "Invalid udp_local '$udp'";
+    my ($from_port, $separator, $to_port) =
+        $udp =~ m{^([^/]+)([/=])([^/]+)\z} or
+        die "Invalid udp_remote '$udp'";
     my $from_host = $from_port =~ s{(.*):}{}s ? $1 :
         $default_local_bind;
     my $to_host   = $to_port   =~ s{(.*):}{}s ? $1 :
         $default_local_bind;
 
-    my $listener = Listener::UDP->new($line, $from_host, $from_port);
-    # For now we have exactly one fou per listener, even if the fou are the same
-    Fou::UDP->new($line, $listener->id, $to_host, $to_port);
+    my $l = $separator eq "/" ? $line : $LINE;
+    my $fou = Fou::UDP->new($to_host, $to_port);
+    my $listener = Listener::UDP->new($l, $from_host, $from_port, $fou);
 }
 
 sub process_DATA {
     my $line = shift;
     my ($id, $dst, $port, $ttl, $data) = unpack("wa4nCa*", shift);
-    $id < $settings{UDP_MAX} ||
-        die "Assertion: Socket id $id >= $settings{UDP_MAX}";
+    $id || die "Assertion: Sender socket id $id == 0";
+    $id <= $settings{UDP_MAX} ||
+        die "Assertion: Sender socket id $id > $settings{UDP_MAX}";
     ::info("Need to send %d bytes of UDP data (TTL %d) on socket %d to %s:%d: %s",
            length($data), $ttl, $id, inet_ntoa($dst), $port, ::display($data)) if $debug;
-    my $sender = $line->{sockets_udp}{$id} ||= Sender::UDP->new($line, $id);
+    my $sender = $line->{sockets_udp}{$id} || Sender::UDP->new($line, $id);
     $sender->write($port, $dst, $data, $ttl);
 }
 
@@ -1116,8 +1145,9 @@ sub process_RESPONSE {
     my $line = shift;
 
     my ($id, $nsrc, $sprt, $ttl, $data) = unpack("wa4nCa*", shift);
-    $id < $settings{UDP_MAX} ||
-        die "Assertion: Socket id $id >= $settings{UDP_MAX}";
+    $id || die "Assertion: Sender socket id $id == 0";
+    $id <= $settings{UDP_MAX} ||
+        die "Assertion: Sender socket id $id > $settings{UDP_MAX}";
     my $src = inet_ntoa($nsrc);
     ::info("\u$role_peer received %d bytes of UDP data on socket %d from %s:%d: %s",
            length($data), $id, $src, $sprt, ::display($data)) if $debug;
@@ -1129,7 +1159,7 @@ sub process_RESPONSE {
     my $map = $map_src->[2][$id] || die "Assertion: No Sender socket[$id]";
     $map->{seq} = $map_src->[0]++;
     die "Too many packets from $src:$sprt" if $map->{seq} == $map_src->[0];
-    my $fou = $line->{fou}{$map->{fou_id}} ||
+    my $fou = $FOU[$map->{fou_id}] ||
         die "Assertion: No Fou::UDP with id '$map->{fou_id}'";
     my $ndst = $map->{addr};
     my $dprt = $map->{port};
@@ -1275,6 +1305,27 @@ sub set_peer {
     $line->write($SET, pack("w", $i), $value);
 }
 
+sub socket_udp_connected {
+    my ($class, $host, $port) = @_;
+
+    $port = $port =~ /^0\z|^[1-9][0-9]*\z/ ? int($port) :
+        getservbyname($port, "udp") || die "Unknown UDP service '$port'";
+    my $addr = inet_aton($host) || die "Could nor resolve '$host'";
+    socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_UDP) ||
+        die "Could not create UDP socket: $^E";
+    my $remote = pack_sockaddr_in($port, $addr);
+    connect($socket, $remote) || die "Could not connect socket: $^E";
+    $socket->blocking(0);
+
+    wantarray || return $socket;
+
+    my $sockaddr = getpeername($socket) ||
+        die "Assertion: Could not getpeername: $^E";
+    my ($p, $address) = unpack_sockaddr_in($sockaddr);
+    my $h = inet_ntoa($address);
+    return $h, $p, $socket;
+}
+
 sub socket_udp {
     my ($class, $host, $port, $probe) = @_;
 
@@ -1408,16 +1459,16 @@ sub client {
         my $line = LineProtocol->new($socket_in, $socket_out);
 
         for my $udp (@$udp_locals) {
-            my ($from_port, $to_port) = $udp =~ m{^([^/]+)/([^/]+)\z} or
+            my ($from_port, $separator, $to_port) =
+                $udp =~ m{^([^/]+)([/=])([^/]+)\z} or
                 die "Invalid udp_local '$udp'";
             my $from_host = $from_port =~ s{(.*):}{}s ? $1 :
                 $default_local_bind;
             my $to_host   = $to_port   =~ s{(.*):}{}s ? $1 :
                 $default_local_bind;
-            my $listener = Listener::UDP->new($line, $from_host, $from_port, $to_host, $to_port);
-            # For now we have exactly one fou per listener,
-            # even if the fou are the same
-            Fou::UDP->new($line, $listener->id, $to_host, $to_port);
+            my $l = $separator eq "/" ? $line : $LINE;
+            my $fou = Fou::UDP->new($to_host, $to_port);
+            my $listener = Listener::UDP->new($l, $from_host, $from_port, $fou);
         }
 
         $line->set_peer(EPOCH      => $BASE_TIME);
@@ -1427,7 +1478,7 @@ sub client {
         # $line->set_peer(HIGH_WATER => $settings{HIGH_WATER});
 
         for my $udp (@$udp_remotes) {
-            $udp =~ m{^[^/]+/[^/]+\z} or die "Invalid udp remote '$udp'";
+            $udp =~ m{^[^/]+[/=][^/]+\z} or die "Invalid udp remote '$udp'";
             $line->write($UDP_REMOTE, $udp);
         }
 
@@ -1468,6 +1519,7 @@ GetOptions("server:s"		=> \my $server,
            "stuff!"		=> \my $stuff,
            "l=s"		=> \my @udp_local,
            "r=s"		=> \my @udp_remote,
+           "udp_max=i"		=> \my $udp_max,
            "version!"		=> \my $version,
            "U|unsafe!"		=> \my $unsafe,
            "h|help!"		=> \my $help) ||
@@ -1475,7 +1527,7 @@ GetOptions("server:s"		=> \my $server,
 
 if ($version) {
     print<<"EOF";
-sssssh (Ton Utils) $VERSION
+udp_proxy (Ton Utils) $VERSION
 EOF
     exit 0;
 }
@@ -1493,8 +1545,9 @@ $role = "server" if defined $server;
 $role_peer = $role eq "server" ? "client" : "server";
 
 if ($role eq "server") {
-    die "Cannot be both server and client" if defined $client;
-    die "Cannot have stuff in server mode" if $stuff;
+    die "Cannot be both server and client\n" if defined $client;
+    die "Cannot have stuff in server mode\n" if $stuff;
+    die "Cannot set udp_max at server\n" if defined $udp_max;
 
     my $socket_in  = \*STDIN;
     my $socket_out = \*STDOUT;
@@ -1518,6 +1571,10 @@ if ($role eq "server") {
 
 # From here on we are the client
 
+if (defined $udp_max) {
+    die "udp_max must be positive" if $udp_max < 1;
+    $settings{UDP_MAX} = $udp_max;
+}
 if (defined $client) {
     die "Cannot have arguments in client mode" if @ARGV;
     die "Cannot have stuff in client mode" if $stuff;
