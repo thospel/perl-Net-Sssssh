@@ -64,6 +64,9 @@ my $TTL = 64;
 my $ssh = "/usr/bin/ssh";
 my $verbose = undef;
 my $debug   = 0;
+my $timeout = 120;
+my $keepalive = 300;
+my $udp_max = 10,
 my $default_local_bind  = "127.0.0.1";
 my $default_remote_bind = "127.0.0.1";
 
@@ -76,13 +79,17 @@ my $BLOCK_SIZE = int(2**16);
 my $UDP_SIZE = int(2**16);
 my $LISTEN_BACKLOG = 128;
 
-my %settings = (
+my %settings_global = (
     EPOCH	=> undef,
-    TIMEOUT	=> 120,
-    KEEPALIVE	=> 300,
-    UDP_MAX	=> 10,
+    TIMEOUT	=> undef,
+    KEEPALIVE	=> undef,
+    UDP_MAX	=> undef,
+    # ACK_LIMIT must be greater than KEEPALIVE/ACK packet or we will explode
+    ACK_LIMIT	=> int(1e6),
+    # For debugging:
+    # ACK_LIMIT	=> 0,
 );
-my @setting_ids = sort keys %settings;
+my @setting_ids = sort keys %settings_global;
 my %setting_ids;
 $setting_ids{$setting_ids[$_]} = $_ for 0..$#setting_ids;
 
@@ -94,7 +101,7 @@ my $SET		= "S";	# sets a server variable
 my $UDP_REMOTE	= "r";
 my $DATA	= "D";
 my $RESPONSE	= "d";
-my $KEEP	= "K";	# Keepalive packet
+my $KEEP	= "K";	# Keepalive/ACK packet
 
 my $ERROR_ECONNREFUSED	= "Connection refused";
 my $ERROR_ENETUNREACH	= "Network is unreachable";
@@ -545,7 +552,7 @@ sub write : method {
         }, "Socket::MsgHdr" :
         [pack_sockaddr_in(shift, shift), shift]) {
         $sender->{socket}->add_write(sub { $sender->writer});
-        $sender->{timeout} = Timer->new($settings{TIMEOUT}, sub { $sender->timeout } );
+        $sender->{timeout} = Timer->new($sender->{line}{settings}{TIMEOUT}, sub { $sender->timeout } );
     }
 }
 
@@ -592,7 +599,7 @@ sub writer {
   DROP:
     shift @{$sender->{out}};
     if (@{$sender->{out}}) {
-        $sender->{timeout} = Timer->new($settings{TIMEOUT}, sub { $sender->timeout } );
+        $sender->{timeout} = Timer->new($sender->{line}{settings}{TIMEOUT}, sub { $sender->timeout } );
     } else {
         $sender->{socket}->delete_write;
         $sender->{timeout} = undef;
@@ -788,8 +795,9 @@ sub reader {
     die "Too many packets to $dst:$dprt" if $map->{seq} == $map_src->[0];
     $id = $map->{id};
     if (!defined $id) {
+        my $settings = $listener->{line}{settings};
         # A source we haven't saeen befre or we have forgotten
-        if (values %{$map_src->[1]} > $settings{UDP_MAX}) {
+        if (values %{$map_src->[1]} > $settings->{UDP_MAX}) {
             my @old = sort {$a->{seq} <=> $b->{seq}} values %{$map_src->[1]};
             # Ignore the map we just added (it will have the highest packet number)
             pop @old;
@@ -869,7 +877,7 @@ sub write : method {
     my $fou = shift;
     if (1 == push @{$fou->{out}}, shift) {
         $fou->{socket}->add_write(sub { $fou->writer});
-        $fou->{timeout} = Timer->new($settings{TIMEOUT}, sub { $fou->timeout } );
+        $fou->{timeout} = Timer->new($settings_global{TIMEOUT}, sub { $fou->timeout } );
     }
 }
 
@@ -905,7 +913,7 @@ sub writer {
   DROP:
     shift @{$fou->{out}};
     if (@{$fou->{out}}) {
-        $fou->{timeout} = Timer->new($settings{TIMEOUT}, sub { $fou->timeout } );
+        $fou->{timeout} = Timer->new($settings_global{TIMEOUT}, sub { $fou->timeout } );
     } else {
         $fou->{socket}->delete_write;
         $fou->{timeout} = undef;
@@ -924,6 +932,7 @@ sub new {
         utime_offset	=> 0,	# Estimated round trip time in microsecond
         keepalive	=> undef,
         timeout		=> undef,
+        settings	=> { %settings_global },
         listeners	=> {},
         map_udp		=> {},
         sockets_udp	=> {},
@@ -940,6 +949,9 @@ use Carp;
 use FindBin qw($Script);
 use Socket qw(PF_INET SOCK_DGRAM SOCK_STREAM SOL_SOCKET SO_REUSEADDR
               inet_ntoa inet_aton pack_sockaddr_in unpack_sockaddr_in);
+use constant {
+    ACK_MASK	=> 0xffffffff,
+};
 
 use base qw(LineProtocol0);
 
@@ -966,50 +978,15 @@ sub new {
     $line->{socket_in}  = $socket_in;
     $line->{socket_out} = $socket_out;
     $line->{in}  = "";
+    $line->{unacked} = 0;
+    $line->{in_acked} = 0;
     $line->{out} = "";
+    $line->{out_sent} = 0;
+    $line->{out_base} = 0;
 
     $socket_in->add_read(sub { $line->reader });
 
     return $line;
-}
-
-sub writer {
-    my ($line) = @_;
-
-    while (1) {
-        my $rc = $line->{socket_out}->syswrite($line->{out}, $BLOCK_SIZE);
-        if (!defined $rc) {
-            if ($! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK) {
-                $line->{timeout} //= Timer->new($settings{TIMEOUT}, sub { $line->timeout } );
-                return;
-            }
-            $line->{socket_out}->delete_write;
-            die "Could not write to $role_peer: $^E"
-        }
-        die "Zero write. Is this even possible ?" if $rc == 0;
-        ::info("Wrote %d bytes to %s (%d left): %s",
-             $rc, $role_peer, length($line->{out})-$rc, ::display(substr($line->{out}, 0, $rc))) if $debug;
-
-        substr($line->{out}, 0, $rc, "");
-        $line->{timeout} = undef;
-        if ($line->{out} eq "") {
-            $line->{socket_out}->delete_write;
-            $line->{keepalive} = Timer->new($settings{KEEPALIVE}, sub { $line->keepalive } );
-            return;
-        }
-    }
-}
-
-sub keepalive {
-    my ($line) = @_;
-
-    $line->write($KEEP, sprintf("%.0f %.0f",
-                                (Timer->realtime() - $BASE_TIME)*1e6,
-                                $line->{utime_offset}));
-}
-
-sub timeout {
-    die "Timeout. Could not write to $role_peer";
 }
 
 sub line_message {
@@ -1030,15 +1007,69 @@ sub line_message {
     return $length;
 }
 
+sub writer {
+    my ($line) = @_;
+
+    while (1) {
+        my $rc = $line->{socket_out}->syswrite($line->{out}, $BLOCK_SIZE, $line->{out_sent});
+        if (!defined $rc) {
+            if ($! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK) {
+                $line->{timeout} //= Timer->new($line->{settings}{TIMEOUT}, sub { $line->timeout } );
+                return;
+            }
+            $line->{socket_out}->delete_write;
+            die "Could not write to $role_peer: $^E"
+        }
+        die "Zero write. Is this even possible ?" if $rc == 0;
+        ::info("Wrote %d bytes to %s (%d left): %s",
+             $rc, $role_peer, length($line->{out})-$line->{out_sent}-$rc,
+               ::display(substr($line->{out}, $line->{out_sent}, $rc))) if $debug;
+
+        $line->{timeout} = undef;
+        $line->{out_sent} += $rc;
+        if (length $line->{out} == $line->{out_sent}) {
+            $line->{socket_out}->delete_write;
+            $line->{keepalive} = Timer->new($line->{settings}{KEEPALIVE}, sub { $line->keepalive } );
+            return;
+        }
+    }
+}
+
+sub keepalive {
+    my ($line) = @_;
+
+    ::info("Sending KEEPALIVE/ACK %d (new base %d)",
+           $line->{unacked},
+           $line->{in_acked} + $line->{unacked} & ACK_MASK) if $debug;
+    die "Assertion: Unacked $line->{unacked} is out of range" if
+        $line->{unacked} > 0xffffffff;
+    my $msg = sprintf("%.0f\0%0.f\0%s",
+                      (Timer->realtime() - $BASE_TIME)*1e6,
+                      $line->{utime_offset}, pack("V", $line->{unacked}));
+    $msg =~ s/\0+\z//;
+    my $length = $line->write($KEEP, $msg);
+    if ($length >= $line->{settings}{ACK_LIMIT}) {
+        $line->{settings}{ACK_LIMIT} = ++$length;
+        ::info("Increasing ACK_LIMIT to $length") if $verbose;
+    }
+    $line->{in_acked} = $line->{in_acked} + $line->{unacked} & ACK_MASK;
+    $line->{unacked} = 0;
+}
+
+sub timeout {
+    die "Timeout. Could not write to $role_peer";
+}
+
 sub write : method {
     my $line = shift;
 
     my $length = line_message($line->{out}, @_);
-    if ($length == length $line->{out}) {
+    if ($line->{out_sent} + $length == length $line->{out}) {
         $line->{socket_out}->add_write(sub { $line->writer });
         $line->{keepalive} = undef;
-        $line->{timeout} = Timer->new($settings{TIMEOUT}, sub { $line->timeout } );
+        $line->{timeout} = Timer->new($line->{settings}{TIMEOUT}, sub { $line->timeout } );
     }
+    return $length;
 }
 
 sub reader {
@@ -1050,10 +1081,14 @@ sub reader {
         die "Could not read from $role_peer: $^E"
     }
     if ($rc == 0) {
-        ::info("exit") if $verbose;
+        ::info("Exit: Remote EOF") if $verbose;
         exit 0;
     }
     ::info("Read %d bytes from $role_peer: %s", $rc, ::display(substr($line->{in}, -$rc))) if $debug;
+
+    $line->{unacked} += $rc;
+    $line->keepalive() if $line->{unacked} >= $line->{settings}{ACK_LIMIT};
+
     while ($line->{in} =~ /^([\x80-\xff]{0,2}[\x00-\x7f].)/s) {
         my ($length, $command) = unpack("wa", $line->{in});
         last if length($line->{in}) < $length;
@@ -1072,14 +1107,15 @@ sub process_SET {
 
     my $i = unpack("C", substr($_[0], 0, 1, ""));
     my $name = $setting_ids[$i] || die "Unknown variable $i";
-    $settings{$name} = $_[0];
+    # At the moment all values are numbers
+    $line->{settings}{$name} = $_[0]+0;
     ::info("Set %s=%s", $name, $_[0]) if $debug;
 }
 
 sub process_START {
     my $line  = shift;
 
-    defined $settings{EPOCH} || die "Lost early epoch message";
+    defined $line->{settings}{EPOCH} || die "Lost early epoch message";
 
     my $ready = "$Script $role $me\@$hostname ready (clock=$CLOCK_TYPE_NAME, pid=$$)";
     $line->{started} = 1;
@@ -1097,20 +1133,24 @@ sub process_KEEP {
     # Transit time is of course meaningless if the clocks aren't
     # synchronized very well. offset tries to compensate for that
 
-    my ($utime, $uoffset) = split " ", $_[0];
+    # add 5 \0 in case they were trimmed (1 for the last Z and 4 for V)
+    my ($utime, $uoffset, $acked) = unpack("Z*Z*V", shift() . "\0" x 5);
+
+    die "Assertion: Impossible ACK" if $acked > $line->{out_sent};
+    substr($line->{out}, 0, $acked, "");
+    $line->{out_sent} -= $acked;
+    $line->{out_base} = $line->{out_base} + $acked & ACK_MASK;
 
     # uoffset has     peertime - mytime + transit_time (me -> peer)
-    # This calculates mytme - peertime  + transit time (peer -> me)
-    $line->{utime_offset} = (Timer->realtime() - $settings{EPOCH})*1e6 -$utime || 1;
-    if ($uoffset) {
-        ::info("Keepalive transit=%.3f ms, roundtrip=%.3f ms, offset=%.0f ms",
-               $line->{utime_offset}/1e3,
+    # This calculates mytime - peertime + transit_time (peer -> me)
+    $line->{utime_offset} = (Timer->realtime() - $line->{settings}{EPOCH})*1e6 -$utime || 1;
+    ::info("Received ACK=%d (base=%d, sent=%d), Keepalive transit=%.3f ms" .
+           ($uoffset ? ", roundtrip=%.3f ms, offset=%.0f ms" : ""),
+           $acked, $line->{out_base}, $line->{out_sent},
+           $line->{utime_offset}/1e3,
+           $uoffset ? (
                ($line->{utime_offset}+$uoffset)/1e3,
-               ($line->{utime_offset}-$uoffset)/2e3) if $debug;
-    } else {
-        ::info("Keepalive transit=%.3f ms",
-               $line->{utime_offset}/1e3) if $debug;
-    }
+               ($line->{utime_offset}-$uoffset)/2e3) : ()) if $debug;
 }
 
 sub process_UDP_REMOTE {
@@ -1133,8 +1173,8 @@ sub process_DATA {
     my $line = shift;
     my ($id, $dst, $port, $ttl, $data) = unpack("wa4nCa*", shift);
     $id || die "Assertion: Sender socket id $id == 0";
-    $id <= $settings{UDP_MAX} ||
-        die "Assertion: Sender socket id $id > $settings{UDP_MAX}";
+    $id <= $line->{settings}{UDP_MAX} ||
+        die "Assertion: Sender socket id $id > $line->{settings}{UDP_MAX}";
     ::info("Need to send %d bytes of UDP data (TTL %d) on socket %d to %s:%d: %s",
            length($data), $ttl, $id, inet_ntoa($dst), $port, ::display($data)) if $debug;
     my $sender = $line->{sockets_udp}{$id} || Sender::UDP->new($line, $id);
@@ -1146,8 +1186,8 @@ sub process_RESPONSE {
 
     my ($id, $nsrc, $sprt, $ttl, $data) = unpack("wa4nCa*", shift);
     $id || die "Assertion: Sender socket id $id == 0";
-    $id <= $settings{UDP_MAX} ||
-        die "Assertion: Sender socket id $id > $settings{UDP_MAX}";
+    $id <= $line->{settings}{UDP_MAX} ||
+        die "Assertion: Sender socket id $id > $line->{settings}{UDP_MAX}";
     my $src = inet_ntoa($nsrc);
     ::info("\u$role_peer received %d bytes of UDP data on socket %d from %s:%d: %s",
            length($data), $id, $src, $sprt, ::display($data)) if $debug;
@@ -1301,7 +1341,8 @@ sub set_peer {
 
     my $i = $setting_ids{$name};
     defined $i || croak "Unknown global variable '$name'";
-    $value //= $settings{$name} // die "Assertion: Setting '$name' to undef";
+    $value //= $line->{settings}{$name} //
+        die "Assertion: Setting '$name' to undef";
     $line->write($SET, pack("w", $i), $value);
 }
 
@@ -1471,11 +1512,13 @@ sub client {
             my $listener = Listener::UDP->new($l, $from_host, $from_port, $fou);
         }
 
-        $line->set_peer(EPOCH      => $BASE_TIME);
-        $line->set_peer(TIMEOUT    => $settings{TIMEOUT});
-        $line->set_peer(KEEPALIVE  => $settings{KEEPALIVE});
-        # $line->set_peer(LOW_WATER  => $settings{LOW_WATER});
-        # $line->set_peer(HIGH_WATER => $settings{HIGH_WATER});
+        for my $name (sort keys %{$line->{settings}}) {
+            if ($name eq "EPOCH") {
+                $line->set_peer(EPOCH => $BASE_TIME);
+            } else {
+                $line->set_peer($name => $line->{settings}{$name});
+            }
+        }
 
         for my $udp (@$udp_remotes) {
             $udp =~ m{^[^/]+[/=][^/]+\z} or die "Invalid udp remote '$udp'";
@@ -1483,8 +1526,6 @@ sub client {
         }
 
         $line->write($START);
-
-        Events->mainloop();
     };
     die "\u$role: $@" if $@;
 }
@@ -1495,8 +1536,6 @@ sub server {
         my $line = LineProtocol->new($socket_in, $socket_out);
 
         $line->set_peer(EPOCH => $BASE_TIME);
-
-        Events->mainloop();
     };
     die "\u$role: $@" if $@;
 }
@@ -1514,12 +1553,12 @@ GetOptions("server:s"		=> \my $server,
            "server_debug!"	=> \my $server_debug,
            "client_debug!"	=> \my $client_debug,
            "debug!"		=> \$debug,
-           "keepalive=o"	=> \$settings{KEEPALIVE},
-           "timeout=o"		=> \$settings{TIMEOUT},
+           "keepalive=o"	=> \$keepalive,
+           "timeout=o"		=> \$timeout,
            "stuff!"		=> \my $stuff,
            "l=s"		=> \my @udp_local,
            "r=s"		=> \my @udp_remote,
-           "udp_max=i"		=> \my $udp_max,
+           "udp_max=i"		=> \$udp_max,
            "version!"		=> \my $version,
            "U|unsafe!"		=> \my $unsafe,
            "h|help!"		=> \my $help) ||
@@ -1541,13 +1580,21 @@ if ($help) {
     %Config::Config = ();
 }
 
+die "timeout $timeout must be positive\n" if $timeout <= 0;
+$settings_global{TIMEOUT} = $timeout;
+die "keepalive $keepalive must be positive\n" if $keepalive <= 0;
+$settings_global{KEEPALIVE} = $keepalive;
+die "udp_max must be positive" if $udp_max < 1;
+$settings_global{UDP_MAX} = $udp_max;
+
 $role = "server" if defined $server;
 $role_peer = $role eq "server" ? "client" : "server";
 
 if ($role eq "server") {
+    # From here on we are the server
+
     die "Cannot be both server and client\n" if defined $client;
     die "Cannot have stuff in server mode\n" if $stuff;
-    die "Cannot set udp_max at server\n" if defined $udp_max;
 
     my $socket_in  = \*STDIN;
     my $socket_out = \*STDOUT;
@@ -1566,127 +1613,123 @@ if ($role eq "server") {
         $socket_in = $socket_out = $accepted;
     }
     server($socket_in, $socket_out);
-    die "Assertion: \u$role fell off the mainloop";
-}
-
-# From here on we are the client
-
-if (defined $udp_max) {
-    die "udp_max must be positive" if $udp_max < 1;
-    $settings{UDP_MAX} = $udp_max;
-}
-if (defined $client) {
-    die "Cannot have arguments in client mode" if @ARGV;
-    die "Cannot have stuff in client mode" if $stuff;
 } else {
-    @ARGV || die "Missing remote host argument, Try $Script -h\n";
-    $stuff //= 1;
-    if ($stuff) {
-        @ARGV == 1 || die "Spurious arguments\n";
-    }
-}
 
-$verbose        = $debug        if $debug        && !defined $verbose;
-$client_verbose = $client_debug if $client_debug && !defined $client_verbose;
-$server_verbose = $server_debug if $server_debug && !defined $server_verbose;
+    # From here on we are the client
 
-$server_debug   = $client_debug   = 1 if $debug;
-$server_verbose = $client_verbose = 1 if $verbose;
+    $verbose        = $debug        if $debug        && !defined $verbose;
+    $client_verbose = $client_debug if $client_debug && !defined $client_verbose;
+    $server_verbose = $server_debug if $server_debug && !defined $server_verbose;
 
-die "timeout $settings{TIMEOUT} must be positive\n" if $settings{TIMEOUT} <= 0;
-die "keepalive $settings{KEEPALIVE} must be positive\n" if $settings{KEEPALIVE} <= 0;
+    $server_debug   = $client_debug   = 1 if $debug;
+    $server_verbose = $client_verbose = 1 if $verbose;
 
-if ($client) {
-    my $host = $client =~ s{(.*):}{}s ? $1 : "127.0.0.1";
-    my $socket = LineProtocol->socket_tcp($host, $client);
-    client($socket, $socket, \@udp_local, \@udp_remote);
-    die "Assertion: \u$role fell off the mainloop";
-}
+    if (defined $client) {
+        die "Cannot have arguments in client mode" if @ARGV;
+        die "Cannot have stuff in client mode" if $stuff;
 
-pipe(my $rd0, my $wr0) || die "Could not pipe: $^E";
-pipe(my $rd1, my $wr1) || die "Could not pipe: $^E";
-defined(my $pid = fork()) || die "could not fork: $^E";
+        my $host = $client =~ s{(.*):}{}s ? $1 : "127.0.0.1";
+        my $socket = LineProtocol->socket_tcp($host, $client);
+        client($socket, $socket, \@udp_local, \@udp_remote);
+    } else {
+        @ARGV || die "Missing remote host argument, Try $Script -h\n";
+        $stuff //= 1;
+        if ($stuff) {
+            @ARGV == 1 || die "Spurious arguments\n";
+        }
 
-if ($pid) {
-    # Parent
-    # This side does the ssh connection so that ^C goes to ssh
-    eval {
-        close $wr0;
-        close $rd1;
-        open(STDIN,  "<&", $rd0) || die "Could not dup STDIN: $^E";
+        pipe(my $rd0, my $wr0) || die "Could not pipe: $^E";
+        pipe(my $rd1, my $wr1) || die "Could not pipe: $^E";
+        defined(my $pid = fork()) || die "could not fork: $^E";
+
+        if ($pid) {
+            # Parent
+            # This side does the ssh connection so that ^C goes to ssh
+            eval {
+                close $wr0;
+                close $rd1;
+                open(STDIN,  "<&", $rd0) || die "Could not dup STDIN: $^E";
+                close $rd0;
+                open(STDOUT, ">&", $wr1) || die "Could not dup STDOUT: $^E";
+                close $wr1;
+
+                if ($stuff) {
+                    # delete @ENV{qw(LANGUAGE LC_ALL LANG)};
+                    my $remote_host = shift;
+                    exec($ssh, $ssh_master ? "-M" : (), "-e", "none", $remote_host, $remote_perl) ||
+                        die "Could not exec $ssh: $^E";
+                } else {
+                    push @ARGV, "$Bin/$Script" if @ARGV == 1;
+                    exec($ssh, $ssh_master ? "-M" : (), "-e", "none", @ARGV) ||
+                        die "Could not exec $ssh: $^E";
+                }
+            };
+            die $@ || "No error";
+        }
+
+        # Child
         close $rd0;
-        open(STDOUT, ">&", $wr1) || die "Could not dup STDOUT: $^E";
         close $wr1;
+        $wr0->autoflush(1);
 
         if ($stuff) {
-            # delete @ENV{qw(LANGUAGE LC_ALL LANG)};
-            my $remote_host = shift;
-            exec($ssh, $ssh_master ? "-M" : (), "-e", "none", $remote_host, $remote_perl) ||
-                die "Could not exec $ssh: $^E";
-        } else {
-            push @ARGV, "$Bin/$Script" if @ARGV == 1;
-            exec($ssh, $ssh_master ? "-M" : (), "-e", "none", @ARGV) ||
-                die "Could not exec $ssh: $^E";
+            my $self = "$Bin/$Script";
+            open(my $fh, "<", $self) || die "Could not open $self: $^E";
+            my $content = qq(#line 1 "$Bin/$Script"\n);
+            $content .= do { local $/; <$fh> };
+            $content =~ s/\n__END__\n.*/\n/s || die "Could not find __END__";
+            # Remove full line comments, but not #line statements.
+            # Leave the \n so line numbers in error messages keep working
+            $content =~ s/^[^\S\n]*#(?![^\S\n]*line\s).*//mg;
+            # Drop leading spaces. Saves about 20%
+            # (less of course if the ssh does compression, as it does by default)
+            $content =~ s/^[^\S\n]+//mg;
+
+            # Change a few variables in the server code
+            my %replace =
+                (verbose	=> $server_verbose,
+                 debug		=> $server_debug,
+                 role		=> "server",
+                 # This is needed because $SET sets the remote timeout for $line
+                 # but Fou::UDP is not a child of $line and uses the global settings
+                 timeout	=> $timeout,
+             );
+            while (my ($name, $value) = each %replace) {
+                local $Data::Dumper::Indent  = 0;
+                local $Data::Dumper::Purity  = 1;
+                local $Data::Dumper::Varname = $name;
+                $value = Dumper($value);
+                $value =~ s/\$\Q$name\E1\b/\$$name/g || die "Assertion: No VAR1";
+                # info("Value=<$value>") if $verbose;
+                $content =~ s{^([^\S\n]*(?:my|our)\s*)\$\Q$name\E\s*=[^;\n]*;[^\S\n]*\n}{$1$value\n}m || die "Could not set $name";
+            }
+
+            print($wr0 $PRE_STUFFER) || die "Write error:$^E";
+            for my $server_lib (map split(/:/), @server_lib) {
+                print($wr0 qq(use lib "$server_lib";\n)) || die "Write error:$^E";
+            }
+            # print($wr0 qq(\$Script="\$Script"\n)) || die "Write error:$^E";
+            print($wr0 $content) || die "Write error:$^E";
+            print($wr0 $POST_STUFFER) || die "Write error:$^E";
+            my $line = "";
+            while (length($line) < length($STUFFED)) {
+                alarm(60);
+                my $rc = sysread($rd1, $line, length($STUFFED)-length $line, length $line);
+                if (!defined $rc) {
+                    next if $! == EINTR;
+                    die "Read error: $^E";
+                }
+                die "Unexpected EOF" if $rc == 0;
+            }
+            alarm(0);
+            $line eq $STUFFED || die "Bad server confirm $line";
         }
-    };
-    die $@ || "No error";
+        client($rd1, $wr0, \@udp_local, \@udp_remote);
+    }
 }
 
-# Child
-close $rd0;
-close $wr1;
-$wr0->autoflush(1);
-
-if ($stuff) {
-    my $self = "$Bin/$Script";
-    open(my $fh, "<", $self) || die "Could not open $self: $^E";
-    my $content = qq(#line 1 "$Bin/$Script"\n);
-    $content .= do { local $/; <$fh> };
-    $content =~ s/\n__END__\n.*/\n/s || die "Could not find __END__";
-    # Remove full line comments, but not #line statements.
-    # Leave the \n so line numbers in error messages keep working
-    $content =~ s/^[^\S\n]*#(?![^\S\n]*line\s).*//mg;
-    # Drop leading spaces. Saves about 20%
-    # (less of course if the ssh does compression, as it does by default)
-    $content =~ s/^[^\S\n]+//mg;
-
-    # Change a few variables in the server code
-    my %replace =
-        (verbose	=> $server_verbose,
-         debug		=> $server_debug,
-         role		=> "server",
-     );
-    while (my ($name, $value) = each %replace) {
-        local $Data::Dumper::Indent  = 0;
-        local $Data::Dumper::Purity  = 1;
-        local $Data::Dumper::Varname = $name;
-        $value = Dumper($value);
-        $value =~ s/\$\Q$name\E1\b/\$$name/g || die "Assertion: No VAR1";
-        # info("Value=<$value>") if $verbose;
-        $content =~ s{^([^\S\n]*(?:my|our)\s*)\$\Q$name\E\s*=[^;\n]*;[^\S\n]*\n}{$1$value\n}m || die "Could not set $name";
-    }
-
-    print($wr0 $PRE_STUFFER) || die "Write error:$^E";
-    for my $server_lib (map split(/:/), @server_lib) {
-        print($wr0 qq(use lib "$server_lib";\n)) || die "Write error:$^E";
-    }
-    # print($wr0 qq(\$Script="\$Script"\n)) || die "Write error:$^E";
-    print($wr0 $content) || die "Write error:$^E";
-    print($wr0 $POST_STUFFER) || die "Write error:$^E";
-    my $line = "";
-    while (length($line) < length($STUFFED)) {
-        alarm(60);
-        my $rc = sysread($rd1, $line, length($STUFFED)-length $line, length $line);
-        if (!defined $rc) {
-            next if $! == EINTR;
-            die "Read error: $^E";
-        }
-        die "Unexpected EOF" if $rc == 0;
-    }
-    alarm(0);
-    $line eq $STUFFED || die "Bad server confirm $line";
-}
-client($rd1, $wr0, \@udp_local, \@udp_remote);
+eval { Events->mainloop() };
+die "\u$role: $@" if $@;
 die "Assertion: \u$role fell off the mainloop";
 
 __END__
