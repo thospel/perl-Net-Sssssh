@@ -33,7 +33,6 @@
 ~$
 \.old$
 \#$
-\b\.#
 /\.#
 ^\.#
 \.bak$
@@ -45,7 +44,12 @@
 ^nytprof\.out\.\d+$
 ^MYMETA\.yml$
 ^MYMETA\.json$
+^MYMETA\.json\.lock$
 /\.access\^$
 ^\.access\^$
+^core$
 
-^bl.b$
+^bl.b\d*$
+^bin/test\.pl$
+^t/bench_timer\.pl$
+\.apk$

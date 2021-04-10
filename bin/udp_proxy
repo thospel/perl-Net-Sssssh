@@ -84,7 +84,8 @@ my %settings_global = (
     TIMEOUT	=> undef,
     KEEPALIVE	=> undef,
     UDP_MAX	=> undef,
-    # ACK_LIMIT must be greater than KEEPALIVE/ACK packet or we will explode
+    # ACK_LIMIT should be greater than KEEPALIVE/ACK packet
+    # (Code will increase it if not, but you will still send way too many ACKs)
     ACK_LIMIT	=> int(1e6),
     # For debugging:
     # ACK_LIMIT	=> 0,
@@ -955,14 +956,18 @@ use constant {
 
 use base qw(LineProtocol0);
 
-my %process = (
-    $SET		=> \&process_SET,
-    $START		=> \&process_START,
-    $KEEP		=> \&process_KEEP,
-    $UDP_REMOTE		=> \&process_UDP_REMOTE,
-    $DATA		=> \&process_DATA,
-    $RESPONSE		=> \&process_RESPONSE,
+my %process_name = (
+    $SET		=> "SET",
+    $START		=> "START",
+    $KEEP		=> "KEEP",
+    $UDP_REMOTE		=> "UDP_REMOTE",
+    $DATA		=> "DATA",
+    $RESPONSE		=> "RESPONSE",
 );
+
+my %process = %process_name;
+$_ = __PACKAGE__->can("process_$_") || die "Unknown sub process_$_" for
+    values %process;
 
 sub new {
     my ($class, $socket_in, $socket_out) = @_;
@@ -1095,7 +1100,8 @@ sub reader {
         my $message = substr($line->{in}, 0, $length, "");
         substr($message, 0, length $1, "");
         ::info("Processing %s: '%s' (%d bytes)",
-               $command, ::display($message), length $message) if $debug;
+               $process_name{$command} // "Unknown command $command",
+               ::display($message), length $message) if $debug;
         my $fun = $process{$command} ||
             die "No handler for proto '$command'";
         $fun->($line, $message, $command);
@@ -1540,25 +1546,24 @@ sub server {
     die "\u$role: $@" if $@;
 }
 
-my $remote_perl = "/usr/bin/perl";
 GetOptions("server:s"		=> \my $server,
            "client=s"		=> \my $client,
            "server_lib=s"	=> \my @server_lib,
            "ssh=s"		=> \$ssh,
            "M|master"		=> \my $ssh_master,
-           "perl=s"		=> \$remote_perl,
+           "perl=s"		=> \my $remote_perl,
            "server_verbose!"	=> \my $server_verbose,
            "client_verbose!"	=> \my $client_verbose,
            "verbose!"		=> \$verbose,
            "server_debug!"	=> \my $server_debug,
            "client_debug!"	=> \my $client_debug,
            "debug!"		=> \$debug,
-           "keepalive=o"	=> \$keepalive,
-           "timeout=o"		=> \$timeout,
+           "keepalive=f"	=> \$keepalive,
+           "timeout=f"		=> \$timeout,
            "stuff!"		=> \my $stuff,
            "l=s"		=> \my @udp_local,
            "r=s"		=> \my @udp_remote,
-           "udp_max=i"		=> \$udp_max,
+           "udp_max=o"		=> \$udp_max,
            "version!"		=> \my $version,
            "U|unsafe!"		=> \my $unsafe,
            "h|help!"		=> \my $help) ||
@@ -1656,8 +1661,14 @@ if ($role eq "server") {
                 if ($stuff) {
                     # delete @ENV{qw(LANGUAGE LC_ALL LANG)};
                     my $remote_host = shift;
-                    exec($ssh, $ssh_master ? "-M" : (), "-e", "none", $remote_host, $remote_perl) ||
-                        die "Could not exec $ssh: $^E";
+                    if ($remote_host eq "") {
+                        $remote_perl //= $^X;
+                        exec($remote_perl) ||
+                            die "Could not exec $remote_perl: $^E";
+                    } else {
+                        exec($ssh, $ssh_master ? "-M" : (), "-e", "none", $remote_host, $remote_perl // "/usr/bin/perl") ||
+                            die "Could not exec $ssh: $^E";
+                    }
                 } else {
                     push @ARGV, "$Bin/$Script" if @ARGV == 1;
                     exec($ssh, $ssh_master ? "-M" : (), "-e", "none", @ARGV) ||
@@ -1691,7 +1702,8 @@ if ($role eq "server") {
                  debug		=> $server_debug,
                  role		=> "server",
                  # This is needed because $SET sets the remote timeout for $line
-                 # but Fou::UDP is not a child of $line and uses the global settings
+                 # but Fou::UDP is not a child of $line and uses the
+                 # global settings
                  timeout	=> $timeout,
              );
             while (my ($name, $value) = each %replace) {

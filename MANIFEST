@@ -7,6 +7,6 @@ bin/sssssh
 bin/udp_proxy
 bin/udp_recv
 bin/udp_send
-lib/Sssssh/Package.pm
+lib/Net/Sssssh/Package.pm
 md5-versions
 t/00_syntax.t

@@ -8,9 +8,9 @@ use ExtUtils::MakeMaker;
 our $VERSION = '1.000';
 
 WriteMakefile
-    (NAME		=> 'Sssssh',
+    (NAME		=> 'Net::Sssssh',
      # finds $VERSION, requires EU::MM from perl >= 5.5
-     VERSION_FROM	=> 'lib/Sssssh/Package.pm',
+     VERSION_FROM	=> 'lib/Net/Sssssh/Package.pm',
      eval {
          ## no critic (UselessNoCritic MagicNumbers)
          ExtUtils::MakeMaker->VERSION(6.55_01);
@@ -23,7 +23,7 @@ WriteMakefile
          "Socket::MsgHdr"	=> "0.04",
      },
      ABSTRACT		=> 'Simple Socket Server over SSH',
-     AUTHOR		=> 'Ton Hospel <sssssh@ton.iguana.be>',
+     AUTHOR		=> 'Ton Hospel <Net-Sssssh@ton.iguana.be>',
      $^O eq "MSWin32" ? (
          PM_FILTER	=> '$(PERL) -p -e1',
      ) : (),
