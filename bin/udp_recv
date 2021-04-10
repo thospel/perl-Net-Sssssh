@@ -11,61 +11,57 @@ my $VERSION = "1.000";
 
 # ip link del name tun1
 
-my $IP_VERSION = 4;
-my $PROTO_UDP = getprotobyname("udp") // die "Unknown protocol UDP";
-my $IHL = 5;
-my $UDP_HEADER = 8;
+use FindBin qw($Script);
+our $Bin;
 
-my $FREE_BSD = $^O eq "freebsd";
-# This is the linux value, can be different on other systems
-# FreeBSD uses IP_RECVDSTADDR
-my $IP_PKTINFO = $FREE_BSD ?  7 :  8;
-my $IP_RECVTTL = $FREE_BSD ? 65 : 12;
-my $IP_TTL     = $FREE_BSD ?  4 :  2;
-# IPPROTO_IP exists in Socket, but not in really old ones
-my $IPPROTO_IP = 0;
+# If the program runs as /foobar/bin/program, find libraries in /foobar/lib
+BEGIN {
+    # Even on windows FindBin uses / in the reported path
+    $Bin = $FindBin::Bin;
+    $Bin =~ s{/+\z}{};
+    $Bin =~
+        ($^O eq "MSWin32" ?
+         qr{^((?:[A-Z]:)?(?:/[a-zA-Z0-9_:.~ -]+)*)/[a-zA-Z0-9_.-]+/*\z} :
+         qr{^((?:/[a-zA-Z0-9_:.-]+)*)/[a-zA-Z0-9_.-]+/*\z}) ||
+         die "Could not parse bin directory '$Bin'";
+    # Use untainted version of lib
+    require lib;
+    # Support a simple --blib option for pre-install testing
+    "lib"->import(@ARGV && $ARGV[0] eq "--blib" ? shift && "$1/blib/lib" : "$1/lib");
+}
 
 use Getopt::Long 2.24 qw(:config bundling require_order);
-use IO::Socket::INET;
-use IO::Socket qw(inet_ntoa MSG_TRUNC MSG_CTRUNC);
+use IO::Socket::INET qw();
+use IO::Socket qw(MSG_TRUNC MSG_CTRUNC
+                  inet_ntoa unpack_sockaddr_in);
 use Socket::MsgHdr;
-use Data::Dumper;
+
+use Net::Sssssh qw(IPPROTO_IP IP_PKTINFO IP_RECVTTL IP_RECVDSTADDR IP_TTL
+                   fou_decode string_from_value);
 
 my $port = 5555;
 die "Could not parse your command line. Try $0 -h\n" unless
-    GetOptions("fou!"		=> \my $fou,
+    GetOptions("f|fou!"		=> \my $fou,
                "a|answer!"	=> \my $answer,
                "p|port=o"	=> \$port,
+               "v|verbose!"	=> \my $verbose,
                "version!"	=> \my $version,
                "U|unsafe!"	=> \my $unsafe,
                "h|help!"	=> \my $help);
-
-
-sub string_from_value {
-    local $Data::Dumper::Indent	  = 0;
-    local $Data::Dumper::Sortkeys = 1;
-    local $Data::Dumper::Useqq	  = 1;
-    local $Data::Dumper::Trailingcomma = 0;
-    # local $Data::Dumper::Varname  = "VAR";
-    local $Data::Dumper::Terse = 1;
-    local $Data::Dumper::Quotekeys = 0;
-    local $Data::Dumper::Sparseseen = 1;
-    return Dumper(shift);
-}
 
 my $s = IO::Socket::INET->new(
     Proto	=> "udp",
     ReUse	=> 1,
     # LocalHost	=> "127.0.0.1",
     LocalPort	=> $port) || die "Could not create socket: $!";
-setsockopt($s, $IPPROTO_IP, $IP_PKTINFO, 1) ||
+setsockopt($s, IPPROTO_IP, IP_PKTINFO, 1) ||
     die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
-setsockopt($s, $IPPROTO_IP, $IP_RECVTTL, 1) ||
+setsockopt($s, IPPROTO_IP, IP_RECVTTL, 1) ||
     die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
 
 # my $buffer = "";
 my $msghdr = Socket::MsgHdr->new();
-print "=" x 25 . "\n";
+print STDERR "=" x 25 . "\n" if $verbose;
 while (1) {
     $msghdr->controllen(256);
     $msghdr->namelen(256);
@@ -73,6 +69,7 @@ while (1) {
     $s->recvmsg($msghdr) || die "Could nor recvmsg: $!";
     my $buffer = $msghdr->buf;
 
+    # Socket::MsgHdr 0.05 does in fact not set flags after recvmsg
     die "Yikes! Buffer was truncated\n" if
         $msghdr->flags & MSG_TRUNC;
     die "Yikes! Ancillary data was truncated\n" if
@@ -83,116 +80,50 @@ while (1) {
     for my $i (0 .. $#cmsg / 3) {
         $i *= 3;
         my ($level, $type, $data) = @cmsg[$i..$i+2];
-        $level == $IPPROTO_IP || next;
-        if ($type == $IP_PKTINFO) {
-            if ($FREE_BSD) {
-                length $data == 4 || die "Unexpected IP_RECVDSTADDR length";
-                $local = inet_ntoa($data);
-                $msg_dst = $local;
-            } else {
-                length $data == 12 || die "Unexpected IP_PKTINFO length";
-                my ($interface, $dst, $to) = unpack("Ia4a4", $data);
-                $local = inet_ntoa($to);
-                $msg_dst = inet_ntoa($dst);
-            }
-        } elsif ($type == $IP_TTL) {
+        $level == IPPROTO_IP || next;
+        if (defined IP_RECVDSTADDR && $type == IP_RECVDSTADDR) {
+            # FreeBSD
+            length $data == 4 || die "Unexpected IP_RECVDSTADDR length";
+            $local = inet_ntoa($data);
+            $msg_dst = $local;
+        } elsif (defined IP_PKTINFO && $type == IP_PKTINFO) {
+            # Linux
+            length $data == 12 || die "Unexpected IP_PKTINFO length";
+            my ($interface, $dst, $to) = unpack("Ia4a4", $data);
+            $local = inet_ntoa($to);
+            $msg_dst = inet_ntoa($dst);
+        } elsif ($type == IP_TTL) {
             length $data == 4 || die "Unexpected IP_TTL length";
             $ttl = unpack("I", $data);
             $cmsg[$i+2] = pack("I", $ttl-1);
         }
     }
     $local // die "Assertion: No local addr";
-    $ttl // die "Assertion: No TTL";
+    $ttl   // die "Assertion: No TTL";
+
     my $sender = $msghdr->name;
     my ($peer_port, $peer) = unpack_sockaddr_in($sender);
     $peer = inet_ntoa($peer);
 
-    if (!$fou) {
-        print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n";
-        print "Received: ", length($buffer), " bytes (TTL $ttl) ", string_from_value($buffer), "'\n";
-        if ($answer) {
-            if ($ttl > 1) {
-                $msghdr->cmsghdr(@cmsg);
-                $buffer = time() . ": " . $buffer if $buffer !~ s/^(\d+)/$1+1/ea;
-                $msghdr->buf($buffer);
-                $s->sendmsg($msghdr) || die "Could not send: $!";
-                printf("Sent: %d bytes (TTL %d) %s\n",
-                       length($buffer), $ttl-1, string_from_value($buffer));
-            } else {
-                print "Sent nothing (received TTL=$ttl)\n";
-            }
+    if ($fou) {
+        my $props = fou_decode($buffer, $verbose && \*STDERR, 1);
+        $buffer = $props->{data} // next;
+        die "Answer not implemented (yet)" if $answer;
+    }
+    print STDERR "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n" if $verbose;
+    print STDERR "Received: ", length($buffer), " bytes (TTL $ttl) ", string_from_value($buffer), "'\n" if $verbose;
+
+    if ($answer) {
+        if ($ttl > 1) {
+            $msghdr->cmsghdr(@cmsg);
+            $buffer = time() . ": " . $buffer if $buffer !~ s/^(\d+)/$1+1/ea;
+            $msghdr->buf($buffer);
+            $s->sendmsg($msghdr) || die "Could not send: $!";
+            printf("Sent: %d bytes (TTL %d) %s\n",
+                   length($buffer), $ttl-1, string_from_value($buffer));
+        } else {
+            print STDERR "Sent nothing (received TTL=$ttl)\n" if $verbose;
         }
-        print "=" x 25 . "\n";
-        next;
     }
-    # $s->sysread($buffer, 2**16);
-    # Must have space for IP header
-    next if length $buffer < 20;
-    my ($ihl, $ecn, $length, $id, $fragment, $udp_ttl, $proto, $chksum, $src, $dst) = unpack("CCnnnCCna4a4", $buffer);
-    # print STDERR "TEMP: IHL=$ihl, ECN=$ecn, LEN=$length, ID=$id, FRAGMENT=$fragment, TTL=$udp_ttl, PROTO=$proto, CHK=$chksum, SRC=$src, DST=$dst\n";
-    my $version = $ihl >> 4;
-    $ihl &= 0xf;
-    my $flags = $fragment >> 13;
-    $fragment &= 0x1fff;
-    # only TCP4
-    $version == $IP_VERSION || next;
-    # Only UDP
-    $proto == $PROTO_UDP || next;
-    # Sanity check on buffer
-    length($buffer) == $length || next;
-    # We don't handle IP options (yet)
-    $ihl == $IHL || next;
-    # Too many hops
-    $udp_ttl || next;
-    # Don't handle fragments (fragment offset)
-    next if $fragment;
-    # Don't handle fragments (MF flag set)
-    next if $flags & 0x1;
-
-    my $pseudo10 = pack("a4a4xC", $src, $dst, $proto);
-
-    $ihl *= 4;
-    my $header = substr($buffer, 0, $ihl, "");
-    $length -= $ihl;
-
-    # No buffer padding needed since length($header) is even
-    my $sum = unpack("%32n*", $header);
-    while ($sum > 0xffff) {
-        my $carry = $sum >> 16;
-        $sum &= 0xffff;
-        $sum += $carry;
-    }
-    $sum == 0xffff || next;
-
-    $src = inet_ntoa($src);
-    $dst = inet_ntoa($dst);
-
-    print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n";
-
-    my $dscp = $ecn >> 3;
-    $ecn &= 0x7;
-    print "HEADER: DSCP=$dscp, ECN=$ecn, ID=$id, FLAGS=$flags, FRAGMENT=$fragment, TTL=$udp_ttl, CHKSUM=$chksum, SRC=$src, DST=$dst\n";
-
-    # Must have space for UDP header
-    next if $length < $UDP_HEADER;
-
-    # Pad buffer 0 so a last single byte still gets processed as "n"
-    $sum = unpack("%32n*", $buffer . "\x0") + unpack("%32n*", $pseudo10) + $length;
-    my ($sprt, $dprt, $udp_len, $udp_chksum) = unpack("nnnn", substr($buffer, 0, $UDP_HEADER, ""));
-    $udp_len == $length || die "Inconsistent UDP length";
-    $length -= $UDP_HEADER;
-
-    if ($udp_chksum) {
-        while ($sum > 0xffff) {
-            my $carry = $sum >> 16;
-            $sum &= 0xffff;
-            $sum += $carry;
-        }
-        $sum == 0xffff || next;
-    }
-
-    print "SPRT=$sprt, DPRT=$dprt, LEN=$udp_len, CHK=$udp_chksum\n";
-
-    print "Received: ", length($buffer), " ", unpack("H*", $buffer), " ", $buffer, "\n";
-    print "=" x 25 . "\n";
+    print STDERR "=" x 25 . "\n" if $verbose;
 }
