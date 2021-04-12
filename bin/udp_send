@@ -37,7 +37,7 @@ use Socket::MsgHdr;
 
 use Net::Sssssh
     qw(IP_RECVDSTADDR IP_PKTINFO IPPROTO_IP IP_RECVTTL IP_TTL
-       parse_udp_address fou_encode string_from_value);
+       parse_address fou_encode fou_decode string_from_value);
 
 die "Could not parse your command line. Try $0 -h\n" unless
     GetOptions("f|fou=s"	=> \my $fou,
@@ -75,46 +75,71 @@ $txt =~ s/\n?\z/$no_nl/;
 my ($lport, $laddr);
 if ($local) {
     ($lport, $laddr) = unpack_sockaddr_in(
-        parse_udp_address($local, "Local", "", 0, 1)) ||
+        parse_address($local, "Local", from => "UDP4")) ||
             die "Assertion: Cannot unpack packed local '$local'";
     $local = inet_ntoa($laddr);
 }
 
 my $msghdr = Socket::MsgHdr->new();
+my ($buffer, $msg_src, $msg_dst, $ttl, $sender);
 
 if ($fou) {
-    $fou = parse_udp_address($fou, "Fou", "127.0.0.1");
-    my ($fport, $faddr) = unpack_sockaddr_in($fou) or
-        die "Assertion: Could not unpack parse_udp_address result fro '$fou'";
+    my ($fou_from, $fou_to) = parse_address($fou, "Fou",
+                                                from => "UDP4", to => "UDP4");
+    my ($to_port, $to_addr) = unpack_sockaddr_in($fou_to) or
+        die "Assertion: Could not unpack parse_address result from '$fou'";
+    my ($from_port, $from_addr);
+    if ($fou_from) {
+        ($from_port, $from_addr) = unpack_sockaddr_in($fou_from) or
+            die "Assertion: Could not unpack parse_address result from '$fou'";
+    }
     my $s = IO::Socket::INET->new(
         # The Peer options trigger a connect which in turn forces a bind
         Proto		=> "udp",
-        PeerHost	=> inet_ntoa($faddr),
-        PeerPort	=> $fport) || die "Could not create socket: $!";
+        $from_addr ? (
+            LocalHost	=> inet_ntoa($from_addr),
+            LocalPort	=> $from_port) : (),
+        PeerHost	=> inet_ntoa($to_addr),
+        PeerPort	=> $to_port) || die "Could not create socket: $!";
     if (!$local) {
         $laddr = inet_aton("1.2.3.4");
         $lport = 49154;
     }
-    my $buffer = fou_encode(pack_sockaddr_in($lport, $laddr),
-                            parse_udp_address("$host:$port"),
+    $buffer = fou_encode(pack_sockaddr_in($lport, $laddr),
+                            parse_address("$host:$port", "To", to => "UDP4"),
                             $txt, $verbose && \*STDERR);
     if ($msghdr) {
         $msghdr->buf($buffer);
         $s->sendmsg($msghdr) || die "Could not sendmsg(): $^E";
+
+        $answer || exit;
+
+        $msghdr->controllen(256);
+        $msghdr->namelen(256);
+        $msghdr->buflen(2**16);
+        $s->recvmsg($msghdr) || die "Could not recvmsg: $!";
+
+        my $props = fou_decode($msghdr->buf, $verbose && \*STDERR);
+
+        $buffer = $props->{data};
+        $sender = pack_sockaddr_in($props->{sprt}, $props->{src});
+        $ttl = $props->{ttl};
+        $msg_src = $msg_dst = inet_ntoa($props->{dst});
     } else {
         my $rc = syswrite($s, $buffer) //
             die "Could not write to socket: $^E";
         $rc == length $buffer ||
             die "Truncated write to socket";
+        $answer || exit;
+        die "Answer not implemented (yet)";
     }
-
 } else {
     if ($msghdr) {
         my $s = IO::Socket::INET->new(
             Proto	=> "udp",
             # Trick to force a bind (The first send would cause a bind anyways)
             LocalPort	=> "00") || die "Could not create socket: $!";
-        my $to = parse_udp_address("$host:$port");
+        my $to = parse_address("$host:$port", "To", to => "UDP4");
         $msghdr->name($to);
         if ($local) {
             if (defined IP_RECVDSTADDR) {
@@ -123,70 +148,62 @@ if ($fou) {
                 # I cannot find any documentation about what the addresses
                 # exactly mean. Testing indicates only the second field
                 # (ipi_spec_dst) really matters
+                # Best read: http://mail-index.netbsd.org/tech-net/2017/12/28/msg006579.html
                 $msghdr->cmsghdr(IPPROTO_IP, IP_PKTINFO, pack("x4a4a4", $local, $local));
             }
         }
 
         $msghdr->buf($txt);
         $s->sendmsg($msghdr) || die "Could not sendmsg(): $!";
-        if ($answer) {
-            if (defined IP_RECVDSTADDR) {
-                setsockopt($s, IPPROTO_IP, IP_RECVDSTADDR, 1) ||
-                    die "setsockopt(IPPROTO_IP, IP_RECVDSTADDR): $^E";
-            } elsif (defined IP_PKTINFO) {
-                setsockopt($s, IPPROTO_IP, IP_PKTINFO, 1) ||
-                    die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
-            } else {
-                die "Assertion: Neither IP_RECVDSTADDR nor IP_PKTINFO";
-            }
-            setsockopt($s, IPPROTO_IP, IP_RECVTTL, 1) ||
-                die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
-            $msghdr->controllen(256);
-            $msghdr->namelen(256);
-            $msghdr->buflen(2**16);
-            $s->recvmsg($msghdr) || die "Could nor recvmsg: $!";
 
-            my $buffer = $msghdr->buf;
+        $answer || exit;
 
-            # Socket::MsgHdr 0.05 does in fact not set flags after recvmsg
-            die "Yikes! Buffer was truncated\n" if
-                $msghdr->flags & MSG_TRUNC;
-            die "Yikes! Ancillary data was truncated\n" if
-                $msghdr->flags & MSG_CTRUNC;
-
-            my ($local, $msg_dst, $ttl);
-            my @cmsg = $msghdr->cmsghdr();
-            while (my ($level, $type, $data) = splice(@cmsg, 0, 3)) {
-                $level == IPPROTO_IP || next;
-                if (defined IP_RECVDSTADDR && $type == IP_RECVDSTADDR) {
-                    # FreeBSD
-                    length $data == 4 ||
-                        die "Unexpected IP_RECVDSTADDR length";
-                    $local = inet_ntoa($data);
-                    $msg_dst = $local;
-                } elsif (defined IP_PKTINFO && $type == IP_PKTINFO) {
-                    # Linux
-                    length $data == 12 ||
-                        die "Unexpected IP_PKTINFO length";
-                    my ($interface, $dst, $to) = unpack("Ia4a4", $data);
-                    $local = inet_ntoa($to);
-                    $msg_dst = inet_ntoa($dst);
-                } elsif ($type == IP_TTL) {
-                    length $data == 4 || die "Unexpected IP_TTL length";
-                    $ttl = unpack("I", $data);
-                }
-            }
-
-            $local // die "Assertion: No local addr";
-            $ttl // die "Assertion: No TTL";
-
-            my $sender = $msghdr->name;
-            my ($peer_port, $peer) = unpack_sockaddr_in($sender);
-            $peer = inet_ntoa($peer);
-            print "Answer: From $peer:$peer_port, To $local [$msg_dst]\n";
-            print "Received: TTL $ttl, ", length($buffer), " bytes ",
-                string_from_value($buffer), "\n";
+        if (defined IP_RECVDSTADDR) {
+            setsockopt($s, IPPROTO_IP, IP_RECVDSTADDR, 1) ||
+                die "setsockopt(IPPROTO_IP, IP_RECVDSTADDR): $^E";
+        } elsif (defined IP_PKTINFO) {
+            setsockopt($s, IPPROTO_IP, IP_PKTINFO, 1) ||
+                die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
+        } else {
+            die "Assertion: Neither IP_RECVDSTADDR nor IP_PKTINFO";
         }
+        setsockopt($s, IPPROTO_IP, IP_RECVTTL, 1) ||
+            die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
+        $msghdr->controllen(256);
+        $msghdr->namelen(256);
+        $msghdr->buflen(2**16);
+        $s->recvmsg($msghdr) || die "Could not recvmsg: $!";
+
+        $buffer = $msghdr->buf;
+
+        # Socket::MsgHdr 0.05 does in fact not set flags after recvmsg
+        die "Yikes! Buffer was truncated\n" if
+            $msghdr->flags & MSG_TRUNC;
+        die "Yikes! Ancillary data was truncated\n" if
+            $msghdr->flags & MSG_CTRUNC;
+
+        my @cmsg = $msghdr->cmsghdr();
+        while (my ($level, $type, $data) = splice(@cmsg, 0, 3)) {
+            $level == IPPROTO_IP || next;
+            if (defined IP_RECVDSTADDR && $type == IP_RECVDSTADDR) {
+                # FreeBSD
+                length $data == 4 ||
+                    die "Unexpected IP_RECVDSTADDR length";
+                $msg_src = inet_ntoa($data);
+                $msg_dst = $msg_src;
+            } elsif (defined IP_PKTINFO && $type == IP_PKTINFO) {
+                # Linux
+                length $data == 12 ||
+                    die "Unexpected IP_PKTINFO length";
+                my ($interface, $dst, $src) = unpack("Ia4a4", $data);
+                $msg_src = inet_ntoa($src);
+                $msg_dst = inet_ntoa($dst);
+            } elsif ($type == IP_TTL) {
+                length $data == 4 || die "Unexpected IP_TTL length";
+                $ttl = unpack("I", $data);
+            }
+        }
+        $sender = $msghdr->name;
     } else {
         my $s = IO::Socket::INET->new(
             # The Peer options trigger a connect which in turn forces a bind
@@ -203,5 +220,17 @@ if ($fou) {
             die "Could not write to socket: $^E";
         $rc == length $txt ||
             die "Truncated write to socket";
+        $answer || exit;
+        die "Answer not implemented (yet)";
     }
 }
+
+# Show answer
+$msg_src // die "Assertion: No local addr";
+$ttl     // die "Assertion: No TTL";
+
+my ($peer_port, $peer) = unpack_sockaddr_in($sender);
+$peer = inet_ntoa($peer);
+print "Answer: From $peer:$peer_port, To $msg_src [$msg_dst]\n";
+print "Received: TTL $ttl, ", length($buffer), " bytes ",
+    string_from_value($buffer), "\n";

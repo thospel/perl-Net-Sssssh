@@ -46,26 +46,86 @@ use Exporter::Tidy
     constants => [qw(SHORT_MAX IP_VERSION IHL UDP_HEADER DF TTL PROTO_UDP
                      LINUX FREE_BSD
                      IP_PKTINFO IP_RECVDSTADDR IP_RECVTTL IP_TTL IPPROTO_IP)],
-    other => [qw(parse_udp_address string_from_value fou_encode fou_decode)];
+    other => [qw(parse_address string_from_value fou_encode fou_decode)];
 
-sub parse_udp_address {
-    my ($str, $context, $default_host, $default_port, $prefer_host) = @_;
+# IPv6 could use [fe80::240:63ff:fede:3c19]:1234 as notation (like RFC 3986)
+my %parse_regex = (
+    udp4	=> "(?:([^:]*):|^)([^:]*)",
+    tcp4	=> "(?:([^:]*):|^)([^:]*)",
+);
 
-    my ($host, $port) = $prefer_host && $str !~ /^[0-9]+\z/ ?
-        $str =~ /^(?:(.*))(:[^:]*)?\z/ :
-        $str =~ /^(?:(.*):)?([^:]*)\z/ or
-        die "Could not parse $context '$str'\n";
-    if (!defined $host) {
-        $host = $default_host // "127.0.0.1" || "0.0.0.0";
-    } elsif ($host eq "") {
-        $host = $default_host // "0.0.0.0" || "127.0.0.1";
+sub build_parser {
+    my ($mode, $types, $matches) = @_;
+
+    my @regex;
+    $types = "UDP4" if !defined $types || $types eq "";
+    for my $type (split /\|/, $types) {
+        my $regex = $parse_regex{lc $type} || die "Unknown $mode type '$type'";
+        $regex =~ s/\((?!\?)/(?:/g;
+        push @regex, "($regex)";
+        push @$matches, "$mode-\L$type";
     }
-    my $addr = inet_aton($host) || die "Could not resolve $context '$host'\n";
-    $port = $port eq "" ? $default_port // die "No port in $context '$str'\n" :
-        $port =~ /^0\z|^[1-9][0-9]*\z/ ? int($port) :
-        getservbyname($port, "udp") // die "Unknown UDP service '$port'\n";
-    die "Port '$port' is out of range" if $port >= 2**16;
-    return pack_sockaddr_in($port, $addr);
+    # print STDERR "REGEX: <@regex>\n";
+    return join("|", @regex);
+}
+
+sub parse_address {
+    my ($str, $context, %options) = @_;
+
+    my (@matches, @modes);
+    my $regex = "";
+    for my $mode (qw(from to)) {
+        my $types = delete $options{$mode} // next;
+        my $r = build_parser($mode, $types, \@matches);
+        $regex = $regex eq "" ? $r : "(?:$regex:)?$r";
+        push @modes, $mode;
+    }
+    die "Unknown option " . join(", ", map "'$_'", sort keys %options) if %options;
+    my @matched = $str =~ /^$regex\z/ or
+        die "Could not parse $context '$str'\n";
+    my %matches;
+    for my $i (0..$#matched) {
+        my $matched = $matched[$i] // next;
+        my ($mode, $type) = $matches[$i] =~ /^([^-]+)-([^-]+)\z/ or
+            die "Assertion: Impossible match name $matches[$i]";
+        my @parts = $matched =~ $parse_regex{$type};
+        if ($type eq "udp4" || $type eq "tcp4") {
+            if (!defined $parts[0]) {
+                $parts[0] = "127.0.0.1";
+            } elsif ($parts[0] eq "") {
+                $parts[0] = $mode eq "from" ? "0.0.0.0" : "127.0.0.1";
+            } elsif ($parts[0] eq "*") {
+                die "Cannot connect to the $context '*'" if $mode eq "to";
+                $parts[0] = "0.0.0.0";
+            }
+            $parts[0] = inet_aton($parts[0]) ||
+                die "Could not resolve $context '$parts[0]'\n";
+
+            if (!defined $parts[1] || $parts[1] eq "") {
+                die "Missing $context port" if $mode eq "to";
+                $parts[1] = 0;
+            }
+            $parts[1] = $parts[1] =~
+                /^0\z|^[1-9][0-9]*\z/ ? int($parts[1]) :
+                $type =~ /^udp/ ? getservbyname($parts[1], "udp") //
+                die("Unknown UDP service '$parts[1]'\n") :
+                $type =~ /^tcp/ ? getservbyname($parts[1], "tcp") //
+                die("Unknown TCP service '$parts[1]'\n") :
+                die("Assertion: Unknown type '$type'");
+
+            #printf(STDERR "$context: UDP4 address %s:%d\n",
+            #       inet_ntoa($parts[0]), $parts[1]);
+            $matches{$mode} = pack_sockaddr_in($parts[1], $parts[0]);
+        } else {
+            die "Assertion: Type '$type' not implemented";
+        }
+        # $matches{$mode} = [$type => \@parts];
+    }
+    my @result = @matches{@modes} or
+        die "Assertion: No modes";
+    return @result if wantarray;
+    croak "Cannot return multiple results in a scalar" if @result != 1;
+    return $result[0];
 }
 
 sub string_from_value {
@@ -81,12 +141,15 @@ sub string_from_value {
 }
 
 sub fou_encode {
-    my ($from, $to, $data, $verbose) = @_;
+    my ($from, $to, $data, $verbose, $ttl) = @_;
 
     my ($sprt, $src) = unpack_sockaddr_in($from) or
         die "Assertion: Could not unpack from address";
     my ($dprt, $dst) = unpack_sockaddr_in($to) or
         die "Assertion: Could not unpack to address";
+
+    # Avoid real outgoing packet if we are sending to 0.X.X.X
+    $ttl //= $dst =~ /^\0/ ? TTL_LOW : TTL,
 
     my $packet_id = int rand SHORT_MAX;
     my $flags = DF;
@@ -101,8 +164,7 @@ sub fou_encode {
                       $new_length,
                       $packet_id,
                       DF << 13 | 0,
-                      # Avoid real outgoing packet if we are sending to 0.X.X.X
-                      $dst =~ /^\0/ ? TTL_LOW : TTL,
+                      $ttl,
                       PROTO_UDP,
                       $src,
                       $dst,

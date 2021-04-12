@@ -1357,7 +1357,7 @@ sub socket_udp_connected {
 
     $port = $port =~ /^0\z|^[1-9][0-9]*\z/ ? int($port) :
         getservbyname($port, "udp") || die "Unknown UDP service '$port'";
-    my $addr = inet_aton($host) || die "Could nor resolve '$host'";
+    my $addr = inet_aton($host) || die "Could not resolve '$host'";
     socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_UDP) ||
         die "Could not create UDP socket: $^E";
     my $remote = pack_sockaddr_in($port, $addr);
@@ -1378,7 +1378,7 @@ sub socket_udp {
 
     $port = $port =~ /^0\z|^[1-9][0-9]*\z/ ? int($port) :
         getservbyname($port, "udp") || die "Unknown UDP service '$port'";
-    my $addr = inet_aton($host) || die "Could nor resolve '$host'";
+    my $addr = inet_aton($host) || die "Could not resolve '$host'";
     socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_UDP) ||
         die "Could not create UDP socket: $^E";
     my $local = pack_sockaddr_in($port, $addr);
@@ -1404,7 +1404,7 @@ sub socket_tcp {
     $port = $port =~ /^0\z|^[1-9][0-9]*\z/ ? int($port) :
         getservbyname($port, "tcp") || die "Unknown TCP service '$port'";
     $host = "0.0.0.0" if $host eq "";
-    my $addr = inet_aton($host) || die "Could nor resolve '$host'";
+    my $addr = inet_aton($host) || die "Could not resolve '$host'";
     socket(my $socket, PF_INET, SOCK_STREAM, $PROTO_TCP) ||
         die "Could not create TCP socket: $^E";
     my $local = pack_sockaddr_in($port, $addr);
