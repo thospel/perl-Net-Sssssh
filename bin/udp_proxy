@@ -838,6 +838,7 @@ package Fou::UDP;
 # Send out proxied packets at the local (client) side usinga FOU tunnel
 use Errno qw(EINTR EAGAIN EWOULDBLOCK EMSGSIZE);
 use Scalar::Util qw(weaken);
+use Socket qw(inet_aton inet_ntoa pack_sockaddr_in);
 
 my @FOU;
 {
@@ -846,16 +847,26 @@ my @FOU;
     sub new {
         my ($class, $host, $port) = @_;
 
-        my ($h, $p, $socket) = LineProtocol->socket_udp_connected($host, $port);
-        return $fou{"$h:$p"} if exists $fou{"$h:$p"};
+        my $addr = inet_aton($host) || die "Could not resolve '$host'";
+        $host = inet_ntoa($addr);
+        $port = $port =~ /^0\z|^[1-9][0-9]*\z/ ? int($port) :
+            getservbyname($port, "udp") || die "Unknown UDP service '$port'";
+        return $fou{"$host:$port"} if exists $fou{"$host:$port"};
+        my $to = pack_sockaddr_in($port, $addr);
+
+        # For now listen on any with a random port. Make this an option
+        my ($h, $p, $socket) = LineProtocol->socket_udp("0.0.0.0", 0);
 
         my $id = $fou_ids->id_alloc;
         my $fou = bless {
             id		=> $id,
             out		=> [],
             socket	=> $socket,
-            host	=> $h,
-            port	=> $p,
+            host	=> $host,
+            port	=> $port,
+            to		=> $to,
+            host_local	=> $h,
+            port_local	=> $p,
             timeout	=> undef,
         }, $class;
         $fou{"$h:$p"} = $FOU[$id] = $fou;
@@ -876,7 +887,16 @@ sub id {
 
 sub write : method {
     my $fou = shift;
-    if (1 == push @{$fou->{out}}, shift) {
+
+    if (1 == push @{$fou->{out}}, $msghdr ? bless {
+        name => $fou->{to},
+        buf  => shift,
+        control => ::pack_cmsghdr(
+            $IPPROTO_IP,
+            $IP_TTL,
+            pack("I", shift || die "Assertion: TTL 0")),
+        flags => 0,
+    }, "Socket::MsgHdr" : shift) {
         $fou->{socket}->add_write(sub { $fou->writer});
         $fou->{timeout} = Timer->new($settings_global{TIMEOUT}, sub { $fou->timeout } );
     }
@@ -887,7 +907,7 @@ sub writer {
 
     my $rc = $msghdr ?
         ::sendmsg($fou->{socket}, $fou->{out}[0]) :
-        syswrite($fou->{socket}, $fou->{out}[0]);
+        send($fou->{socket}, $fou->{out}[0], 0, $fou->{to});
     if (!defined $rc) {
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
         if ($! == EMSGSIZE) {
@@ -1163,14 +1183,15 @@ sub process_UDP_REMOTE {
     my ($line, $udp) = @_;
 
     my ($from_port, $separator, $to_port) =
-        $udp =~ m{^([^/]+)([/=])([^/]+)\z} or
+        $udp =~ m{^([^%=]+)([%=])([^%=]+)\z} or
         die "Invalid udp_remote '$udp'";
     my $from_host = $from_port =~ s{(.*):}{}s ? $1 :
         $default_local_bind;
+    $from_host = "0.0.0.0" if $from_host eq "" || $from_host eq "*";
     my $to_host   = $to_port   =~ s{(.*):}{}s ? $1 :
         $default_local_bind;
 
-    my $l = $separator eq "/" ? $line : $LINE;
+    my $l = $separator eq "%" ? $line : $LINE;
     my $fou = Fou::UDP->new($to_host, $to_port);
     my $listener = Listener::UDP->new($l, $from_host, $from_port, $fou);
 }
@@ -1327,19 +1348,7 @@ sub process_RESPONSE {
     ::info("Queue packet (TTL %d) for FOU[%d]: %s:%d -> %s:%d",
            $ttl, $map->{fou_id}, $src, $sprt, $map->{host}, $map->{port}) if
                $debug;
-    if ($msghdr) {
-        $fou->write(bless {
-            name => "",
-            buf  => $buffer,
-            control => ::pack_cmsghdr(
-                $IPPROTO_IP,
-                $IP_TTL,
-                pack("I", $ttl || die "Assertion: TTL 0")),
-            flags => 0,
-        }, "Socket::MsgHdr");
-    } else {
-        $fou->write($buffer);
-    }
+    $fou->write($buffer, $ttl);
 }
 
 sub set_peer {
@@ -1507,13 +1516,14 @@ sub client {
 
         for my $udp (@$udp_locals) {
             my ($from_port, $separator, $to_port) =
-                $udp =~ m{^([^/]+)([/=])([^/]+)\z} or
+                $udp =~ m{^([^%=]+)([%=])([^%=]+)\z} or
                 die "Invalid udp_local '$udp'";
             my $from_host = $from_port =~ s{(.*):}{}s ? $1 :
                 $default_local_bind;
+            $from_host = "0.0.0.0" if $from_host eq "" || $from_host eq "*";
             my $to_host   = $to_port   =~ s{(.*):}{}s ? $1 :
                 $default_local_bind;
-            my $l = $separator eq "/" ? $line : $LINE;
+            my $l = $separator eq "%" ? $line : $LINE;
             my $fou = Fou::UDP->new($to_host, $to_port);
             my $listener = Listener::UDP->new($l, $from_host, $from_port, $fou);
         }
@@ -1527,7 +1537,7 @@ sub client {
         }
 
         for my $udp (@$udp_remotes) {
-            $udp =~ m{^[^/]+[/=][^/]+\z} or die "Invalid udp remote '$udp'";
+            $udp =~ m{^[^%=]+[%=][^%=]+\z} or die "Invalid udp remote '$udp'";
             $line->write($UDP_REMOTE, $udp);
         }
 
@@ -1561,8 +1571,8 @@ GetOptions("server:s"		=> \my $server,
            "keepalive=f"	=> \$keepalive,
            "timeout=f"		=> \$timeout,
            "stuff!"		=> \my $stuff,
-           "l=s"		=> \my @udp_local,
-           "r=s"		=> \my @udp_remote,
+           "udp_local|l=s"	=> \my @udp_local,
+           "udp_remoter=s"	=> \my @udp_remote,
            "udp_max=o"		=> \$udp_max,
            "version!"		=> \my $version,
            "U|unsafe!"		=> \my $unsafe,

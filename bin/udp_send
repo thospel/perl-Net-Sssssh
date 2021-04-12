@@ -98,9 +98,8 @@ if ($fou) {
         Proto		=> "udp",
         $from_addr ? (
             LocalHost	=> inet_ntoa($from_addr),
-            LocalPort	=> $from_port) : (),
-        PeerHost	=> inet_ntoa($to_addr),
-        PeerPort	=> $to_port) || die "Could not create socket: $!";
+            LocalPort	=> $from_port) : (LocalPort => "00")) ||
+                die "Could not create socket: $!";
     if (!$local) {
         $laddr = inet_aton("1.2.3.4");
         $lport = 49154;
@@ -108,8 +107,10 @@ if ($fou) {
     $buffer = fou_encode(pack_sockaddr_in($lport, $laddr),
                             parse_address("$host:$port", "To", to => "UDP4"),
                             $txt, $verbose && \*STDERR);
+    my $props;
     if ($msghdr) {
         $msghdr->buf($buffer);
+        $msghdr->name($fou_to);
         $s->sendmsg($msghdr) || die "Could not sendmsg(): $^E";
 
         $answer || exit;
@@ -117,22 +118,22 @@ if ($fou) {
         $msghdr->controllen(256);
         $msghdr->namelen(256);
         $msghdr->buflen(2**16);
-        $s->recvmsg($msghdr) || die "Could not recvmsg: $!";
+        $s->recvmsg($msghdr) || die "Could not recvmsg: $^E";
 
-        my $props = fou_decode($msghdr->buf, $verbose && \*STDERR);
-
-        $buffer = $props->{data};
-        $sender = pack_sockaddr_in($props->{sprt}, $props->{src});
-        $ttl = $props->{ttl};
-        $msg_src = $msg_dst = inet_ntoa($props->{dst});
+        $props = fou_decode($msghdr->buf, $verbose && \*STDERR);
     } else {
-        my $rc = syswrite($s, $buffer) //
+        my $rc = send($s, $buffer, 0, $fou_to) //
             die "Could not write to socket: $^E";
         $rc == length $buffer ||
             die "Truncated write to socket";
         $answer || exit;
-        die "Answer not implemented (yet)";
+        recv($s, $buffer, 2**16, 0) // die "Could not recv: $^E";
+        $props = fou_decode($buffer, $verbose && \*STDERR);
     }
+    $buffer = $props->{data};
+    $sender = pack_sockaddr_in($props->{sprt}, $props->{src});
+    $ttl = $props->{ttl};
+    $msg_src = $msg_dst = inet_ntoa($props->{dst});
 } else {
     if ($msghdr) {
         my $s = IO::Socket::INET->new(
