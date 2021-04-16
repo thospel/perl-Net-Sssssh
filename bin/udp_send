@@ -52,8 +52,9 @@ die "Could not parse your command line. Try $0 -h\n" unless
 
 if ($version) {
     ## no critic (UselessNoCritic RequireCheckedSyscalls)
+    require Net::Sssssh::Package;
     print <<"EOF";
-dhcp_test $VERSION (DHCP::Test $DHCP::Test::Package::VERSION)
+udp_send $VERSION (Net::Sssssh $Net::Sssssh::Package::VERSION)
 EOF
     exit 0;
 }
@@ -146,9 +147,12 @@ if ($fou) {
             if (defined IP_RECVDSTADDR) {
                 $msghdr->cmsghdr(IPPROTO_IP, IP_RECVDSTADDR, $local);
             } else {
-                # I cannot find any documentation about what the addresses
-                # exactly mean. Testing indicates only the second field
-                # (ipi_spec_dst) really matters
+                # I cannot find any clear documentation about what the addresses
+                # *exactly* mean. The linux ip(7) man page explains what the
+                # different IP_PKTINFO fields mean, but I have been unable to
+                # find a scenario where the fields differ on receive, and on
+                # send my testing indicates only the second field (ipi_spec_dst)
+                # really matters
                 # Best read: http://mail-index.netbsd.org/tech-net/2017/12/28/msg006579.html
                 $msghdr->cmsghdr(IPPROTO_IP, IP_PKTINFO, pack("x4a4a4", $local, $local));
             }
@@ -216,7 +220,7 @@ if ($fou) {
         my $mysockaddr = getsockname($s);
         my ($lport, $laddr) = unpack_sockaddr_in($mysockaddr);
         $laddr = inet_ntoa($laddr);
-        print STDERR "Sent from $laddr:$lport\n";
+        print "Sent from $laddr:$lport\n";
         my $rc = syswrite($s, $txt) //
             die "Could not write to socket: $^E";
         $rc == length $txt ||

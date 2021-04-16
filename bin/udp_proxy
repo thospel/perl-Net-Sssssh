@@ -1581,7 +1581,7 @@ GetOptions("server:s"		=> \my $server,
 
 if ($version) {
     print<<"EOF";
-udp_proxy (Ton Utils) $VERSION
+udp_proxy $VERSION (Net::Sssssh) $VERSION
 EOF
     exit 0;
 }

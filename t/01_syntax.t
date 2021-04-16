@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 # Before `make install' is performed this script should be runnable with
-# `make test'. After `make install' it should work as `perl 00_syntax.t'
+# `make test'. After `make install' it should work as `perl 01_syntax.t'
 #########################
 # $Id: 00_syntax.t 5026 2012-02-02 22:33:26Z hospelt $
 ## no critic (UselessNoCritic MagicNumbers)
@@ -13,7 +13,7 @@ use Carp;
 use Errno qw(ENOENT ESTALE);
 BEGIN { $^W = 1 };
 
-use Test::More tests => 1;
+use Test::More tests => 4;
 use FindBin qw($Bin);
 
 my $t_dir;
@@ -58,7 +58,7 @@ sub check {
 
 $Bin =~ s{/t/?\z}{} || die "No /t at end of $Bin";
 
-for my $script (qw(sssssh)) {
+for my $script (qw(sssssh udp_proxy udp_send udp_recv)) {
     ok(!check("-I", "$Bin/blib/lib", "-I", "$Bin/blib/arch",
               "$Bin/bin/$script"),
        "Can compile $Bin/bin/$script");

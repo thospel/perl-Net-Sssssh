@@ -10,4 +10,8 @@ bin/udp_send
 lib/Net/Sssssh.pm
 lib/Net/Sssssh/Package.pm
 md5-versions
-t/00_syntax.t
+t/00_load.t
+t/01_syntax.t
+t/02_fou_encode_decode.t
+t/03_udp_send.t
+t/04_udp_recv.t

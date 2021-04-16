@@ -202,7 +202,11 @@ sub fou_encode {
 sub fou_decode {
     my ($buffer, $verbose, $relaxed) = @_;
 
-    return undef if length $buffer < 20;
+    if (length $buffer < 20) {
+        my $error = "Packet too short";
+        $relaxed || die $error;
+        return { error => $error }
+    }
 
     my ($ihl, $ecn, $length, $packet_id, $fragment, $ttl, $proto, $chksum, $src, $dst) = unpack("CCnnnCCna4a4", $buffer);
     my $version = $ihl >> 4;

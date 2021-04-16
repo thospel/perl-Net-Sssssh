@@ -75,6 +75,7 @@ my $ERROR_ETIMEDOUT	= "Timed out";
 my $ERROR_ERESOLV	= "Could not resolve host";
 
 my $role = "client";
+my $role_peer;
 my (@tcp_local, @udp_local, @tcp_remote, @udp_remote);
 my (@socks_local, @socks_remote, $ole_peer);
 

@@ -6,8 +6,8 @@ use strict;
 use warnings;
 use vars qw($VERSION $SUB_VERSION $release_time %history);
 $VERSION = "1.000";
-$SUB_VERSION = "031";
-$release_time = 1618218704;	## no critic (UselessNoCritic MagicNumbers)
+$SUB_VERSION = "032";
+$release_time = 1618611921;	## no critic (UselessNoCritic MagicNumbers)
 %history = (
   'Changes' => {
     '1.000' => '1.000'
@@ -42,7 +42,22 @@ $release_time = 1618218704;	## no critic (UselessNoCritic MagicNumbers)
   'lib/Net/Sssssh/Package.pm' => {
     '1.000' => '1.000'
   },
+  't/00_load.t' => {
+    '1.000' => '1.000'
+  },
   't/00_syntax.t' => {
+    '1.000' => '1.000'
+  },
+  't/01_syntax.t' => {
+    '1.000' => '1.000'
+  },
+  't/02_fou_encode_decode.t' => {
+    '1.000' => '1.000'
+  },
+  't/03_udp_send.t' => {
+    '1.000' => '1.000'
+  },
+  't/04_udp_recv.t' => {
     '1.000' => '1.000'
   }
 );
