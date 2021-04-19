@@ -2,7 +2,6 @@
 # Before `make install' is performed this script should be runnable with
 # `make test'. After `make install' it should work as `perl 04_udp_recv.t'
 #########################
-# $Id: 00_syntax.t 5026 2012-02-02 22:33:26Z hospelt $
 ## no critic (UselessNoCritic MagicNumbers)
 use strict;
 use warnings;

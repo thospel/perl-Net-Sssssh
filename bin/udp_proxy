@@ -182,89 +182,134 @@ $| = 1;
 print "' . $STUFFED . '";
 ');
 
-package Events;
-# A small event core
-use Carp;
-use Errno qw(EINTR);
-
-my $read_mask  = "";
-my $write_mask = "";
-my $error_mask = "";
-my (%read_refs, %write_refs, %error_refs);
-
-sub add_read(*$ ) {
-    defined(my $fd = fileno(shift)) || croak "Not a filehandle";
-    ::caller_info("add_read $fd") if $debug;
-    croak "Descriptor $fd already selected for read" if $read_refs{$fd};
-    $read_refs{$fd} = shift;
-    vec($read_mask, $fd, 1) = 1;
-}
-
-sub add_write(*$ ) {
-    defined(my $fd = fileno(shift)) || croak "Not a filehandle";
-    ::caller_info("add_write $fd") if $debug;
-    croak "Descriptor $fd already selected for write" if $write_refs{$fd};
-    $write_refs{$fd} = shift;
-    vec($write_mask, $fd, 1) = 1;
-}
-
-sub add_error(*$ ) {
-    defined(my $fd = fileno(shift)) || croak "Not a filehandle";
-    ::caller_info("add_error $fd") if $debug;
-    croak "Descriptor $fd already selected for error" if $error_refs{$fd};
-    $error_refs{$fd} = shift;
-    vec($error_mask, $fd, 1) = 1;
-}
-
-sub delete_read(*) {
-    defined(my $fd = fileno(shift)) || croak "Not a filehandle";
-    ::caller_info("delete_read $fd") if $debug;
-    croak "Descriptor $fd wasn't selected for read" unless $read_refs{$fd};
-    # This strange assign before delete is to poison the reference the for in
-    # sub mainloop may still have
-    $read_refs{$fd} = undef;
-    delete $read_refs{$fd};
-    if (%read_refs) {
-        vec($read_mask, $fd, 1) = 0;
-        $read_mask =~ s/\x00+\z//;
-    } else {
-        $read_mask = "";
-    }
-}
-
-sub delete_write(*) {
-    defined(my $fd = fileno(shift)) || croak "Not a filehandle";
-    ::caller_info("delete_write $fd") if $debug;
-    croak "Descriptor $fd wasn't selected for write" unless $write_refs{$fd};
-    # This strange assign before delete is to poison the reference the for in
-    # sub mainloop may still have
-    $write_refs{$fd} = undef;
-    delete $write_refs{$fd};
-    if (%write_refs) {
-        vec($write_mask, $fd, 1) = 0;
-        $write_mask =~ s/\x00+\z//;
-    } else {
-        $write_mask = "";
-    }
-}
-
-sub delete_error(*) {
-    defined(my $fd = fileno(shift)) || croak "Not a filehandle";
-    ::caller_info("delete_error $fd") if $debug;
-    croak "Descriptor $fd wasn't selected for error" unless $error_refs{$fd};
-    # This strange assign before delete is to poison the reference the for in
-    # sub mainloop may still have
-    $error_refs{$fd} = undef;
-    delete $error_refs{$fd};
-    if (%error_refs) {
-        vec($error_mask, $fd, 1) = 0;
-        $error_mask =~ s/\x00+\z//;
-    } else {
-        $error_mask = "";
-    }
-}
-
 {
+    package Events;
+    # A small event core
+    use Carp;
+    use Errno qw(EINTR);
+
+    my $read_fixed = 0;
+    my $read_mask  = "";
+    my $write_mask = "";
+    my $error_mask = "";
+    my (%read_refs, %write_refs, %error_refs);
+
+    # All placeholder subs are the same sub
+    use constant NOP => sub {};
+
+    sub Events::Read::DESTROY {
+        my $fd = ${shift()} // die "No filedescriptor";
+        ::caller_info("delete_read $fd") if $debug;
+        # This strange assign after delete is to update the reference the for in
+        # sub mainloop may still have in such a way that element 0 keeps existing
+        # (otherwise a confess during the callback will access freed memory)
+        # We could set either the object (index 0) or the callback (index 1)
+        # But the object is already weak and the callback may be a closure
+        delete($read_refs{$fd})->[1] = NOP;
+        if (%read_refs) {
+            vec($read_mask, $fd, 1) = 0;
+            $read_mask =~ s/\x00+\z//;
+        } else {
+            $read_mask = "";
+        }
+    }
+
+    sub Events::Write::DESTROY {
+        my $fd = ${shift()} // die "No filedescriptor";
+        ::caller_info("delete_write $fd") if $debug;
+        # This strange assign after delete is to update the reference the for in
+        # sub mainloop may still have in such a way that element 0 keeps existing
+        # (otherwise a confess during the callback will access freed memory)
+        # We could set either the object (index 0) or the callback (index 1)
+        # But the object is already weak and the callback may be a closure
+        delete($write_refs{$fd})->[1] = NOP;
+        if (%write_refs) {
+            vec($write_mask, $fd, 1) = 0;
+            $write_mask =~ s/\x00+\z//;
+        } else {
+            $write_mask = "";
+        }
+    }
+
+    sub Events::Error::DESTROY {
+        my $fd = ${shift()} // die "No filedescriptor";
+        ::caller_info("delete_error $fd") if $debug;
+        # This strange assign after delete is to update the reference the for in
+        # sub mainloop may still have in such a way that element 0 keeps existing
+        # (otherwise a confess during the callback will access freed memory)
+        # We could set either the object (index 0) or the callback (index 1)
+        # But the object is already weak and the callback may be a closure
+        delete($error_refs{$fd})->[1] = NOP;
+        if (%error_refs) {
+            vec($error_mask, $fd, 1) = 0;
+            $error_mask =~ s/\x00+\z//;
+        } else {
+            $error_mask = "";
+        }
+    }
+
+    package Events;
+    use Scalar::Util qw(weaken);
+
+    sub add_read {
+        my $fd = fileno(shift) // croak "Not a filehandle";
+        ::caller_info("add_read $fd") if $debug;
+        croak "Descriptor $fd already selected for read" if $read_refs{$fd};
+        vec($read_mask, $fd, 1) = 1;
+        weaken(($read_refs{$fd} = [shift, shift])->[0]);
+        return bless \$fd, "Events::Read";
+    }
+
+    sub add_write {
+        my $fd = fileno(shift) // croak "Not a filehandle";
+        ::caller_info("add_write $fd") if $debug;
+        croak "Descriptor $fd already selected for write" if $write_refs{$fd};
+        vec($write_mask, $fd, 1) = 1;
+        weaken(($write_refs{$fd} = [shift, shift])->[0]);
+        return bless \$fd, "Events::Write";
+    }
+
+    sub add_error {
+        my $fd = fileno(shift) // croak "Not a filehandle";
+        ::caller_info("add_error $fd") if $debug;
+        croak "Descriptor $fd already selected for error" if $error_refs{$fd};
+        vec($error_mask, $fd, 1) = 1;
+        weaken(($error_refs{$fd} = [shift, shift])->[0]);
+        return bless \$fd, "Events::Error";
+    }
+
+    sub mainloop {
+        ::info($msghdr_error) if $msghdr_error && ($verbose || $debug);
+        ::info("Entering mainloop") if $verbose || $debug;
+        my ($r, $w, $e, $name, $timeout);
+        while (1) {
+            ($timeout = Timer::timers_collect()) //
+                (keys %read_refs > $read_fixed || %write_refs || %error_refs || last);
+            if ((select($r = $read_mask,
+                        $w = $write_mask,
+                        $e = $error_mask, $timeout) || next) > 0) {
+                # The copy to @tmp is because the stack doesn't keep values
+                # alive, so any deletes on xxx_refs during the loop can make
+                # the value go poof. The copy temporarily increases the
+                # refcount so the value doesn't go away. That is also why the
+                # delete_xxx functions modify the value before delete
+                # $name = $_->[1], $_->[0]->$name for my @tmp=(
+                $_->[1]->($_->[0] || next) for my @tmp=(
+                    # $$_ and $$_->[0]->(@{$$_->[1]}[1..$#{$$_->[1]}]) for
+                    @read_refs{ grep vec($r, $_, 1), keys %read_refs},
+                    @write_refs{grep vec($w, $_, 1), keys %write_refs},
+                    @error_refs{grep vec($e, $_, 1), keys %error_refs});
+            } elsif ($! != EINTR) {
+                redo;
+            } else {
+                die "Select failed: $^E";
+            }
+        } continue {
+            Timer::timers_run();
+        }
+        ::info("Exiting mainloop") if $verbose || $debug;
+    }
+
     no warnings "once";
     *IO::Handle::add_read     = \&add_read;
     *IO::Handle::add_write    = \&add_write;
@@ -274,190 +319,214 @@ sub delete_error(*) {
     *IO::Handle::delete_error = \&delete_error;
 }
 
-sub mainloop {
-    ::info($msghdr_error) if $msghdr_error && ($verbose || $debug);
-    ::info("Entering mainloop") if $verbose || $debug;
-    while (1) {
-        my $timeout = Timer::timers_collect();
-        $timeout // (%read_refs || %write_refs || %error_refs || last);
-        if ((select(my $r = $read_mask, my $w = $write_mask, my $e = $error_mask, $timeout) || (Timer::timers_run(), next)) > 0) {
-            $$_ && $$_->() for
-                \@read_refs{ grep vec($r, $_, 1), keys %read_refs},
-                \@write_refs{grep vec($w, $_, 1), keys %write_refs},
-                \@error_refs{grep vec($e, $_, 1), keys %error_refs};
-            Timer::timers_run();
-        } elsif ($! != EINTR) {
-            die "Select failed: $^E";
-        }
-    }
-    ::info("Exiting mainloop") if $verbose || $debug;
-}
+my $CLOCK_TYPE_NAME;
+{
+    package Timer;
+    # A small timer core
+    use Scalar::Util qw(weaken refaddr);
+    use Carp;
+    use Time::HiRes qw(clock_gettime CLOCK_REALTIME CLOCK_MONOTONIC);
 
-package Timer;
-# A small timer core
-use Scalar::Util qw(weaken);
-use Carp;
-use Time::HiRes qw(clock_gettime CLOCK_REALTIME CLOCK_MONOTONIC);
+    # Timer indices
+    sub INDEX	() { 0 };
+    sub TIME	() { 1 };
+    sub OBJ		() { 2 }; # Must come after TIME
+    sub CODE	() { 3 };
+    sub CALLERS	() { 4 };
 
-# Timer indices
-sub TIME	() { 0 };
-sub INDEX	() { 1 };
-sub CODE	() { 2 };	# Must come after INDEX
+    my @timers = (undef);
+    # @expired must be persistent so no timers get lost if a callback dies
+    my @expired;
+    # Simular for @expired. @immediate contains timeout 0 timers that we don't
+    # even bother to put in @timers
+    my @immediate;
 
-# @immediate must be persistent so no timers get lost if a callback dies
-my @immediate;
-my @timers = (undef);
-
-my $CLOCK_TYPE;
-my $CLOCK_TYPE_NAME =
-    eval { $CLOCK_TYPE = CLOCK_MONOTONIC; "MONOTONIC" } ||
+    my $CLOCK_TYPE;
+    $CLOCK_TYPE_NAME =
+        eval { $CLOCK_TYPE = CLOCK_MONOTONIC; "MONOTONIC" } ||
     eval { $CLOCK_TYPE = CLOCK_REALTIME;  "REAL" } ||
     die "Time::HiRes doesn't even have CLOCK_REALTIME";
 
-sub realtime {
-    return clock_gettime(CLOCK_REALTIME);
-}
-
-sub time : method {
-    return clock_gettime($CLOCK_TYPE);
-}
-
-my $BASE_TIME = Timer->realtime();
-
-# Timers are kept in a simple binary heap @timers
-sub new {
-    my ($class, $time, $fun) = @_;
-
-    $time += clock_gettime($CLOCK_TYPE);
-    my $i = @timers;
-    while ($i > 1 && $time < $timers[$i >> 1][TIME]) {
-        weaken($timers[$i] = $timers[$i >> 1]);
-        $i = ($timers[$i][INDEX] = $i) >> 1;
+    sub realtime {
+        return clock_gettime(CLOCK_REALTIME);
     }
-    my $timer = bless [$time, $i, $fun], $class;
-    weaken($timers[$i] = $timer);
-    return $timer;
-}
 
-sub delete : method {
-    my ($timer) = @_;
+    sub clocktime : method {
+        return clock_gettime($CLOCK_TYPE);
+    }
 
-    my $i = $timer->[INDEX];
-    if (!$i) {
-        croak "Not a timer reference" unless defined($i) && $i == 0;
-        # Could be a timer sitting on the expired queue @immediate
-        $#$timer = INDEX if @$timer > INDEX;
-        return;
-    }
-    $timer->[INDEX] = 0;
-    # Last element or beyond...
-    if ($i >= $#timers) {
-        croak "Not a timer reference" if $i > $#timers;
-        pop(@timers);
-        return;
-    }
-    my $time = $timers[-1][TIME];
-    if ($i > 1 && $time < $timers[$i >> 1][TIME]) {
-        # percolate to root
-        do {
+    # Timers are kept in a simple binary heap @timers
+    sub timer {
+        if ($debug) {
+            my $d = $debug;
+            $debug = 0;
+            my $timer = timer(@_);
+            my $callers = ::callers();
+            $timer->[CALLERS] = $callers;
+            ::info("add Timer(%s) %08x [%s]", $_[0], refaddr($timer), $callers);
+            $debug = $d;
+            return $timer;
+        }
+        my $time = shift() + clocktime();
+        my $i = @timers;
+        while ($i > 1 && $time < $timers[$i >> 1][TIME]) {
             weaken($timers[$i] = $timers[$i >> 1]);
             $i = ($timers[$i][INDEX] = $i) >> 1;
-        } while ($i > 1 && $time < $timers[$i >> 1][TIME]);
-    } else {
-        # percolate to leafs
-        my $n = @timers-2;
-        my $l = $i * 2;
-        while ($l < $n) {
-            if ($timers[$l][TIME] < $time) {
-                if ($timers[$l+1][TIME] < $timers[$l][TIME]) {
-                    weaken($timers[$i] = $timers[$l+1]);
-                    $timers[$i][INDEX] = $i;
-                    $i = $l+1;
-                } else {
-                    weaken($timers[$i] = $timers[$l]);
-                    $timers[$i][INDEX] = $i;
-                    $i = $l;
-                }
-            } elsif ($timers[$l+1][TIME] < $time) {
-                weaken($timers[$i] = $timers[$l+1]);
-                $timers[$i][INDEX] = $i;
-                $i = $l+1;
-            } else {
-                last;
-            }
-            $l = $i * 2;
         }
-        if ($l == $n && $timers[$l][TIME] < $time) {
-            weaken($timers[$i] = $timers[$l]);
-            $timers[$i][INDEX] = $i;
-            $i = $l;
-        }
+        my $timer = bless [$i, $time, @_];
+        weaken($timer->[OBJ]);
+        weaken($timers[$i] = $timer);
+        return $timer;
     }
-    weaken($timers[$i] = pop @timers);
-    $timers[$i][INDEX] = $i;
-}
 
-sub DESTROY {
-    shift->delete;
-}
+    sub immediate {
+        # If we ever expose the TIME element we should put clocktime() there
+        my $timer = bless [0, 0, @_];
+        weaken($timer->[OBJ]);
+        weaken($immediate[@immediate] = $timer);
+        if ($debug) {
+            my $callers = ::callers();
+            $timer->[CALLERS] = $callers;
+            ::info("add Immediate Timer(0) %08x [%s]", refaddr($timer), $callers);
+        }
+        return $timer;
+    }
 
-sub timers_collect {
-    return @immediate ? 0 : undef if @timers <= 1;
-    my $now = clock_gettime($CLOCK_TYPE);
-    return @immediate ? 0 : $timers[1][TIME] - $now if $timers[1][TIME] > $now;
+    sub delete : method {
+        my ($timer) = @_;
 
-    # We will expire at least 1 timer
-    # @timers > 2 makes sure that if we pop @timers we don't remove $timers[1]
-    while (@timers > 2) {
-        $timers[1][INDEX] = 0;
-        weaken($immediate[@immediate] = $timers[1]);
-
+        my $i = $timer->[INDEX];
+        if ($debug && defined $i) {
+            if ($timer->[CALLERS]) {
+                my $callers = ::callers();
+                ::info("delete Timer %08x [%s], added at [%s]", refaddr($timer), $callers, $timer->[CALLERS]);
+            } else {
+                ::caller_info("delete Timer %08x", refaddr($timer));
+            }
+        }
+        if (!$i) {
+            croak "Not a timer reference" unless defined($i) && $i == 0;
+            # Could be a timer sitting on the expired queue in run_now
+            $#$timer = TIME if @$timer > TIME;
+            return;
+        }
+        $timer->[INDEX] = 0;
+        # Last element or beyond...
+        if ($i >= $#timers) {
+            croak "Not a timer reference" if $i > $#timers;
+            pop(@timers);
+            return;
+        }
         my $time = $timers[-1][TIME];
-        my $n = @timers-2;
-        my $i = 1;
-        my $l = 2;
-        while ($l < $n) {
-            if ($timers[$l][TIME] < $time) {
-                if ($timers[$l+1][TIME] < $timers[$l][TIME]) {
+        if ($i > 1 && $time < $timers[$i >> 1][TIME]) {
+            # percolate to root
+            do {
+                weaken($timers[$i] = $timers[$i >> 1]);
+                $i = ($timers[$i][INDEX] = $i) >> 1;
+            } while ($i > 1 && $time < $timers[$i >> 1][TIME]);
+        } else {
+            # percolate to leafs
+            my $n = @timers-2;
+            my $l = $i * 2;
+            while ($l < $n) {
+                if ($timers[$l][TIME] < $time) {
+                    if ($timers[$l+1][TIME] < $timers[$l][TIME]) {
+                        weaken($timers[$i] = $timers[$l+1]);
+                        $timers[$i][INDEX] = $i;
+                        $i = $l+1;
+                    } else {
+                        weaken($timers[$i] = $timers[$l]);
+                        $timers[$i][INDEX] = $i;
+                        $i = $l;
+                    }
+                } elsif ($timers[$l+1][TIME] < $time) {
                     weaken($timers[$i] = $timers[$l+1]);
                     $timers[$i][INDEX] = $i;
                     $i = $l+1;
                 } else {
-                    weaken($timers[$i] = $timers[$l]);
-                    $timers[$i][INDEX] = $i;
-                    $i = $l;
+                    last;
                 }
-            } elsif ($timers[$l+1][0] < $time) {
-                weaken($timers[$i] = $timers[$l+1]);
-                $timers[$i][INDEX] = $i;
-                $i = $l+1;
-            } else {
-                last;
+                $l = $i * 2;
             }
-            $l = $i * 2;
-        }
-        if ($l == $n && $timers[$l][TIME] < $time) {
-            weaken($timers[$i] = $timers[$l]);
-            $timers[$i][INDEX] = $i;
-            $i = $l;
+            if ($l == $n && $timers[$l][TIME] < $time) {
+                weaken($timers[$i] = $timers[$l]);
+                $timers[$i][INDEX] = $i;
+                $i = $l;
+            }
         }
         weaken($timers[$i] = pop @timers);
         $timers[$i][INDEX] = $i;
-        return 0 if $timers[1][TIME] > $now;
     }
-    if (@timers == 2) {
-        $timers[1][INDEX] = 0;
-        weaken($immediate[@immediate] = pop @timers);
+
+    sub DESTROY {
+        shift->delete;
     }
-    return 0;
-}
 
-sub timers_run {
-    @immediate || return;
-    my $fun;
+    sub timers_collect {
+        if (@immediate) {
+            my $from = @expired;
+            push @expired, @immediate;
+            weaken($expired[$_]) for $from .. $#expired;
+            @immediate = ();
+        }
+        return @expired ? 0 : undef if @timers <= 1;
+        my $now = clocktime();
+        return @expired ? 0 : $timers[1][TIME] - $now if $timers[1][TIME] > $now;
 
-    # Using while instead of for in case a callback dies
-    ($fun = shift @immediate) && $fun->[CODE] && $fun->[CODE]->() while @immediate;
+        # We will expire at least 1 timer
+        # @timers > 2 makes sure that if we pop @timers we don't remove $timers[1]
+        while (@timers > 2) {
+            $timers[1][INDEX] = 0;
+            weaken($expired[@expired] = $timers[1]);
+
+            my $time = $timers[-1][TIME];
+            my $n = @timers-2;
+            my $i = 1;
+            my $l = 2;
+            while ($l < $n) {
+                if ($timers[$l][TIME] < $time) {
+                    if ($timers[$l+1][TIME] < $timers[$l][TIME]) {
+                        weaken($timers[$i] = $timers[$l+1]);
+                        $timers[$i][INDEX] = $i;
+                        $i = $l+1;
+                    } else {
+                        weaken($timers[$i] = $timers[$l]);
+                        $timers[$i][INDEX] = $i;
+                        $i = $l;
+                    }
+                } elsif ($timers[$l+1][0] < $time) {
+                    weaken($timers[$i] = $timers[$l+1]);
+                    $timers[$i][INDEX] = $i;
+                    $i = $l+1;
+                } else {
+                    last;
+                }
+                $l = $i * 2;
+            }
+            if ($l == $n && $timers[$l][TIME] < $time) {
+                weaken($timers[$i] = $timers[$l]);
+                $timers[$i][INDEX] = $i;
+                $i = $l;
+            }
+            weaken($timers[$i] = pop @timers);
+            $timers[$i][INDEX] = $i;
+            return 0 if $timers[1][TIME] > $now;
+        }
+        if (@timers == 2) {
+            $timers[1][INDEX] = 0;
+            weaken($expired[@expired] = pop @timers);
+        }
+
+        return 0;
+    }
+
+    sub timers_run {
+        @expired || return;
+        my $fun;
+
+        # Using while instead of for in case a callback dies
+        ($fun = shift @expired) && $fun->[OBJ] && $fun->[CODE]->($fun->[OBJ]) while @expired;
+    }
 }
 
 package Ids;
@@ -522,12 +591,14 @@ sub new {
         socket		=> $socket,
         local_host	=> $host,
         local_port	=> $port,
+        reader		=> undef,
+        writer		=> undef,
         timeout		=> undef,
     }, $class;
+    $sender->{reader} = $socket->add_read($sender, \&reader),
     weaken($sender->{line} = $line);
 
     ::info("Creating new Sender::UDP socket[$id] '$host:$port'") if $debug;
-    $socket->add_read(sub { $sender->reader });
 
     $line->{sockets_udp}{$id} = $sender;
     return $sender;
@@ -552,8 +623,9 @@ sub write : method {
             flags => 0,
         }, "Socket::MsgHdr" :
         [pack_sockaddr_in(shift, shift), shift]) {
-        $sender->{socket}->add_write(sub { $sender->writer});
-        $sender->{timeout} = Timer->new($sender->{line}{settings}{TIMEOUT}, sub { $sender->timeout } );
+        $sender->{writer} = $sender->{socket}->add_write($sender, \&writer);
+        $sender->{timeout} = Timer::timer($sender->{line}{settings}{TIMEOUT},
+                                          $sender, \&timeout);
     }
 }
 
@@ -600,9 +672,10 @@ sub writer {
   DROP:
     shift @{$sender->{out}};
     if (@{$sender->{out}}) {
-        $sender->{timeout} = Timer->new($sender->{line}{settings}{TIMEOUT}, sub { $sender->timeout } );
+        $sender->{timeout} = Timer::timer($sender->{line}{settings}{TIMEOUT},
+                                          $sender, \&timeout);
     } else {
-        $sender->{socket}->delete_write;
+        $sender->{writer}  = undef;
         $sender->{timeout} = undef;
     }
 }
@@ -669,11 +742,13 @@ sub new {
         socket		=> $socket,
         local_host	=> $h,
         local_port	=> $p,
+        reader		=> undef,
     }, $class;
+    $listener->{reader} = $socket->add_read($listener, \&reader),
     weaken($listener->{line} = $line);
 
     ::info("Listening on UDP socket '$h:$p'") if $debug;
-    $socket->add_read(sub { $listener->reader });
+
 
     my $id = $line->id_alloc;
     $listener->{id} = $id;
@@ -844,6 +919,12 @@ my @FOU;
 {
     my %fou;
     my $fou_ids = Ids->new;
+
+    sub free {
+        %fou = ();
+        @FOU = ();
+    }
+
     sub new {
         my ($class, $host, $port) = @_;
 
@@ -867,6 +948,7 @@ my @FOU;
             to		=> $to,
             host_local	=> $h,
             port_local	=> $p,
+            writer	=> undef,
             timeout	=> undef,
         }, $class;
         $fou{"$h:$p"} = $FOU[$id] = $fou;
@@ -897,8 +979,9 @@ sub write : method {
             pack("I", shift || die "Assertion: TTL 0")),
         flags => 0,
     }, "Socket::MsgHdr" : shift) {
-        $fou->{socket}->add_write(sub { $fou->writer});
-        $fou->{timeout} = Timer->new($settings_global{TIMEOUT}, sub { $fou->timeout } );
+        $fou->{writer} = $fou->{socket}->add_write($fou, \&writer);
+        $fou->{timeout} = Timer::timer($settings_global{TIMEOUT},
+                                       $fou, \&timeout);
     }
 }
 
@@ -934,9 +1017,10 @@ sub writer {
   DROP:
     shift @{$fou->{out}};
     if (@{$fou->{out}}) {
-        $fou->{timeout} = Timer->new($settings_global{TIMEOUT}, sub { $fou->timeout } );
+        $fou->{timeout} = Timer::timer($settings_global{TIMEOUT},
+                                       $fou, \&timeout);
     } else {
-        $fou->{socket}->delete_write;
+        $fou->{writer}  = undef;
         $fou->{timeout} = undef;
     }
 }
@@ -976,6 +1060,8 @@ use constant {
 
 use base qw(LineProtocol0);
 
+my $BASE_TIME = Timer->realtime();
+
 my %process_name = (
     $SET		=> "SET",
     $START		=> "START",
@@ -1009,7 +1095,7 @@ sub new {
     $line->{out_sent} = 0;
     $line->{out_base} = 0;
 
-    $socket_in->add_read(sub { $line->reader });
+    $line->{reader} = $socket_in->add_read($line, \&reader);
 
     return $line;
 }
@@ -1039,10 +1125,11 @@ sub writer {
         my $rc = $line->{socket_out}->syswrite($line->{out}, $BLOCK_SIZE, $line->{out_sent});
         if (!defined $rc) {
             if ($! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK) {
-                $line->{timeout} //= Timer->new($line->{settings}{TIMEOUT}, sub { $line->timeout } );
+                $line->{timeout} //= Timer::timer($line->{settings}{TIMEOUT},
+                                                  $line, \&timeout);
                 return;
             }
-            $line->{socket_out}->delete_write;
+            $line->{writer} = undef;
             die "Could not write to $role_peer: $^E"
         }
         die "Zero write. Is this even possible ?" if $rc == 0;
@@ -1053,8 +1140,9 @@ sub writer {
         $line->{timeout} = undef;
         $line->{out_sent} += $rc;
         if (length $line->{out} == $line->{out_sent}) {
-            $line->{socket_out}->delete_write;
-            $line->{keepalive} = Timer->new($line->{settings}{KEEPALIVE}, sub { $line->keepalive } );
+            $line->{writer} = undef;
+            $line->{keepalive} = Timer::timer($line->{settings}{KEEPALIVE},
+                                              $line, \&keepalive);
             return;
         }
     }
@@ -1090,9 +1178,10 @@ sub write : method {
 
     my $length = line_message($line->{out}, @_);
     if ($line->{out_sent} + $length == length $line->{out}) {
-        $line->{socket_out}->add_write(sub { $line->writer });
         $line->{keepalive} = undef;
-        $line->{timeout} = Timer->new($line->{settings}{TIMEOUT}, sub { $line->timeout } );
+        $line->{writer} = $line->{socket_out}->add_write($line, \&writer);
+        $line->{timeout} = Timer::timer($line->{settings}{TIMEOUT},
+                                        $line, \&timeout);
     }
     return $length;
 }
@@ -1435,6 +1524,140 @@ sub socket_tcp {
     return $h, $p, $socket;
 }
 
+package Control;
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+
+{
+    my %controls;
+    my $ids = Ids->new;
+
+    sub free {
+        %controls = ();
+    }
+
+    sub new {
+        my ($class, $host, $port) = @_;
+
+        my ($h, $p, $socket_in, $socket_out);
+        if (@_ >= 3) {
+            ($h, $p, my $socket) = LineProtocol->socket_tcp($host, $port, 1);
+            $socket_in = $socket_out = $socket;
+        } else {
+            $socket_in  = \*STDIN;
+            $socket_in->blocking(0);
+            $socket_out = \*STDOUT;
+            $socket_out->blocking(0);
+        }
+
+        my $id = $ids->id_alloc;
+        my $control = $controls{$id} = bless {
+            id		=> $id,
+            socket_in	=> $socket_in,
+            socket_out	=> $socket_out,
+            in		=> "",
+            out		=> "",
+            host	=> $h,
+            port	=> $p,
+            reader	=> undef,
+            writer	=> undef,
+            timeout	=> undef,
+        }, $class;
+        $control->{reader} = $socket_in->add_read($control, \&reader);
+        return $control;
+    }
+
+
+    sub reader {
+        my ($control) = @_;
+
+        my $rc = $control->{socket_in}->sysread(my $buffer, $BLOCK_SIZE);
+        if (!defined $rc) {
+            return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+            die "Could not read from control[$control->{id}]: $^E";
+        }
+        if ($rc == 0) {
+            # EOF
+            $ids->id_free($control->{id});
+            delete $controls{$control->{id}};
+            $control->{host} || exit(0);
+            return;
+        }
+        $control->{in} .= $buffer;
+        return if index($buffer, "\n") < 0;
+        $control->process($1) while $control->{in} =~ s/^(.*)\n//;
+    }
+}
+
+sub help {
+    my ($control) = @_;
+    $control->write(<<"EOF")
+help	Show this help
+EOF
+        ;
+}
+
+my %commands = (
+    help => \&help,
+);
+
+sub process {
+    my $control = shift;
+    my ($command, @args) = split " ", shift or return;
+    return if $command =~ m{^#|^//|^--};
+    eval {
+        my $code = $commands{lc $command} || die "Unknown command '$command'\n";
+        $code->($control, @args);
+    };
+    $control->write($@) if $@;
+}
+
+sub write : method {
+    my $control = shift;
+
+    my $was_empty = $control->{out} eq "";
+    $control->{out} .= join("", @_);
+    if ($was_empty && $control->{out} ne "") {
+        $control->{writer} = $control->{socket_out}->add_write($control, \&writer);
+        $control->{timeout} = Timer::timer($settings_global{TIMEOUT},
+                                           $control, \&timeout);
+    }
+}
+
+sub writer {
+    my ($control) = @_;
+
+    while (1) {
+        my $rc = $control->{socket_out}->syswrite($control->{out}, $BLOCK_SIZE);
+        if (!defined $rc) {
+            if ($! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK) {
+                $control->{timeout} //=
+                    Timer::timer($control->{settings}{TIMEOUT},
+                                 $control, \&timeout);
+                return;
+            }
+            $control->{writer} = undef;
+            die "Could not write to conrol $control->{id}: $^E"
+        }
+        die "Zero write. Is this even possible ?" if $rc == 0;
+        substr($control->{out}, 0, $rc, "");
+        ::info("Wrote %d bytes to control %s (%d left): %s",
+               $rc, $control->{id}, length($control->{out}),
+               ::display($control->{out})) if $debug;
+
+        $control->{timeout} = undef;
+        if ($control->{out} eq "") {
+            $control->{writer} = undef;
+            return;
+        }
+    }
+}
+
+sub timeout {
+    my ($control) = @_;
+
+    die "Timeout. Could not TCP write[$control->{id}";
+}
+
 package main;
 # use Scalar::Util qw(weaken);
 
@@ -1477,14 +1700,21 @@ sub peer_info {
     _info($role_peer, @_);
 }
 
+sub callers {
+    my (@lines, $line, $i);
+    # Skip the entry for callers itself, so start $i at 1
+    push @lines, $line while (undef, undef, $line) = caller(++$i);
+    return join(" ", @lines);
+}
+
 sub caller_info {
     my $format = shift;
-    my (@lines, $line, $i);
-    push @lines, $line while $line = (caller(++$i))[2];
     if (@_) {
-        info("$format [line %s]", @_, "@lines");
+        info("$format [%s]", @_, callers());
     } else {
-        info("$format [line @lines]");
+        my $callers = callers();
+        $callers =~ s{%}{%%}g;
+        info("$format [$callers]");
     }
 }
 
@@ -1511,8 +1741,9 @@ sub display {
 sub client {
     my ($socket_in, $socket_out, $udp_locals, $udp_remotes) = @_;
 
+    my $line;
     eval {
-        my $line = LineProtocol->new($socket_in, $socket_out);
+        $line = LineProtocol->new($socket_in, $socket_out);
 
         for my $udp (@$udp_locals) {
             my ($from_port, $separator, $to_port) =
@@ -1544,20 +1775,25 @@ sub client {
         $line->write($START);
     };
     die "\u$role: $@" if $@;
+    return $line;
 }
 
 sub server {
     my ($socket_in, $socket_out) = @_;
+
+    my $line;
     eval {
-        my $line = LineProtocol->new($socket_in, $socket_out);
+        $line = LineProtocol->new($socket_in, $socket_out);
 
         $line->set_peer(EPOCH => $BASE_TIME);
     };
     die "\u$role: $@" if $@;
+    return $line;
 }
 
 GetOptions("server:s"		=> \my $server,
            "client=s"		=> \my $client,
+           "n!"			=> \my $no_control,
            "server_lib=s"	=> \my @server_lib,
            "ssh=s"		=> \$ssh,
            "M|master"		=> \my $ssh_master,
@@ -1605,6 +1841,7 @@ $settings_global{UDP_MAX} = $udp_max;
 $role = "server" if defined $server;
 $role_peer = $role eq "server" ? "client" : "server";
 
+my $HOLD;
 if ($role eq "server") {
     # From here on we are the server
 
@@ -1614,6 +1851,7 @@ if ($role eq "server") {
     my $socket_in  = \*STDIN;
     my $socket_out = \*STDOUT;
     if (defined $server && $server ne "") {
+        # Manual start
         my $host = $server =~ s{(.*):}{}s ? $1 :
             $default_local_bind;
         my ($h, $p, $socket) = LineProtocol->socket_tcp($host, $server, 1);
@@ -1626,8 +1864,9 @@ if ($role eq "server") {
             ::info("Accepted TCP line connection from %s:%d", $host, $port);
         }
         $socket_in = $socket_out = $accepted;
+        $no_control || Control->new;
     }
-    server($socket_in, $socket_out);
+    $HOLD = server($socket_in, $socket_out);
 } else {
 
     # From here on we are the client
@@ -1645,7 +1884,7 @@ if ($role eq "server") {
 
         my $host = $client =~ s{(.*):}{}s ? $1 : "127.0.0.1";
         my $socket = LineProtocol->socket_tcp($host, $client);
-        client($socket, $socket, \@udp_local, \@udp_remote);
+        $HOLD = client($socket, $socket, \@udp_local, \@udp_remote);
     } else {
         @ARGV || die "Missing remote host argument, Try $Script -h\n";
         $stuff //= 1;
@@ -1746,8 +1985,9 @@ if ($role eq "server") {
             alarm(0);
             $line eq $STUFFED || die "Bad server confirm $line";
         }
-        client($rd1, $wr0, \@udp_local, \@udp_remote);
+        $HOLD= client($rd1, $wr0, \@udp_local, \@udp_remote);
     }
+    $no_control || Control->new;
 }
 
 eval { Events->mainloop() };
