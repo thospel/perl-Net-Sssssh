@@ -27,10 +27,12 @@ use constant {
     IP_VERSION	=> 4,
     IHL		=> 5,
     UDP_HEADER	=> 8,
+    ICMP_HEADER	=> 8,
     DF		=> 2,
     TTL		=> 64,
     TTL_LOW	=> 2,
     PROTO_UDP	=> getprotobyname("udp") // 17,
+    PROTO_ICMP	=> getprotobyname("icmp") // 1,
 
     # IP_PKTINFO is the linux name, can be different on other systems
     # FreeBSD uses IP_RECVDSTADDR
@@ -40,13 +42,18 @@ use constant {
     IP_TTL	=> LINUX ?  2 :  4,
     # IPPROTO_IP now exists in Socket, but not in really old versions
     IPPROTO_IP	=> 0,
+
+    ICMP_ECHO_REPLY	=> 0,
+    ICMP_ECHO_REQUEST	=> 8,
 };
 
 use Exporter::Tidy
     constants => [qw(SHORT_MAX IP_VERSION IHL UDP_HEADER DF TTL PROTO_UDP
                      LINUX FREE_BSD
-                     IP_PKTINFO IP_RECVDSTADDR IP_RECVTTL IP_TTL IPPROTO_IP)],
-    other => [qw(parse_address string_from_value fou_encode fou_decode)];
+                     IP_PKTINFO IP_RECVDSTADDR IP_RECVTTL IP_TTL IPPROTO_IP
+                     ICMP_ECHO_REPLY ICMP_ECHO_REQUEST)],
+    other => [qw(parse_address string_from_value fou_encode_udp fou_encode_icmp
+                 fou_decode)];
 
 # IPv6 could use [fe80::240:63ff:fede:3c19]:1234 as notation (like RFC 3986)
 my %parse_regex = (
@@ -140,7 +147,7 @@ sub string_from_value {
     return Dumper(shift);
 }
 
-sub fou_encode {
+sub fou_encode_udp {
     my ($from, $to, $data, $verbose, $ttl) = @_;
 
     my ($sprt, $src) = unpack_sockaddr_in($from) or
@@ -149,7 +156,7 @@ sub fou_encode {
         die "Assertion: Could not unpack to address";
 
     # Avoid real outgoing packet if we are sending to 0.X.X.X
-    $ttl //= $dst =~ /^\0/ ? TTL_LOW : TTL,
+    $ttl //= $dst =~ /^\0/ ? TTL_LOW : TTL;
 
     my $packet_id = int rand SHORT_MAX;
     my $flags = DF;
@@ -163,7 +170,7 @@ sub fou_encode {
                       0,
                       $new_length,
                       $packet_id,
-                      DF << 13 | 0,
+                      $flags << 13 | 0,
                       $ttl,
                       PROTO_UDP,
                       $src,
@@ -199,6 +206,60 @@ sub fou_encode {
     return $buffer;
 }
 
+sub fou_encode_icmp {
+    my ($from, $to, $type, $code, $icmp_header, $data, $verbose, $ttl) = @_;
+
+    my $src = inet_aton($from) //
+        die "Assertion: Could not resolve '$from'";
+    my $dst = inet_aton($to) //
+        die "Assertion: Could not resolve '$to'";
+
+    # Avoid real outgoing packet if we are sending to 0.X.X.X
+    $ttl //= $dst =~ /^\0/ ? TTL_LOW : TTL;
+
+    my $ip_len = IHL * 4;
+    my $buffer = pack("x${ip_len}CCx2a4a*x", $type, $code, $icmp_header, $data);
+    my $new_length = length($buffer)-1;
+    substr($buffer, 0, $ip_len, "");
+    my $sum = unpack("%32n*", $buffer);
+    chop $buffer;
+    while ($sum > 0xffff) {
+        my $carry = $sum >> 16;
+        $sum &= 0xffff;
+        $sum += $carry;
+    }
+    substr($buffer, 2, 2, pack("n", 0xffff - $sum));
+
+    my $packet_id = int rand SHORT_MAX;
+    my $flags = DF;
+    my $header = pack("CCnnnCCx2a4a4",
+                      IP_VERSION << 4 | IHL,
+                      0,
+                      $new_length,
+                      $packet_id,
+                      $flags << 13 | 0,
+                      $ttl,
+                      PROTO_ICMP,
+                      $src,
+                      $dst,
+                  );
+    $sum = unpack("%32n*", $header);
+    while ($sum > 0xffff) {
+        my $carry = $sum >> 16;
+        $sum &= 0xffff;
+        $sum += $carry;
+    }
+    substr($header, 10, 2, pack("n", 0xffff - $sum));
+    substr($buffer, 0, 0, $header);
+    if ($verbose) {
+        my $props = fou_decode($buffer, $verbose);
+        $props->{data} eq $data ||
+            die "Assertion: Decode does not invert encode";
+        # print Dumper($props);
+    }
+    return $buffer;
+}
+
 sub fou_decode {
     my ($buffer, $verbose, $relaxed) = @_;
 
@@ -219,15 +280,9 @@ sub fou_decode {
         $relaxed || die $error;
         return { error => $error }
     }
-    # Only UDP
-    if ($proto != PROTO_UDP) {
-        my $error = "Wrong proto $proto";
-        $relaxed || die $error;
-        return { error => $error }
-    }
     # Sanity check on buffer
     if (length($buffer) != $length) {
-        my $error = "Wrong length " . length($buffer);
+        my $error = sprintf("Wrong length: %d bytes packet but IP header says %d", length($buffer), $length);
         $relaxed || die $error;
         return { error => $error }
     }
@@ -256,8 +311,6 @@ sub fou_decode {
         return { error => $error }
     }
 
-    my $pseudo10 = pack("a4a4xC", $src, $dst, $proto);
-
     $ihl *= 4;
     my $header = substr($buffer, 0, $ihl, "");
     $length -= $ihl;
@@ -273,28 +326,67 @@ sub fou_decode {
 
     my $dscp = $ecn >> 3;
     $ecn &= 0x7;
-    printf($verbose "HEADER: DSCP=%d, ECN=%d, ID=%d, FLAGS=%#X, FRAGMENT=%d, TTL=%d, CHKSUM=%#04x, SUM=%#04X, SRC=%s, DST=%s\n",
-           $dscp, $ecn, $packet_id, $flags, $fragment, $ttl, $chksum, $sum,
-           inet_ntoa($src), inet_ntoa($dst)) if $verbose;
 
-    # Must have space for UDP header
-    if ($length < UDP_HEADER) {
-        my $error = "Bad UDP length $length";
-        $relaxed || die $error;
-        return { error => $error }
-    }
+    printf($verbose "HEADER: PROTO=%d, DSCP=%d, ECN=%d, ID=%d, FLAGS=%#X, FRAGMENT=%d, TTL=%d, CHKSUM=%#04x, SUM=%#04X, SRC=%s, DST=%s\n",
+           $proto, $dscp, $ecn, $packet_id, $flags, $fragment, $ttl, $chksum,
+           $sum, inet_ntoa($src), inet_ntoa($dst)) if $verbose;
 
-    # Pad buffer with \0 so a last single byte still gets processed by "n"
-    $sum = unpack("%32n*", $buffer . "\x0") + unpack("%32n*", $pseudo10) + $length;
-    my ($sprt, $dprt, $udp_len, $udp_chksum) = unpack("nnnn", substr($buffer, 0, UDP_HEADER, ""));
-    if ($udp_len != $length) {
-        my $error = "Inconsistent UDP length";
-        $relaxed || die $error;
-        return { error => $error }
-    }
-    $length -= UDP_HEADER;
+    # Only UDP
+    if ($proto == PROTO_UDP) {
+        # Must have space for UDP header
+        if ($length < UDP_HEADER) {
+            my $error = "Bad UDP length $length";
+            $relaxed || die $error;
+            return { error => $error }
+        }
 
-    if ($udp_chksum) {
+        my $pseudo10 = pack("a4a4xC", $src, $dst, $proto);
+
+        # Pad buffer with \0 so a last single byte still gets processed by "n"
+        $sum = unpack("%32n*", $buffer . "\x0") + unpack("%32n*", $pseudo10) + $length;
+        my ($sprt, $dprt, $udp_len, $udp_chksum) = unpack("nnnn", substr($buffer, 0, UDP_HEADER, ""));
+        if ($udp_len != $length) {
+            my $error = "Inconsistent UDP length";
+            $relaxed || die $error;
+            return { error => $error }
+        }
+        $length -= UDP_HEADER;
+
+        if ($udp_chksum) {
+            while ($sum > 0xffff) {
+                my $carry = $sum >> 16;
+                $sum &= 0xffff;
+                $sum += $carry;
+            }
+            if ($sum != 0xffff) {
+                my $error = "Bad UDP chksum $sum";
+                $relaxed || die $error;
+                return { error => $error }
+            }
+        }
+
+        printf($verbose "SPRT=%d, DPRT=%d, LEN=%d, CHK=%04X\n" .
+               "Encapsulated FOU packet from %s:%d to %s:%d\n",
+               $sprt, $dprt, $udp_len, $udp_chksum,
+               inet_ntoa($src), $sprt, inet_ntoa($dst), $dprt) if $verbose;
+        return {
+            proto	=> "udp",
+            ttl		=> $ttl,
+            src		=> $src,
+            sprt	=> $sprt,
+            dst		=> $dst,
+            dprt	=> $dprt,
+            data	=> $buffer,
+        };
+    } elsif ($proto == PROTO_ICMP) {
+        # Must have space for ICMP header
+        if ($length < ICMP_HEADER) {
+            my $error = "Bad ICMP length $length";
+            $relaxed || die $error;
+            return { error => $error }
+        }
+        # Pad buffer with \0 so a last single byte still gets processed by "n"
+        $sum = unpack("%32n*", $buffer . "\x0");
         while ($sum > 0xffff) {
             my $carry = $sum >> 16;
             $sum &= 0xffff;
@@ -305,20 +397,32 @@ sub fou_decode {
             $relaxed || die $error;
             return { error => $error }
         }
-    }
+        if ($ecn != 0 || $dscp != 0) {
+            my $error = "ICMP with ToS != 0";
+            $relaxed || die $error;
+            return { error => $error }
+        }
 
-    printf($verbose "SPRT=%d, DPRT=%d, LEN=%d, CHK=%04X\n" .
-           "Encapsulated FOU packet from %s:%d to %s:%d\n",
-           $sprt, $dprt, $udp_len, $udp_chksum,
-           inet_ntoa($src), $sprt, inet_ntoa($dst), $dprt) if $verbose;
-    return {
-        ttl	=> $ttl,
-        src	=> $src,
-        sprt	=> $sprt,
-        dst	=> $dst,
-        dprt	=> $dprt,
-        data	=> $buffer,
-    };
+        my ($type, $code, $icmp_header) = unpack("WWx2a4", substr($buffer, 0, ICMP_HEADER, ""));
+        my $props= {
+            proto	=> "icmp",
+            ttl		=> $ttl,
+            src		=> $src,
+            dst		=> $dst,
+            type	=> $type,
+            code	=> $code,
+            header_icmp	=> $icmp_header,
+            data	=> $buffer,
+        };
+        if (($type == ICMP_ECHO_REQUEST || $type == ICMP_ECHO_REPLY) && $code == 0) {
+            @$props{qw(id seqno)} = unpack("nn", $icmp_header);
+        }
+        return $props;
+    } else {
+        my $error = "Wrong proto $proto";
+        $relaxed || die $error;
+        return { error => $error }
+    }
 }
 
 1;

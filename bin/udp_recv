@@ -38,13 +38,15 @@ use IO::Socket qw(MSG_TRUNC MSG_CTRUNC
 use Socket::MsgHdr;
 
 use Net::Sssssh qw(IPPROTO_IP IP_PKTINFO IP_RECVTTL IP_RECVDSTADDR IP_TTL
-                   fou_decode fou_encode string_from_value);
+                   ICMP_ECHO_REPLY ICMP_ECHO_REQUEST
+                   fou_decode fou_encode_udp fou_encode_icmp string_from_value
+                   parse_address);
 
 my $port = 5555;
 my $loops = -1;
 die "Could not parse your command line. Try $0 -h\n" unless
     GetOptions("f|fou!"		=> \my $fou,
-               "a|answer!"	=> \my $answer,
+               "a|answer:s"	=> \my $answer,
                "p|port=o"	=> \$port,
                "l|loops=o"	=> \$loops,
                "v|verbose!"	=> \my $verbose,
@@ -79,6 +81,13 @@ setsockopt($s, IPPROTO_IP, IP_PKTINFO, 1) ||
 setsockopt($s, IPPROTO_IP, IP_RECVTTL, 1) ||
     die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
 
+if (defined $answer && $answer ne "") {
+    my ($aport, $aaddr) = unpack_sockaddr_in(
+        my $tmp = parse_address($answer, "Answer", to => "UDP4")) or
+            die "Assertion: Cannot unpack packed answer '$answer'";
+    printf("Answers to %s:%d\n", inet_ntoa($aaddr), $aport) if $verbose;
+    $answer = $tmp;
+}
 # my $buffer = "";
 my $msghdr = Socket::MsgHdr->new();
 print "=" x 25 . "\n" if $verbose;
@@ -133,22 +142,39 @@ while ($loops--) {
     print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n" if $verbose;
     print "Received: ", length($buffer), " bytes (TTL $ttl) ", string_from_value($buffer), "\n" if $verbose;
 
-    if ($answer) {
+    if (defined $answer) {
         if ($ttl > 1) {
             $msghdr->cmsghdr(@cmsg);
-            $buffer = time() . ": " . $buffer if $buffer !~ s/^(\d+)/$1+1/ea;
+            $msghdr->name($answer) if $answer;
+            unless ($fou && $props->{proto} eq "icmp") {
+                $buffer = time() . ": " . $buffer if $buffer !~ s/^(\d+)/$1+1/ea;
+            }
             if ($fou) {
                 if ($props->{ttl} <= 1) {
                     print "Sent nothing (received TTL=$props->{ttl})\n" if $verbose;
                     print "=" x 25 . "\n" if $verbose;
                     exit;
                 }
-                $buffer = fou_encode(
-                    pack_sockaddr_in($props->{dprt}, $props->{dst}),
-                    pack_sockaddr_in($props->{sprt}, $props->{src}),
-                    $buffer,
-                    $verbose && \*STDOUT, $props->{ttl}-1);
-                # fou_decode($buffer, \*STDOUT) if $verbose;
+                if ($props->{proto} eq "udp") {
+                    $buffer = fou_encode_udp(
+                        pack_sockaddr_in($props->{dprt}, $props->{dst}),
+                        pack_sockaddr_in($props->{sprt}, $props->{src}),
+                        $buffer,
+                        $verbose && \*STDOUT, $props->{ttl}-1);
+                } elsif ($props->{proto} eq "icmp") {
+                    $props->{type} == ICMP_ECHO_REQUEST ||
+                        die "No answer for ICMP type $props->{type}";
+                    $buffer = fou_encode_icmp(
+                        inet_ntoa($props->{dst}),
+                        inet_ntoa($props->{src}),
+                        ICMP_ECHO_REPLY, 0,
+                        $props->{header_icmp},
+                        $buffer,
+                        $verbose && \*STDOUT);
+                } else {
+                    die "Protocol '$props->{proto}' not implemented (yet)";
+                }
+                    # fou_decode($buffer, \*STDOUT) if $verbose;
             }
             $msghdr->buf($buffer);
             $s->sendmsg($msghdr) || die "Could not send: $!";

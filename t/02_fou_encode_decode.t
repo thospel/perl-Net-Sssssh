@@ -18,14 +18,15 @@ use Data::Dumper;
 $Data::Dumper::Indent	= 1;
 $Data::Dumper::Sortkeys	= 1;
 
-use Net::Sssssh qw(fou_encode fou_decode);
+use Net::Sssssh qw(fou_encode_udp fou_decode);
 
 my $from = pack_sockaddr_in(25, inet_aton("1.2.3.4"));
 my $to = pack_sockaddr_in(81, inet_aton("6.7.8.9"));
 my $data = "Test\nGh\0v";
-my $packet = fou_encode($from, $to, $data);
+my $packet = fou_encode_udp($from, $to, $data);
 my $props = fou_decode($packet);
 is_deeply($props, {
+    proto	=> "udp",
     'data' => $data,
     'dprt' => 81,
     'dst' => inet_aton("6.7.8.9"),
@@ -35,9 +36,10 @@ is_deeply($props, {
 }, "Can encode/decode basic packet") ||
     diag(Dumper($props));
 
-$packet = fou_encode($from, $to, $data, undef, 85);
+$packet = fou_encode_udp($from, $to, $data, undef, 85);
 $props = fou_decode($packet);
 is_deeply($props, {
+    proto	=> "udp",
     'data' => $data,
     'dprt' => 81,
     'dst' => inet_aton("6.7.8.9"),
@@ -47,9 +49,10 @@ is_deeply($props, {
 }, "Can set TTL") ||
     diag(Dumper($props));
 
-$packet = fou_encode($from, $to, $data, undef, 1);
+$packet = fou_encode_udp($from, $to, $data, undef, 1);
 $props = fou_decode($packet);
 is_deeply($props, {
+    proto	=> "udp",
     'data' => $data,
     'dprt' => 81,
     'dst' => inet_aton("6.7.8.9"),
@@ -60,9 +63,10 @@ is_deeply($props, {
     diag(Dumper($props));
 
 $to = pack_sockaddr_in(82, inet_aton("0.0.0.8"));
-$packet = fou_encode($from, $to, $data);
+$packet = fou_encode_udp($from, $to, $data);
 $props = fou_decode($packet);
 is_deeply($props, {
+    proto	=> "udp",
     'data' => $data,
     'dprt' => 82,
     'dst' => inet_aton("0.0.0.8"),
@@ -72,7 +76,7 @@ is_deeply($props, {
 }, "Packet to 0.0.0.x gets TTL 2") ||
     diag(Dumper($props));
 
-eval { fou_encode($from, $to, "a" x 65530) };
+eval { fou_encode_udp($from, $to, "a" x 65530) };
 like($@, qr{^Packet too long at }, "Cannot encode a huge packet");
 eval { fou_decode("abc") };
 like($@, qr{^Packet too short at }, "Cannot decode a short packet");

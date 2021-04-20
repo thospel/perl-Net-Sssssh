@@ -15,6 +15,8 @@ use warnings;
 # # iptables -t mangle -A FWMARK2 -j LOG --log-prefix 'iptables-mark2: ' --log-level info
 # iptables -t mangle -A FWMARK2 -j MARK --set-mark 17
 # iptables -t mangle -A OUTPUT -p udp --dport 1234 -j FWMARK2
+# # Also catch ping requests
+# # iptables -t mangle -A OUTPUT -p icmp --icmp-type 8 -j FWMARK2
 # ip rule add fwmark 17 lookup 101
 # ip route add default via 10.253.4.1 table 101
 
@@ -54,12 +56,16 @@ my $MULTICAST_BEGIN = inet_aton("224.0.0.0") // die "Assertion: Bad address";
 my $MULTICAST_END   = inet_aton("240.0.0.0") // die "Assertion: Bad address";
 
 my $IP_VERSION = 4;
-my $PROTO_UDP = getprotobyname("udp") // die "Unknown protocol UDP";
-my $PROTO_TCP = getprotobyname("tcp") // die "Unknown protocol TCP";
+my $PROTO_ICMP = getprotobyname("icmp") // die "Unknown protocol ICMP";
+my $PROTO_UDP  = getprotobyname("udp")  // die "Unknown protocol UDP";
+my $PROTO_TCP  = getprotobyname("tcp")  // die "Unknown protocol TCP";
 my $IHL = 5;
-my $UDP_HEADER = 8;
+my $ICMP_HEADER = 8;
+my $UDP_HEADER  = 8;
 my $DF = 2;
 my $TTL = 64;
+my $ICMP_ECHO_REQUEST = 8;
+my $ICMP_ECHO_REPLY = 0;
 
 my $ssh = "/usr/bin/ssh";
 my $verbose = undef;
@@ -94,14 +100,18 @@ my @setting_ids = sort keys %settings_global;
 my %setting_ids;
 $setting_ids{$setting_ids[$_]} = $_ for 0..$#setting_ids;
 
+my $SECRET = pack("NNNN", $$ ^ rand 2**32, $^T ^ rand 2**32, rand 2**32, rand 2**32);
+
 my $STUFFED = "GoNow";
 
 # Line protocol commands
 my $START	= "1";
 my $SET		= "S";	# sets a server variable
 my $UDP_REMOTE	= "r";
-my $DATA	= "D";
-my $RESPONSE	= "d";
+my $PING	= "P";
+my $RESPONSE_PING= "p";
+my $RESPONSE_UDP= "d";
+my $DATA_UDP	= "D";
 my $KEEP	= "K";	# Keepalive/ACK packet
 
 my $ERROR_ECONNREFUSED	= "Connection refused";
@@ -569,6 +579,188 @@ sub id_free {
     }
 }
 
+package Sender::ICMP;
+use Scalar::Util qw(weaken);
+use Socket qw(pack_sockaddr_in unpack_sockaddr_in inet_ntoa
+              MSG_TRUNC MSG_CTRUNC);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK EMSGSIZE);
+
+sub new {
+    my ($class, $line, $id) = @_;
+
+    die "Already have Sender::ICMP socket '$id'" if $line->{sockets_icmp}{$id};
+
+    my ($host, $icmp_id, $socket) = $line->socket_icmp("0.0.0.0", 0);
+    !$msghdr || setsockopt($socket, $IPPROTO_IP, $IP_RECVTTL, 1) ||
+        die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
+
+    my $icmp = bless {
+        id		=> $id,
+        out		=> [],
+        socket		=> $socket,
+        local_host	=> $host,
+        icmp_id		=> $icmp_id,
+        reader		=> undef,
+        writer		=> undef,
+        timeout		=> undef,
+    }, $class;
+    $icmp->{reader} = $socket->add_read($icmp, \&reader),
+    weaken($icmp->{line} = $line);
+    $line->{sockets_icmp}{$id} = $icmp;
+
+    ::info("Creating new Sender::ICMP socket[$id] '$host:$icmp_id'") if $debug;
+
+    return $icmp;
+}
+
+sub write : method {
+    my $icmp = shift;
+
+    my $data = {
+        name	=> pack_sockaddr_in(0, shift),
+        # $icmp->{icmp_id} doesn't need to be set here. Whatever you use
+        # will get ignored and the socket bind properties are used
+        buf	=> pack("Cx3n2a*x", $ICMP_ECHO_REQUEST, $icmp->{icmp_id}, shift, shift)
+    };
+    my $sum = unpack("%32n*", $data->{buf});
+    chop $data->{buf};
+    while ($sum > 0xffff) {
+        my $carry = $sum >> 16;
+        $sum &= 0xffff;
+        $sum += $carry;
+    }
+    substr($data->{buf}, 2, 2, pack("n", 0xffff - $sum));
+
+    if ($msghdr) {
+        $data->{flags} = 0;
+        $data->{control} = ::pack_cmsghdr(
+                $IPPROTO_IP,
+                $IP_TTL,
+                pack("I", shift || die "Assertion: TTL 0"));
+        bless $data, "Socket::MsgHdr";
+    } else {
+        $data->{ttl} = shift || die "Assertion: TTL 0"
+    }
+    if (1 == push @{$icmp->{out}}, $data) {
+        $icmp->{writer} = $icmp->{socket}->add_write($icmp, \&writer);
+        $icmp->{timeout} = Timer::timer($icmp->{line}{settings}{TIMEOUT},
+                                        $icmp, \&timeout);
+    }
+}
+
+sub writer {
+    my ($icmp) = @_;
+
+    my $data = $icmp->{out}[0];
+    my $rc;
+    if ($msghdr) {
+        $rc = ::sendmsg($icmp->{socket}, $data);
+    } else {
+        $rc = send($icmp->{socket}, $data->{buf}, 0, $data->{name});
+    }
+    if (!defined $rc) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        if ($! == EMSGSIZE) {
+            ::info("Cannot send oversized ICMP packet. Dropped") if $debug;
+            goto DROP;
+        }
+        die "Could not write to sender ICMP socket: $^E";
+    }
+    if ($debug) {
+        my ($port, $addr) = unpack_sockaddr_in($data->{name});
+        my $host = inet_ntoa($addr);
+
+        my ($type, $code, $icmp_id, $seqno) = unpack("wwx2n2", $data->{buf});
+
+        if ($rc >= $ICMP_HEADER) {
+            ::info("Wrote %d ICMP bytes [Type %d, Code %d, Id %d, Seqno %d] to %s (%d left): %s",
+                   $rc-$ICMP_HEADER, $type, $code, $icmp_id, $seqno, $host,
+                   length($data->{buf}) - $rc,
+                   ::display(substr($data->{buf}, $ICMP_HEADER, $rc-$ICMP_HEADER)));
+        } else {
+            ::info("Wrote %d ICMP bytes (including header) [Type %d, Code %d, Id %d, Seqno %d] to %s (%d left): %s",
+                   $rc, $type, $code, $icmp_id, $seqno, $host,
+                   length($data->{buf}) - $rc,
+                   ::display(substr($data->{buf}, 0, $rc)));
+        }
+    }
+    $rc == length($data->{buf}) || die "Assertion: Incomplete ICMP write ($rc of " . length($data->{buf}) . ")";
+
+  DROP:
+    shift @{$icmp->{out}};
+    if (@{$icmp->{out}}) {
+        $icmp->{timeout} = Timer::timer($icmp->{line}{settings}{TIMEOUT},
+                                          $icmp, \&timeout);
+    } else {
+        $icmp->{writer}  = undef;
+        $icmp->{timeout} = undef;
+    }
+}
+
+sub reader {
+    my ($icmp) = @_;
+
+    my ($sockaddr, $buffer, $ttl);
+    if ($msghdr) {
+        $msghdr->{name} = "\0" x 256;
+        $msghdr->{buf}  = "\0" x $UDP_SIZE;
+        $msghdr->{control} = "\0" x 256;
+        $msghdr->{flags} = 0;
+        if (defined ::recvmsg($icmp->{socket}, $msghdr)) {
+            # I suspect Socket::MsgHdr has a bug so that flags is never set
+            die "Yikes! Buffer was truncated\n" if
+                $msghdr->flags & MSG_TRUNC;
+            die "Yikes! Ancillary data was truncated\n" if
+                $msghdr->flags & MSG_CTRUNC;
+            $buffer = $msghdr->{buf};
+            $sockaddr = $msghdr->{name};
+            my ($level, $type, $data) = ::unpack_cmsghdr($msghdr->{control}) or
+                die "No ancillary data from socket";
+            $level == $IPPROTO_IP ||
+                die "Unexpected level in ancillary data from socket";
+            $type == $IP_TTL ||
+                die "Unexpected type in ancillary data from socket";
+            $ttl = unpack("I", $data);
+        }
+    } else {
+        $sockaddr = recv($icmp->{socket}, $buffer, $UDP_SIZE, 0);
+        $ttl = $TTL;
+    }
+    if (!defined $sockaddr) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Could not read from sending ICMP socket: $^E";
+    }
+
+    # 16 bytes MD5, 4 bytes rand, 4 bytes src, 2 bytes id, 2 bytes seqno
+    # and at least 1 fou_id byte
+    length $buffer >= $ICMP_HEADER + (16+4+4+2+2+1) || return;
+    $buffer .= "\0";
+    my $sum = unpack("%32n*", $buffer);
+    my ($type, $code, $icmp_chksum, $icmp_id, $seqno) =
+        unpack("wwn3", substr($buffer, 0, $ICMP_HEADER, ""));
+    chop $buffer;
+    if (1 || $icmp_chksum) {
+        while ($sum > 0xffff) {
+            my $carry = $sum >> 16;
+            $sum &= 0xffff;
+            $sum += $carry;
+        }
+        $sum == 0xffff || return;
+    }
+    $type == $ICMP_ECHO_REPLY || return;
+    $code == 0 || return;
+
+    my ($port, $addr) = unpack_sockaddr_in($sockaddr);
+    if ($debug) {
+        my $host = inet_ntoa($addr);
+        ::info("Received %d bytes (%sType %d, Code %d, Id %d, Seqno %d) from %s on sender ICMP socket[%d]: %s",
+               length($buffer), $msghdr ? "TTL $ttl, " : "", $type, $code,
+               $icmp_id, $seqno,
+               $host, $icmp->{id}, ::display($buffer));
+    }
+    $icmp->{line}->write($RESPONSE_PING, pack("wa4C", $icmp->{id}, $addr, $ttl-1), $buffer) if $ttl > 1;
+}
+
 package Sender::UDP;
 # Send out packets at the remote side (and wait for replies)
 use Scalar::Util qw(weaken);
@@ -597,10 +789,10 @@ sub new {
     }, $class;
     $sender->{reader} = $socket->add_read($sender, \&reader),
     weaken($sender->{line} = $line);
+    $line->{sockets_udp}{$id} = $sender;
 
     ::info("Creating new Sender::UDP socket[$id] '$host:$port'") if $debug;
 
-    $line->{sockets_udp}{$id} = $sender;
     return $sender;
 }
 
@@ -722,7 +914,7 @@ sub reader {
                length($buffer), $msghdr ? "(TTL $ttl) " : "",
                $host, $port, $sender->{id}, ::display($buffer));
     }
-    $sender->{line}->write($RESPONSE, pack("wa4nC", $sender->{id}, $addr, $port, $ttl-1), $buffer) if $ttl > 1;
+    $sender->{line}->write($RESPONSE_UDP, pack("wa4nC", $sender->{id}, $addr, $port, $ttl-1), $buffer) if $ttl > 1;
 }
 
 package Listener::UDP;
@@ -731,6 +923,7 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK);
 use Socket qw(inet_ntoa pack_sockaddr_in
               MSG_TRUNC MSG_CTRUNC);
 use Scalar::Util qw(weaken);
+use Digest::MD5 qw(md5);
 
 sub new {
     my ($class, $line, $host, $port, $fou) = @_;
@@ -788,8 +981,6 @@ sub reader {
     $fragment &= 0x1fff;
     # only TCP4
     $version == $IP_VERSION || return;
-    # Only UDP
-    $proto == $PROTO_UDP || return;
     # Sanity check on buffer
     length($buffer) == $length || return;
     # We don't handle IP options (yet)
@@ -800,8 +991,6 @@ sub reader {
     return if $fragment;
     # Don't handle fragments (MF flag set)
     return if $flags & 0x1;
-
-    my $pseudo10 = pack("a4a4xC", $nsrc, $ndst, $proto);
 
     $ihl *= 4;
     my $header = substr($buffer, 0, $ihl, "");
@@ -825,88 +1014,139 @@ sub reader {
     $ecn &= 0x7;
     # print "HEADER: DSCP=$dscp, ECN=$ecn, ID=$id, FLAGS=$flags, FRAGMENT=$fragment, TTL=$ttl, CHKSUM=$chksum, SRC=$src, DST=$dst\n";
 
-    # Must have space for UDP header
-    return if $length < $UDP_HEADER;
+    if ($proto == $PROTO_UDP) {
+        # Only UDP
 
-    # Pad buffer 0 so a last single byte still gets processed as "n"
-    $sum = unpack("%32n*", $buffer . "\x0") + unpack("%32n*", $pseudo10) + $length;
-    my ($sprt, $dprt, $udp_len, $udp_chksum) = unpack("nnnn", substr($buffer, 0, $UDP_HEADER, ""));
-    $udp_len == $length || die "Inconsistent UDP length (inner UDP payload length: $udp_len, Inner IP packet length - inner UDP header length $ihl = $length)";
-    $length -= $UDP_HEADER;
+        # Must have space for UDP header
+        return if $length < $UDP_HEADER;
 
-    if ($udp_chksum) {
-        while ($sum > 0xffff) {
-            my $carry = $sum >> 16;
-            $sum &= 0xffff;
-            $sum += $carry;
-        }
-        $sum == 0xffff || return;
-    }
+        my $pseudo10 = pack("a4a4xC", $nsrc, $ndst, $proto);
+        # Pad buffer with \0 so a last single byte still gets processed as "n"
+        $sum = unpack("%32n*", $buffer . "\x0") + unpack("%32n*", $pseudo10) + $length;
+        my ($sprt, $dprt, $udp_len, $udp_chksum) = unpack("nnnn", substr($buffer, 0, $UDP_HEADER, ""));
+        $udp_len == $length || die "Inconsistent UDP length (inner UDP payload length: $udp_len, Inner IP packet length - inner UDP header length $ihl = $length)";
+        $length -= $UDP_HEADER;
 
-    ::info("FOU decoded %d bytes (TTL %d) on $role UDP socket(%s:%d -> %s:%d): %s",
-           length($buffer), $ttl, $src, $sprt, $dst, $dprt,
-           ::display($buffer)) if $debug;
-
-    my $line = $listener->{line};
-    # On the remote side we will be able to distinguish packets coming back from
-    # ($dst, $dport) so we can share a single Sender::UDP for a given ($src,$port)
-    my $map_src = $line->{map_udp}{"$dst:$dprt"} ||= [
-        0,		# Next seq counter
-        {},		# Map "src:port" to map
-        [undef],	# Map id to map (the undef makes id start at 1)
-        # $ndst,	# Packed destination address
-        # $dprt,	# Destination Port
-    ];
-    my $fou_id = $listener->{fou_id};
-    my $key = "$src:$sprt:$fou_id";
-    my $map = $map_src->[1]{$key} ||= {
-        key	=> $key,
-        port	=> $sprt,
-        host	=> $src,
-        addr	=> $nsrc,
-        fou_id	=> $fou_id,
-    };
-    $map->{seq} = $map_src->[0]++;
-    # We should be able to handle many billions of packets before this overflows
-    die "Too many packets to $dst:$dprt" if $map->{seq} == $map_src->[0];
-    $id = $map->{id};
-    if (!defined $id) {
-        my $settings = $listener->{line}{settings};
-        # A source we haven't saeen befre or we have forgotten
-        if (values %{$map_src->[1]} > $settings->{UDP_MAX}) {
-            my @old = sort {$a->{seq} <=> $b->{seq}} values %{$map_src->[1]};
-            # Ignore the map we just added (it will have the highest packet number)
-            pop @old;
-            for my $old (@old) {
-                # Try to allocate the socket. If we can that means the
-                # ($src,$port) combination is not in local use anymore and we
-                # can completely drop it
-                # Notice if we receive FOU packets from a remote host we also
-                # won't be able to bind(), so this works out OK. There is a
-                # problem if we share IP addresses with the sender of the FOU
-                # packets though. So we probably need an option to turn this
-                # off and have another strategy to free up entries
-                # (e.g. a timeout)
-                # print STDERR "Probe $old->{host}, $old->{port}\n";
-                if ($line->socket_udp($old->{host}, $old->{port}, 1)) {
-                    ::info("Releasing map '$key' (socket not in use any more)") if $debug;
-                    $id = $old->{id};
-                    last;
-                }
+        if ($udp_chksum) {
+            while ($sum > 0xffff) {
+                my $carry = $sum >> 16;
+                $sum &= 0xffff;
+                $sum += $carry;
             }
-            $id // die "Assertion: no Free id's";
-            # $id //= $old[0]{id} // die "Assertion: no Free id's";
-            my $remove = $map_src->[2][$id];
-            delete $map_src->[1]{$remove->{key}} == $remove ||
-                die "Assertion: Removing unexpected entry";
-        } else {
-            $id = @{$map_src->[2]};
+            $sum == 0xffff || return;
         }
-        $map->{id} = $id;
-        $map_src->[2][$id] = $map;
+
+        ::info("FOU decoded %d UDP bytes (TTL %d) on $role UDP socket(%s:%d -> %s:%d): %s",
+               length($buffer), $ttl, $src, $sprt, $dst, $dprt,
+               ::display($buffer)) if $debug;
+
+        my $line = $listener->{line};
+        # On the remote side we will be able to distinguish packets coming back
+        # from ($dst, $dport) so we can share a single Sender::UDP for a given
+        # ($src,$port)
+        my $map_src = $line->{map_udp}{"$dst:$dprt"} ||= [
+            0,                 # Next seq counter
+            {
+            },                 # Map "src:port" to map
+            [undef],           # Map id to map (the undef makes id start at 1)
+            # $ndst,	# Packed destination address
+            # $dprt,	# Destination Port
+        ];
+        my $fou_id = $listener->{fou_id};
+        my $key = "$src:$sprt:$fou_id";
+        my $map = $map_src->[1]{$key} ||= {
+            key		=> $key,
+            port	=> $sprt,
+            host	=> $src,
+            addr	=> $nsrc,
+            fou_id	=> $fou_id,
+        };
+        $map->{seq} = $map_src->[0]++;
+        # We should be able to handle many billions of packets before this overflows
+        die "Too many packets to $dst:$dprt" if $map->{seq} == $map_src->[0];
+        $id = $map->{id};
+        if (!defined $id) {
+            my $settings = $listener->{line}{settings};
+            # A source we haven't saeen befre or we have forgotten
+            if (values %{$map_src->[1]} > $settings->{UDP_MAX}) {
+                my @old = sort {$a->{seq} <=> $b->{seq}} values %{$map_src->[1]};
+                # Ignore the map we just added (it will have the highest packet number)
+                pop @old;
+                for my $old (@old) {
+                    # Try to allocate the socket. If we can that means the
+                    # ($src,$port) combination is not in local use anymore and we
+                    # can completely drop it
+                    # Notice if we receive FOU packets from a remote host we also
+                    # won't be able to bind(), so this works out OK. There is a
+                    # problem if we share IP addresses with the sender of the FOU
+                    # packets though. So we probably need an option to turn this
+                    # off and have another strategy to free up entries
+                    # (e.g. a timeout)
+                    # print STDERR "Probe $old->{host}, $old->{port}\n";
+                    if ($line->socket_udp($old->{host}, $old->{port}, 1)) {
+                        ::info("Releasing map '$key' (socket not in use any more)") if $debug;
+                        $id = $old->{id};
+                        last;
+                    }
+                }
+                $id // die "Assertion: no Free id's";
+                # $id //= $old[0]{id} // die "Assertion: no Free id's";
+                my $remove = $map_src->[2][$id];
+                delete $map_src->[1]{$remove->{key}} == $remove ||
+                    die "Assertion: Removing unexpected entry";
+            } else {
+                $id = @{$map_src->[2]};
+            }
+            $map->{id} = $id;
+            $map_src->[2][$id] = $map;
+        }
+        # print STDERR ::Dumper($id, $line->{map_udp});
+        $line->write($DATA_UDP, pack("wa4nC", $id, $ndst, $dprt, $ttl-1), $buffer);
+    } elsif ($proto == $PROTO_ICMP) {
+        # Must have ToS 0
+        $dscp == 0 && $ecn == 0 || return;
+        # Must have space for ICMP header
+        return if $length < $ICMP_HEADER;
+
+        # Pad buffer with \0 so a last single byte still gets processed as "n"
+        $sum = unpack("%32n*", $buffer . "\x0");
+        my ($type, $code, $icmp_chksum, $id, $seqno) =
+            unpack("WWn3", substr($buffer, 0, $ICMP_HEADER, ""));
+        $length -= $ICMP_HEADER;
+
+        # For mow we only support ICMP ECHO REQUEST
+        $code == 0 || return;
+        my $extra = "";
+        if ($type == $ICMP_ECHO_REQUEST) {
+            # Resulting packet must fit
+            $extra = pack("a16Na4nnw", $SECRET, rand int 2**32, $nsrc, $id, $seqno, $listener->{fou_id});
+            return if $length + $ICMP_HEADER + $IHL * 4 + length($extra) >> 16;
+        } else {
+            return;
+        }
+
+        if (1 || $icmp_chksum) {
+            while ($sum > 0xffff) {
+                my $carry = $sum >> 16;
+                $sum &= 0xffff;
+                $sum += $carry;
+            }
+            $sum == 0xffff || return;
+        }
+
+        ::info("FOU decoded %d ICMP bytes (TTL %d) on $role UDP socket(%s -> %s): type %d, code %d, id %d, seqno %d, data=%s",
+               length($buffer), $ttl, $src, $dst,
+               $type, $code, $id, $seqno,
+               ::display($buffer)) if $debug;
+
+        my $line = $listener->{line};
+        # We leak $src here. We could do some unique remote port mapping instead
+        substr($buffer, 0, 0, $extra);
+        substr($buffer, 0, 16, md5($buffer));
+        my $remote_seqno = ++$line->{seqno_echo};
+        $line->{seqno_echo} = $remote_seqno = 1 if $remote_seqno >> 16;
+        $line->write($PING, pack("wa4nC", 1, $ndst, $remote_seqno, $ttl-1), $buffer);
     }
-    # print STDERR ::Dumper($id, $line->{map_udp});
-    $line->write($DATA, pack("wa4nC", $id, $ndst, $dprt, $ttl-1), $buffer);
 }
 
 package Fou::UDP;
@@ -1040,7 +1280,9 @@ sub new {
         settings	=> { %settings_global },
         listeners	=> {},
         map_udp		=> {},
+        seqno_echo	=> 0,
         sockets_udp	=> {},
+        sockets_icmp	=> {},
     }, $class;
     $line->id_init;
 
@@ -1054,6 +1296,8 @@ use Carp;
 use FindBin qw($Script);
 use Socket qw(PF_INET SOCK_DGRAM SOCK_STREAM SOL_SOCKET SO_REUSEADDR
               inet_ntoa inet_aton pack_sockaddr_in unpack_sockaddr_in);
+use Digest::MD5 qw(md5);
+
 use constant {
     ACK_MASK	=> 0xffffffff,
 };
@@ -1067,12 +1311,14 @@ my %process_name = (
     $START		=> "START",
     $KEEP		=> "KEEP",
     $UDP_REMOTE		=> "UDP_REMOTE",
-    $DATA		=> "DATA",
-    $RESPONSE		=> "RESPONSE",
+    $DATA_UDP		=> "DATA_UDP",
+    $PING		=> "PING",
+    $RESPONSE_UDP	=> "RESPONSE_UDP",
+    $RESPONSE_PING	=> "RESPONSE_PING",
 );
 
 my %process = %process_name;
-$_ = __PACKAGE__->can("process_$_") || die "Unknown sub process_$_" for
+$_ = __PACKAGE__->can("process_$_") || die "Unknown sub 'process_$_'" for
     values %process;
 
 sub new {
@@ -1285,19 +1531,19 @@ sub process_UDP_REMOTE {
     my $listener = Listener::UDP->new($l, $from_host, $from_port, $fou);
 }
 
-sub process_DATA {
+sub process_DATA_UDP {
     my $line = shift;
     my ($id, $dst, $port, $ttl, $data) = unpack("wa4nCa*", shift);
     $id || die "Assertion: Sender socket id $id == 0";
     $id <= $line->{settings}{UDP_MAX} ||
         die "Assertion: Sender socket id $id > $line->{settings}{UDP_MAX}";
-    ::info("Need to send %d bytes of UDP data (TTL %d) on socket %d to %s:%d: %s",
+    ::info("Need to send %d bytes of UDP data (TTL %d) from socket %d to %s:%d: %s",
            length($data), $ttl, $id, inet_ntoa($dst), $port, ::display($data)) if $debug;
     my $sender = $line->{sockets_udp}{$id} || Sender::UDP->new($line, $id);
     $sender->write($port, $dst, $data, $ttl);
 }
 
-sub process_RESPONSE {
+sub process_RESPONSE_UDP {
     my $line = shift;
 
     my ($id, $nsrc, $sprt, $ttl, $data) = unpack("wa4nCa*", shift);
@@ -1434,9 +1680,72 @@ sub process_RESPONSE {
 
         ::info("SPRT=$sprt, DPRT=$dprt, LEN=$udp_len, CHK=$udp_chksum");
     }
-    ::info("Queue packet (TTL %d) for FOU[%d]: %s:%d -> %s:%d",
+    ::info("Queue UDP packet (TTL %d) for FOU[%d]: %s:%d -> %s:%d",
            $ttl, $map->{fou_id}, $src, $sprt, $map->{host}, $map->{port}) if
                $debug;
+    $fou->write($buffer, $ttl);
+}
+
+sub process_PING {
+    my $line = shift;
+    my ($id, $dst, $seqno, $ttl, $data) = unpack("wa4nCa*", shift);
+    # Currently we only ever use one pinger
+    $id == 1 || die "Assertion: Pinger socket id $id != 1";
+    ::info("Need to send %d bytes of ICMP ECHO data (seqno %d, TTL %d) from socket %d to %s: %s",
+           length($data), $seqno, $ttl, $id, inet_ntoa($dst), ::display($data))
+        if $debug;
+    my $pinger = $line->{sockets_icmp}{$id} || Sender::ICMP->new($line, $id);
+    $pinger->write($dst, $seqno, $data, $ttl);
+}
+
+sub process_RESPONSE_PING {
+    my $line = shift;
+
+    my ($id, $nsrc, $ttl, $buffer) = unpack("wa4Ca*", shift);
+    my $md5 = substr($buffer, 0, 16, $SECRET);
+    md5($buffer) eq $md5 || return;
+    my ($ndst, $icmp_id, $seqno, $fou_id, $data) =
+        unpack("x20a4n2wa*", $buffer);
+    my $fou = $FOU[$fou_id] || die "Assertion: No Fou::UDP with id '$fou_id'";
+
+    # Build FOU IP packet
+    my $ip_len = $IHL * 4;
+    $buffer = pack("x${ip_len}CCx2nna*x", $ICMP_ECHO_REPLY, 0, $icmp_id, $seqno, $data);
+    my $new_length = length($buffer)-1;
+    substr($buffer, 0, $ip_len, "");
+    my $sum = unpack("%32n*", $buffer);
+    chop $buffer;
+    while ($sum > 0xffff) {
+        my $carry = $sum >> 16;
+        $sum &= 0xffff;
+        $sum += $carry;
+    }
+    substr($buffer, 2, 2, pack("n", 0xffff - $sum));
+
+    # Packet ID is meaningless for atomic packets (RFC 6864)
+    my $packet_id = int rand 2**16;
+    my $header = pack("CCnnnCCx2a4a4",
+                      $IP_VERSION << 4 | $IHL,
+                      0,
+                      $new_length,
+                      $packet_id,
+                      $DF << 13 | 0,
+                      $ttl,
+                      $PROTO_ICMP,
+                      $nsrc,
+                      $ndst,
+                  );
+    $sum = unpack("%32n*", $header);
+    while ($sum > 0xffff) {
+        my $carry = $sum >> 16;
+        $sum &= 0xffff;
+        $sum += $carry;
+    }
+    substr($header, 10, 2, pack("n", 0xffff - $sum));
+    substr($buffer, 0, 0, $header);
+
+    ::info("Queue ICMP packet (TTL %d) for FOU[%d]: %s -> %s",
+           $ttl, $fou_id, inet_ntoa($nsrc), inet_ntoa($ndst)) if $debug;
     $fou->write($buffer, $ttl);
 }
 
@@ -1522,6 +1831,28 @@ sub socket_tcp {
     my ($p, $address) = unpack_sockaddr_in($sockaddr);
     my $h = inet_ntoa($address);
     return $h, $p, $socket;
+}
+
+sub socket_icmp {
+    my ($class, $host, $id) = @_;
+
+    $host //= "0.0.0.0";
+    $id //= 0;
+
+    $id =~ /^0\z|^[1-9][0-9]*\z/  || die "Invalid id '$id'";
+    my $addr = inet_aton($host) || die "Could not resolve '$host'";
+    socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_ICMP) ||
+        die "Could not create ICMP socket: $^E";
+    my $local = pack_sockaddr_in($id, $addr);
+    bind($socket, $local) || die "Could not bind socket: $^E";
+    $socket->blocking(0);
+    wantarray || return $socket;
+
+    my $sockaddr = getsockname($socket) ||
+        die "Assertion: Could not getsockname: $^E";
+    my ($i, $address) = unpack_sockaddr_in($sockaddr);
+    my $h = inet_ntoa($address);
+    return $h, $i, $socket;
 }
 
 package Control;

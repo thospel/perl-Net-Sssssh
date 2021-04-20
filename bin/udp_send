@@ -37,7 +37,7 @@ use Socket::MsgHdr;
 
 use Net::Sssssh
     qw(IP_RECVDSTADDR IP_PKTINFO IPPROTO_IP IP_RECVTTL IP_TTL
-       parse_address fou_encode fou_decode string_from_value);
+       parse_address fou_encode_udp fou_decode string_from_value);
 
 die "Could not parse your command line. Try $0 -h\n" unless
     GetOptions("f|fou=s"	=> \my $fou,
@@ -76,7 +76,7 @@ $txt =~ s/\n?\z/$no_nl/;
 my ($lport, $laddr);
 if ($local) {
     ($lport, $laddr) = unpack_sockaddr_in(
-        parse_address($local, "Local", from => "UDP4")) ||
+        parse_address($local, "Local", from => "UDP4")) or
             die "Assertion: Cannot unpack packed local '$local'";
     $local = inet_ntoa($laddr);
 }
@@ -105,9 +105,9 @@ if ($fou) {
         $laddr = inet_aton("1.2.3.4");
         $lport = 49154;
     }
-    $buffer = fou_encode(pack_sockaddr_in($lport, $laddr),
-                            parse_address("$host:$port", "To", to => "UDP4"),
-                            $txt, $verbose && \*STDERR);
+    $buffer = fou_encode_udp(pack_sockaddr_in($lport, $laddr),
+                             parse_address("$host:$port", "To", to => "UDP4"),
+                             $txt, $verbose && \*STDERR);
     my $props;
     if ($msghdr) {
         $msghdr->buf($buffer);
