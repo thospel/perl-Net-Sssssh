@@ -31,6 +31,14 @@ use warnings;
 # ip fou del port 1237 ipproto 4 local 127.0.0.1
 # ip link del name fou1
 
+# Ping forwarding needs permission to open a IPPROTO_ICMP sockets on the
+# forwarded host.
+# E.g. On linux:
+#   Query current permissions:
+#      sysctl net.ipv4.ping_group_range
+#   Allow group 1014:
+#      sysctl net.ipv4.ping_group_range='1014 1014'
+
 our $VERSION = "1.000";
 
 use FindBin qw($Bin $Script);
@@ -72,7 +80,8 @@ my $verbose = undef;
 my $debug   = 0;
 my $timeout = 120;
 my $keepalive = 300;
-my $udp_max = 10,
+my $udp_max = 10;
+my $ping_max = 10;
 my $default_local_bind  = "127.0.0.1";
 my $default_remote_bind = "127.0.0.1";
 
@@ -85,11 +94,17 @@ my $BLOCK_SIZE = int(2**16);
 my $UDP_SIZE = int(2**16);
 my $LISTEN_BACKLOG = 128;
 
+my @PING =
+    $^O eq "solaris" ? (["/bin/ping", "-s"], ["64", "1"]) :
+    (["/bin/ping", "-c", "1"], []);
+
 my %settings_global = (
     EPOCH	=> undef,
+    MSGHDR	=> undef,
     TIMEOUT	=> undef,
     KEEPALIVE	=> undef,
     UDP_MAX	=> undef,
+    PING_MAX	=> undef,
     # ACK_LIMIT should be greater than KEEPALIVE/ACK packet
     # (Code will increase it if not, but you will still send way too many ACKs)
     ACK_LIMIT	=> int(1e6),
@@ -122,15 +137,20 @@ my $ERROR_ERESOLV	= "Could not resolve host";
 my $msghdr_error;
 BEGIN {
     # Can't use "require" later on since Socket::MsgHdr has INIT blocks
-    eval sprintf(qq(#line %d "%s"\nuse Socket::MsgHdr qw(pack_cmsghdr unpack_cmsghdr sendmsg recvmsg); 1), __LINE__, __FILE__)
-        or $msghdr_error = $@ || "Unknown error loading Socket::MsgHdr\n";
-    $msghdr_error =~ s/^BEGIN failed.*\n\z// if $msghdr_error;
+    $msghdr_error = eval(sprintf(qq(#line %d "%s"\nuse Socket::MsgHdr qw(pack_cmsghdr unpack_cmsghdr sendmsg recvmsg); 1), __LINE__, __FILE__)) ? "" :
+        $@ || "Unknown error loading Socket::MsgHdr\n";
+    $msghdr_error =~ s/^BEGIN failed.*\n\z//m if $msghdr_error;
+}
+
+END {
+    # Carp.pm can stash objects in @DB::args causing them not to get freed
+    @DB::args = ();
 }
 
 my $FREE_BSD = $^O eq "freebsd";
 # IPPROTO_IP exists in Socket, but not in really old ones
 my $IPPROTO_IP = 0;
-my ($IP_RECVTTL, $IP_TTL, $IP_PKTINFO);
+my ($IP_RECVTTL, $IP_TTL, $IP_PKTINFO, $ICMP_FILTER, $SOL_RAW);
 if (!$msghdr_error) {
     if (0 && $FREE_BSD) {
         # FreeBSD uses IP_RECVDSTADDR
@@ -141,10 +161,13 @@ if (!$msghdr_error) {
         $IP_PKTINFO	=  8;
         $IP_RECVTTL	= 12;
         $IP_TTL		=  2;
+        $ICMP_FILTER	=  1;
+        $SOL_RAW	=255;
     } else {
         $msghdr_error = "Socket::MsgHdr constants for OS $^O not implemented (yet)\n";
     }
 }
+
 my $msghdr = $msghdr_error ? undef : Socket::MsgHdr->new();
 
 my $role = "client";
@@ -289,7 +312,8 @@ print "' . $STUFFED . '";
     }
 
     sub mainloop {
-        ::info($msghdr_error) if $msghdr_error && ($verbose || $debug);
+        ::info("WARNING (can safely be ignored): $msghdr_error") if
+            $msghdr_error && ($verbose || $debug);
         ::info("Entering mainloop") if $verbose || $debug;
         my ($r, $w, $e, $name, $timeout);
         while (1) {
@@ -579,6 +603,85 @@ sub id_free {
     }
 }
 
+package Pinger;
+use Scalar::Util qw(weaken refaddr);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+use Socket qw(inet_aton);
+
+{
+    my @queued;
+    sub queue {
+        my ($class, $icmp) = @_;
+
+        die "Assertion: Already pending" if $icmp->{pending};
+        weaken($queued[@queued] = $icmp);
+        $icmp->{pending} = 1;
+    }
+
+    sub activate_ping {
+        while (@queued && $ping_max > 0) {
+            my $icmp = shift @queued || next;
+            $icmp->unqueue_ping();
+        }
+    }
+}
+
+sub new {
+    my ($class, $host, $data, $icmp) = @_;
+
+    $ping_max > 0 || die "Assertion: Ping max $ping_max > 0";
+
+    my $pid, open(my $fh, "-|", @{$PING[0]}, $host, @{$PING[1]}) //
+        die "Could not fork: $^E";
+    $fh->blocking(0);
+    my $pinger = bless {
+        handle	=> $fh,
+        pid	=> $pid,
+        in	=> "",
+        host	=> $host,
+        data	=> $data,
+        reader	=> undef,
+    }, $class;
+
+    $pinger->{id} = refaddr($pinger);
+    weaken($pinger->{icmp} = $icmp);
+    $pinger->{reader} = $fh->add_read($pinger, \&reader);
+
+    ::info("Start ping '$pinger->{host}' (ID $pinger->{id})") if $debug;
+
+    return $pinger;
+}
+
+sub reader {
+    my ($pinger) = @_;
+
+    my $rc = $pinger->{handle}->sysread(my $buffer, $BLOCK_SIZE);
+    if (!defined $rc) {
+        # Error
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        $pinger->{reader} = undef;
+        die "Could not read from pinger[$pinger->{pid}]: $^E";
+    }
+    if ($rc) {
+        $pinger->{in} .= $buffer;
+        return;
+    }
+
+    # EOF
+    $pinger->{reader} = undef;
+    close($pinger->{handle});
+    my $icmp = $pinger->{icmp};
+    if (my ($ip, $ttl, $time) = $pinger->{in} =~ /from (\d+\.\d+\.\d\.\d+).* icmp_[sr]eq.* ttl=(\d+).* time=(\S+ (?:ms|usec))/) {
+        ::info("Got ping response from '$ip' ttl=$ttl, time=$time (ID $pinger->{id})") if $debug;
+        $ip eq $pinger->{host} ||
+            die "Asertion: Inconsistent: pinged '$pinger->{host}', got aswer from '$ip'";
+        $icmp->{line}->write($RESPONSE_PING, pack("wa4C", $icmp->{id}, inet_aton($pinger->{host}), $ttl-1), $pinger->{data}) if $ttl > 1;
+    } else {
+        ::info("Got no ping response from '$pinger->{host}' (ID $pinger->{id})") if $debug;
+    }
+    $icmp->unget($pinger);
+}
+
 package Sender::ICMP;
 use Scalar::Util qw(weaken);
 use Socket qw(pack_sockaddr_in unpack_sockaddr_in inet_ntoa
@@ -590,9 +693,14 @@ sub new {
 
     die "Already have Sender::ICMP socket '$id'" if $line->{sockets_icmp}{$id};
 
+    # Notice this can return nothing if we can't open an UDP icmp socket
+    # (either not supported on OS or user not in allowed grooup)
     my ($host, $icmp_id, $socket) = $line->socket_icmp("0.0.0.0", 0);
-    !$msghdr || setsockopt($socket, $IPPROTO_IP, $IP_RECVTTL, 1) ||
+    !$msghdr || !$socket || setsockopt($socket, $IPPROTO_IP, $IP_RECVTTL, 1) ||
         die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
+    # ICMP_FILTER not avialble on UDP sockets (only for raw sockets)
+    # setsockopt($socket, $SOL_RAW, $ICMP_FILTER, 0) ||
+    #    die "setsockopt(SOL_RAW, ICMP_FILTER): $^E" if defined $ICMP_FILTER;
 
     my $icmp = bless {
         id		=> $id,
@@ -603,19 +711,33 @@ sub new {
         reader		=> undef,
         writer		=> undef,
         timeout		=> undef,
+        pingers		=> {},
+        pending		=> 0,
     }, $class;
-    $icmp->{reader} = $socket->add_read($icmp, \&reader),
+    $icmp->{reader} = $socket->add_read($icmp, \&reader) if $socket;
     weaken($icmp->{line} = $line);
     $line->{sockets_icmp}{$id} = $icmp;
 
-    ::info("Creating new Sender::ICMP socket[$id] '$host:$icmp_id'") if $debug;
+    if ($debug) {
+        if ($socket) {
+            ::info("Creating new Sender::ICMP socket[$id] '$host:$icmp_id'");
+        } else {
+            ::info("Creating new Sender::ICMP socket[$id] (using external ping)");
+        }
+    }
 
     return $icmp;
 }
 
 sub write : method {
+    # @_ = ($icmp, $dst, $seqno, $data, $ttl)
     my $icmp = shift;
 
+    if (!$icmp->{socket}) {
+        push @{$icmp->{out}}, [shift, shift, shift];
+        $icmp->activate_ping;
+        return;
+    }
     my $data = {
         name	=> pack_sockaddr_in(0, shift),
         # $icmp->{icmp_id} doesn't need to be set here. Whatever you use
@@ -761,6 +883,58 @@ sub reader {
     $icmp->{line}->write($RESPONSE_PING, pack("wa4C", $icmp->{id}, $addr, $ttl-1), $buffer) if $ttl > 1;
 }
 
+sub activate_ping {
+    my ($icmp) = @_;
+
+    @{$icmp->{out}} || return;
+    return if $icmp->{pending};
+
+    if ($ping_max <= 0) {
+        Pinger->queue($icmp);
+        return;
+    }
+
+    my $line = $icmp->{line};
+    if ($line->{nr_pingers} >= $line->{settings}{PING_MAX}) {
+        $line->queue_ping($icmp);
+        return;
+    }
+
+    my $pinger = Pinger->new(inet_ntoa($icmp->{out}[0][0]),
+                             shift(@{$icmp->{out}})->[2], $icmp);
+    $icmp->{pingers}{$pinger->{id}} = $pinger;
+    ++$line->{nr_pingers};
+    --$ping_max;
+}
+
+sub unget {
+    my ($icmp, $pinger) = @_;
+
+    delete $icmp->{pingers}{$pinger->{id}};
+    if (my $line = $icmp->{line}) {
+        --$line->{nr_pingers};
+        $line->activate_ping;
+    }
+    ++$ping_max;
+    Pinger->activate_ping;
+}
+
+sub unqueue_ping {
+    my ($icmp) = @_;
+
+    $icmp->{pending} || die "Assertion: Not pending";
+    $icmp->{pending} = 0;
+    $icmp->activate_ping;
+}
+
+sub DESTROY {
+    my ($icmp) = @_;
+
+    # Avoid recursive calls to activate from starting stuff again
+    @{$icmp->{out}} = ();
+    $icmp->unget($_) for values %{$icmp->{pingers}};
+}
+
 package Sender::UDP;
 # Send out packets at the remote side (and wait for replies)
 use Scalar::Util qw(weaken);
@@ -787,7 +961,7 @@ sub new {
         writer		=> undef,
         timeout		=> undef,
     }, $class;
-    $sender->{reader} = $socket->add_read($sender, \&reader),
+    $sender->{reader} = $socket->add_read($sender, \&reader);
     weaken($sender->{line} = $line);
     $line->{sockets_udp}{$id} = $sender;
 
@@ -937,7 +1111,7 @@ sub new {
         local_port	=> $p,
         reader		=> undef,
     }, $class;
-    $listener->{reader} = $socket->add_read($listener, \&reader),
+    $listener->{reader} = $socket->add_read($listener, \&reader);
     weaken($listener->{line} = $line);
 
     ::info("Listening on UDP socket '$h:$p'") if $debug;
@@ -1291,7 +1465,7 @@ sub new {
 
 package LineProtocol;
 # Handle traffic between client and server
-use Errno qw(EINTR EAGAIN EWOULDBLOCK EADDRINUSE);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK EADDRINUSE EPROTONOSUPPORT EACCES);
 use Carp;
 use FindBin qw($Script);
 use Socket qw(PF_INET SOCK_DGRAM SOCK_STREAM SOL_SOCKET SO_REUSEADDR
@@ -1340,6 +1514,8 @@ sub new {
     $line->{out} = "";
     $line->{out_sent} = 0;
     $line->{out_base} = 0;
+    $line->{nr_pingers} = 0;
+    $line->{queue_ping} = [];
 
     $line->{reader} = $socket_in->add_read($line, \&reader);
 
@@ -1463,13 +1639,30 @@ sub reader {
     }
 }
 
+sub queue_ping {
+    my ($line, $icmp) = @_;
+
+    die "Assertion: Already pending" if $icmp->{pending};
+    weaken($line->{queue_ping}[@{$line->{queue_ping}}] = $icmp);
+    $icmp->{pending} = 2;
+}
+
+sub activate_ping {
+    my ($line) = @_;
+
+    while (@{$line->{queue_ping}} && $line->{nr_pingers} < $line->{settings}{PING_MAX}) {
+        my $icmp = shift @{$line->{queue_ping}} || next;
+        $icmp->unqueue_ping();
+    }
+}
+
 sub process_SET {
     my $line  = shift;
 
     my $i = unpack("C", substr($_[0], 0, 1, ""));
     my $name = $setting_ids[$i] || die "Unknown variable $i";
     # At the moment all values are numbers
-    $line->{settings}{$name} = $_[0]+0;
+    $line->{settings}{$name} = $_[0] =~ /^0\z|^[1-9][0-9]*\z/ ? $_[0]+0 : $_[0];
     ::info("Set %s=%s", $name, $_[0]) if $debug;
 }
 
@@ -1841,8 +2034,10 @@ sub socket_icmp {
 
     $id =~ /^0\z|^[1-9][0-9]*\z/  || die "Invalid id '$id'";
     my $addr = inet_aton($host) || die "Could not resolve '$host'";
-    socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_ICMP) ||
+    socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_ICMP) || do {
+        return if $! == EPROTONOSUPPORT || $! == EACCES;
         die "Could not create ICMP socket: $^E";
+    };
     my $local = pack_sockaddr_in($id, $addr);
     bind($socket, $local) || die "Could not bind socket: $^E";
     $socket->blocking(0);
@@ -2092,7 +2287,9 @@ sub client {
 
         for my $name (sort keys %{$line->{settings}}) {
             if ($name eq "EPOCH") {
-                $line->set_peer(EPOCH => $BASE_TIME);
+                $line->set_peer($name => $BASE_TIME);
+            } elsif ($name eq "MSGHDR") {
+                $line->set_peer($name => $msghdr_error || Socket::MsgHdr->VERSION);
             } else {
                 $line->set_peer($name => $line->{settings}{$name});
             }
@@ -2141,6 +2338,7 @@ GetOptions("server:s"		=> \my $server,
            "udp_local|l=s"	=> \my @udp_local,
            "udp_remoter=s"	=> \my @udp_remote,
            "udp_max=o"		=> \$udp_max,
+           "ping_max=o"		=> \$ping_max,
            "version!"		=> \my $version,
            "U|unsafe!"		=> \my $unsafe,
            "h|help!"		=> \my $help) ||
@@ -2168,6 +2366,8 @@ die "keepalive $keepalive must be positive\n" if $keepalive <= 0;
 $settings_global{KEEPALIVE} = $keepalive;
 die "udp_max must be positive" if $udp_max < 1;
 $settings_global{UDP_MAX} = $udp_max;
+die "ping_max must be positive" if $ping_max < 1;
+$settings_global{PING_MAX} = $ping_max;
 
 $role = "server" if defined $server;
 $role_peer = $role eq "server" ? "client" : "server";
@@ -2285,6 +2485,7 @@ if ($role eq "server") {
                  # but Fou::UDP is not a child of $line and uses the
                  # global settings
                  timeout	=> $timeout,
+                 ping_max	=> $ping_max,
              );
             while (my ($name, $value) = each %replace) {
                 local $Data::Dumper::Indent  = 0;
@@ -2322,6 +2523,7 @@ if ($role eq "server") {
 }
 
 eval { Events->mainloop() };
+$HOLD = undef;
 die "\u$role: $@" if $@;
 die "Assertion: \u$role fell off the mainloop";
 
