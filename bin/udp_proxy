@@ -88,14 +88,14 @@ $Data::Dumper::Useqq	= 1;
 $SIG{PIPE} = "IGNORE";
 $SIG{CHLD} = "IGNORE";
 
-my $MULTICAST_BEGIN = inet_aton("224.0.0.0") // die "Assertion: Bad address";
+my $MULTICAST_BEGIN = inet_aton("224.0.0.0") || die "Assertion: Bad address";
 # multicast range *excludes* this END address
-my $MULTICAST_END   = inet_aton("240.0.0.0") // die "Assertion: Bad address";
+my $MULTICAST_END   = inet_aton("240.0.0.0") || die "Assertion: Bad address";
 
 my $IP_VERSION = 4;
-my $PROTO_ICMP = getprotobyname("icmp") // die "Unknown protocol ICMP";
-my $PROTO_UDP  = getprotobyname("udp")  // die "Unknown protocol UDP";
-my $PROTO_TCP  = getprotobyname("tcp")  // die "Unknown protocol TCP";
+defined(my $PROTO_ICMP = getprotobyname("icmp")) || die "Unknown protocol ICMP";
+defined(my $PROTO_UDP  = getprotobyname("udp"))  || die "Unknown protocol UDP";
+defined(my $PROTO_TCP  = getprotobyname("tcp"))  || die "Unknown protocol TCP";
 my $IHL = 5;
 my $ICMP_HEADER = 8;
 my $UDP_HEADER  = 8;
@@ -198,6 +198,8 @@ if (!$msghdr_error) {
 }
 
 my $msghdr = $msghdr_error ? undef : Socket::MsgHdr->new();
+my (%lines, $loops);
+my $line_ids = Ids->new;
 
 my $role = "client";
 my $role_peer;
@@ -256,11 +258,15 @@ print "' . $STUFFED . '";
     my $error_mask = "";
     my (%read_refs, %write_refs, %error_refs);
 
+    sub fixed {
+        shift;
+        $read_fixed += shift;
+    }
     # All placeholder subs are the same sub
     use constant NOP => sub {};
 
     sub Events::Read::DESTROY {
-        my $fd = ${shift()} // die "No filedescriptor";
+        defined(my $fd = ${shift()}) || die "No filedescriptor";
         ::caller_info("delete_read $fd") if $debug;
         # This strange assign after delete is to update the reference the for in
         # sub mainloop may still have in such a way that element 0 keeps existing
@@ -277,7 +283,7 @@ print "' . $STUFFED . '";
     }
 
     sub Events::Write::DESTROY {
-        my $fd = ${shift()} // die "No filedescriptor";
+        defined(my $fd = ${shift()}) || die "No filedescriptor";
         ::caller_info("delete_write $fd") if $debug;
         # This strange assign after delete is to update the reference the for in
         # sub mainloop may still have in such a way that element 0 keeps existing
@@ -294,7 +300,7 @@ print "' . $STUFFED . '";
     }
 
     sub Events::Error::DESTROY {
-        my $fd = ${shift()} // die "No filedescriptor";
+        defined(my $fd = ${shift()}) || die "No filedescriptor";
         ::caller_info("delete_error $fd") if $debug;
         # This strange assign after delete is to update the reference the for in
         # sub mainloop may still have in such a way that element 0 keeps existing
@@ -314,7 +320,7 @@ print "' . $STUFFED . '";
     use Scalar::Util qw(weaken);
 
     sub add_read {
-        my $fd = fileno(shift) // croak "Not a filehandle";
+        defined(my $fd = fileno(shift)) || croak "Not a filehandle";
         ::caller_info("add_read $fd") if $debug;
         croak "Descriptor $fd already selected for read" if $read_refs{$fd};
         vec($read_mask, $fd, 1) = 1;
@@ -323,7 +329,7 @@ print "' . $STUFFED . '";
     }
 
     sub add_write {
-        my $fd = fileno(shift) // croak "Not a filehandle";
+        defined(my $fd = fileno(shift)) || croak "Not a filehandle";
         ::caller_info("add_write $fd") if $debug;
         croak "Descriptor $fd already selected for write" if $write_refs{$fd};
         vec($write_mask, $fd, 1) = 1;
@@ -332,7 +338,7 @@ print "' . $STUFFED . '";
     }
 
     sub add_error {
-        my $fd = fileno(shift) // croak "Not a filehandle";
+        defined(my $fd = fileno(shift)) || croak "Not a filehandle";
         ::caller_info("add_error $fd") if $debug;
         croak "Descriptor $fd already selected for error" if $error_refs{$fd};
         vec($error_mask, $fd, 1) = 1;
@@ -346,7 +352,7 @@ print "' . $STUFFED . '";
         ::info("Entering mainloop") if $verbose || $debug;
         my ($r, $w, $e, $name, $timeout);
         while (1) {
-            ($timeout = Timer::timers_collect()) //
+            defined($timeout = Timer::timers_collect()) ||
                 (keys %read_refs > $read_fixed || %write_refs || %error_refs || last);
             if ((select($r = $read_mask,
                         $w = $write_mask,
@@ -664,7 +670,7 @@ sub new {
     pipe(my $rd0, my $wr0) || die "Could not open pipe: $^E";
     pipe(my $rd1, my $wr1) || die "Could not open pipe: $^E";
 
-    my $pid = fork() // die "Could not fork: $^E";
+    defined(my $pid = fork()) || die "Could not fork: $^E";
     if ($pid == 0) {
         # Child
         select($wr1);
@@ -1371,7 +1377,7 @@ sub reader {
                         last;
                     }
                 }
-                $id // die "Assertion: no Free id's";
+                defined $id || die "Assertion: no Free id's";
                 # $id //= $old[0]{id} // die "Assertion: no Free id's";
                 my $remove = $map_src->[2][$id];
                 delete $map_src->[1]{$remove->{key}} == $remove ||
@@ -1555,6 +1561,7 @@ sub new {
     my ($class) = @_;
 
     my $line = bless {
+        id		=> $line_ids->id_alloc,
         started		=> undef,	# Normal operations started
         utime_offset	=> 0,	# Estimated round trip time in microsecond
         keepalive	=> undef,
@@ -1568,7 +1575,11 @@ sub new {
     }, $class;
     $line->id_init;
 
-    return $line;
+    return $lines{$line->{id}} = $line;
+}
+
+sub DESTROY {
+    $line_ids->id_free(shift->{id});
 }
 
 package LineProtocol;
@@ -1655,7 +1666,7 @@ sub writer {
         my $rc = $line->{socket_out}->syswrite($line->{out}, $BLOCK_SIZE, $line->{out_sent});
         if (!defined $rc) {
             if ($! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK) {
-                $line->{timeout} //= Timer::timer($line->{settings}{TIMEOUT},
+                $line->{timeout} ||= Timer::timer($line->{settings}{TIMEOUT},
                                                   $line, \&timeout);
                 return;
             }
@@ -1725,8 +1736,9 @@ sub reader {
         die "Could not read from $role_peer: $^E"
     }
     if ($rc == 0) {
-        ::info("Exit: Remote EOF") if $verbose;
-        exit 0;
+        ::info("Line $line->{id}: Remote EOF. Closing") if $verbose || $debug;
+        delete $lines{$line->{id}};
+        return;
     }
     ::info("Read %d bytes from $role_peer: %s", $rc, ::display(substr($line->{in}, -$rc))) if $debug;
 
@@ -1739,7 +1751,7 @@ sub reader {
         my $message = substr($line->{in}, 0, $length, "");
         substr($message, 0, length $1, "");
         ::info("Processing %s: '%s' (%d bytes)",
-               $process_name{$command} // "Unknown command $command",
+               $process_name{$command} || "Unknown command $command",
                ::display($message), length $message) if $debug;
         my $fun = $process{$command} ||
             die "No handler for proto '$command'";
@@ -2055,8 +2067,10 @@ sub set_peer {
 
     my $i = $setting_ids{$name};
     defined $i || croak "Unknown global variable '$name'";
-    $value //= $line->{settings}{$name} //
-        die "Assertion: Setting '$name' to undef";
+    if (!defined $value) {
+        defined($value = $line->{settings}{$name}) ||
+            die "Assertion: Setting '$name' to undef";
+    }
     $line->write($SET, pack("w", $i), $value);
 }
 
@@ -2137,8 +2151,8 @@ sub socket_tcp {
 sub socket_icmp {
     my ($class, $host, $id) = @_;
 
-    $host //= "0.0.0.0";
-    $id //= 0;
+    $host = "0.0.0.0" if !defined $host;
+    $id = 0 if !defined $id;
 
     $id =~ /^0\z|^[1-9][0-9]*\z/  || die "Invalid id '$id'";
     my $addr = inet_aton($host) || die "Could not resolve '$host'";
@@ -2177,6 +2191,9 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK);
             ($h, $p, my $socket) = LineProtocol->socket_tcp($host, $port, 1);
             $socket_in = $socket_out = $socket;
         } else {
+            # STDIN control should not keep the event.loop alive
+            Events->fixed(1);
+
             $socket_in  = \*STDIN;
             $socket_in->blocking(0);
             $socket_out = \*STDOUT;
@@ -2264,7 +2281,7 @@ sub writer {
         my $rc = $control->{socket_out}->syswrite($control->{out}, $BLOCK_SIZE);
         if (!defined $rc) {
             if ($! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK) {
-                $control->{timeout} //=
+                $control->{timeout} ||=
                     Timer::timer($control->{settings}{TIMEOUT},
                                  $control, \&timeout);
                 return;
@@ -2290,6 +2307,55 @@ sub timeout {
     my ($control) = @_;
 
     die "Timeout. Could not TCP write[$control->{id}";
+}
+
+package Listener;
+use Socket qw(unpack_sockaddr_in inet_ntoa);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+
+{
+    my %listeners;
+    my $listen_ids = Ids->new;
+
+    sub new {
+        my ($class, $host, $port, $loops) = @_;
+
+        $loops = -1 if !defined $loops;
+        return if $loops == 0;
+        my ($h, $p, $socket) = LineProtocol->socket_tcp($host, $port, 1);
+        ::info("Listening on $h:$p") if $port eq "0";
+        my $listen = bless {
+            id => $listen_ids->id_alloc,
+            socket => $socket,
+        }, $class;
+        $listen->{reader} = $socket->add_read($listen, \&acceptable);
+        return $listeners{$listen->{id}} = $listen;
+    }
+
+    sub delete : method {
+        delete $listeners{shift->{id}};
+    }
+
+    sub DESTROY {
+        $listen_ids->id_free(shift->{id});
+    }
+}
+
+sub acceptable {
+    my ($listener) = @_;
+
+    my $from = accept(my $accepted, $listener->{socket});
+    if (!$from) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Accept failed: $^E";
+    }
+    $listener->delete if --$loops == 0;
+    my $line = ::server($accepted, $accepted);
+    if ($debug || $verbose) {
+        my ($port, $addr) = unpack_sockaddr_in($from);
+        my $host = inet_ntoa($addr);
+        ::info("Accepted TCP connection from %s:%d. Starting Line %d (loops=%d)", $host, $port, $line->{id}, $loops);
+    }
 }
 
 package main;
@@ -2429,6 +2495,7 @@ sub server {
 
 GetOptions("server:s"		=> \my $server,
            "client=s"		=> \my $client,
+           "N|loops=o"		=> \$loops,
            "n!"			=> \my $no_control,
            "server_lib=s"	=> \my @server_lib,
            "ssh=s"		=> \$ssh,
@@ -2480,7 +2547,6 @@ $settings_global{PING_MAX} = $ping_max;
 $role = "server" if defined $server;
 $role_peer = $role eq "server" ? "client" : "server";
 
-my $HOLD;
 if ($role eq "server") {
     # From here on we are the server
 
@@ -2488,20 +2554,11 @@ if ($role eq "server") {
     die "Cannot have stuff in server mode\n" if $stuff;
 
     my ($socket_in, $socket_out);
-    if (defined $server && $server ne "") {
+    if (defined $server) {
         # Manual start
-        my $host = $server =~ s{(.*):}{}s ? $1 :
-            $default_local_bind;
-        my ($h, $p, $socket) = LineProtocol->socket_tcp($host, $server, 1);
-        $socket->blocking(1);
-        ::info("Listening on port $p") if $server eq "0";
-        my $from = accept(my $accepted, $socket) || die "Accept failed: $^E";
-        if ($debug || $verbose) {
-            my ($port, $addr) = unpack_sockaddr_in($from);
-            my $host = inet_ntoa($addr);
-            ::info("Accepted TCP line connection from %s:%d", $host, $port);
-        }
-        $socket_in = $socket_out = $accepted;
+        my $host = $server =~ s{(.*):}{}s ? $1 : $default_local_bind;
+        $server = "0" if $server eq "";
+        Listener->new($host, $server, $loops);
         if ($no_control) {
             open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
         } else {
@@ -2514,8 +2571,8 @@ if ($role eq "server") {
         open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
         open($socket_out, ">&STDOUT") || die "Could not dup STDOUT: $^E";
         open(STDIN, ">&", $null) || die "Could not dup to STDOUT: $^E";
+        server($socket_in, $socket_out);
     }
-    $HOLD = server($socket_in, $socket_out);
 } else {
 
     # From here on we are the client
@@ -2533,10 +2590,10 @@ if ($role eq "server") {
 
         my $host = $client =~ s{(.*):}{}s ? $1 : "127.0.0.1";
         my $socket = LineProtocol->socket_tcp($host, $client);
-        $HOLD = client($socket, $socket, \@udp_local, \@udp_remote);
+        client($socket, $socket, \@udp_local, \@udp_remote);
     } else {
         @ARGV || die "Missing remote host argument, Try $Script -h\n";
-        $stuff //= 1;
+        $stuff = 1 if !defined $stuff;
         if ($stuff) {
             @ARGV == 1 || die "Spurious arguments\n";
         }
@@ -2561,11 +2618,12 @@ if ($role eq "server") {
                     # delete @ENV{qw(LANGUAGE LC_ALL LANG)};
                     my $remote_host = shift;
                     if ($remote_host eq "") {
-                        $remote_perl //= $^X;
+                        $remote_perl = $^X if !defined $remote_perl;
                         exec($remote_perl) ||
                             die "Could not exec $remote_perl: $^E";
                     } else {
-                        exec($ssh, $ssh_master ? "-M" : (), "-e", "none", $remote_host, $remote_perl // "/usr/bin/perl") ||
+                        $remote_perl = "/usr/bin/perl" if !defined $remote_perl;
+                        exec($ssh, $ssh_master ? "-M" : (), "-e", "none", $remote_host, $remote_perl) ||
                             die "Could not exec $ssh: $^E";
                     }
                 } else {
@@ -2636,7 +2694,7 @@ if ($role eq "server") {
             alarm(0);
             $line eq $STUFFED || die "Bad server confirm $line";
         }
-        $HOLD= client($rd1, $wr0, \@udp_local, \@udp_remote);
+        client($rd1, $wr0, \@udp_local, \@udp_remote);
     }
     if ($no_control) {
         open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
@@ -2646,9 +2704,9 @@ if ($role eq "server") {
 }
 
 eval { Events->mainloop() };
-$HOLD = undef;
+%lines = ();
 die "\u$role DIED: $@" if $@;
-die "Assertion: \u$role fell off the mainloop";
+# die "Assertion: \u$role fell off the mainloop";
 
 __END__
 Implementation notes:
