@@ -26,6 +26,7 @@ MYMETA.yml
 MYMETA.json
 t/sgf$
 test
+test.*
 *.S
 *.s
 *.bs

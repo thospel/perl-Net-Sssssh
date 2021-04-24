@@ -1,4 +1,32 @@
 #!/usr/bin/perl -w
+my $null;
+BEGIN {
+    # This must come before any modules, even use strict/warnings
+    # (to avoid these modules keeping open early file handles for __DATA__)
+    open($null, "+<", "/dev/null") || die "Could not open '/dev/null': $^E";
+    die "Assertion: Should at least have the source code open at fileno 0" if
+        fileno($null) == 0;
+    if (fileno($null) == 1) {
+        # Perl will automatically subsume fd 1 into STDOUT
+        open($null = undef, "+>&STDOUT") || die "Could not dup STDOUT: $^E";
+    }
+    if (fileno($null) == 2) {
+        # Perl will automatically subsume fd 2 into STDERR
+        open($null = undef, "+>&STDERR") || die "Could not dup STDERR: $^E";
+    }
+    $^F == 2 || die "Assertion: Invalid CLO_EXEC range";
+    fileno($null) > 2 || die "Assertion: Invalid NULL handle";
+    # So now we are absolutely sure $null has CLO_EXEC
+}
+# Now take over STDIN in case we had no STDIN and perl opened it as source code
+# We should have a DATA filehandle because this file has an __END__ section
+# (but for unclear reasons it does not when stuffing --Ton)
+if (defined fileno(DATA)) {
+    fileno(DATA) != fileno(STDIN) ||
+        open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
+    close(DATA);
+}
+
 use strict;
 use warnings;
 
@@ -58,6 +86,7 @@ $Data::Dumper::Useqq	= 1;
     die "Could not parse ", __FILE__ if $Script eq "-" && __FILE__ ne "-";
 
 $SIG{PIPE} = "IGNORE";
+$SIG{CHLD} = "IGNORE";
 
 my $MULTICAST_BEGIN = inet_aton("224.0.0.0") // die "Assertion: Bad address";
 # multicast range *excludes* this END address
@@ -607,6 +636,7 @@ package Pinger;
 use Scalar::Util qw(weaken refaddr);
 use Errno qw(EINTR EAGAIN EWOULDBLOCK);
 use Socket qw(inet_aton);
+use POSIX qw(_exit);
 
 {
     my @queued;
@@ -631,12 +661,39 @@ sub new {
 
     $ping_max > 0 || die "Assertion: Ping max $ping_max > 0";
 
-    my $pid, open(my $fh, "-|", @{$PING[0]}, $host, @{$PING[1]}) //
-        die "Could not fork: $^E";
-    $fh->blocking(0);
+    pipe(my $rd0, my $wr0) || die "Could not open pipe: $^E";
+    pipe(my $rd1, my $wr1) || die "Could not open pipe: $^E";
+
+    my $pid = fork() // die "Could not fork: $^E";
+    if ($pid == 0) {
+        # Child
+        select($wr1);
+        $| = 1;
+        eval {
+            close($rd0) || die "Could not close pipe: $^E";
+            close($rd1) || die "Could not close pipe: $^E";
+            open(STDIN,  "<&", $null) || die "Could not dup to STDIN: $^E";
+            open(STDOUT, ">&", $wr0)  || die "Could not dup to STDOUT: $^E";
+            close($wr0) || die "Could not close pipe: $^E";
+            # open(STDERR, ">&STDOUT")  || die "Could not dup to STDERR: $^E";
+            $SIG{CHLD} = "DEFAULT";
+            no warnings "exec";
+            exec(@{$PING[0]}, $host, @{$PING[1]}) ||
+                die "Could not exec $PING[0][0]: $^E";
+        };
+        print $@;
+        _exit(1);
+    }
+    # Parent
+    close($wr0) || die "Could not close pipe: $^E";
+    close($wr1) || die "Could not close pipe: $^E";
+    $rd0->blocking(0);
+    $rd1->blocking(0);
     my $pinger = bless {
-        handle	=> $fh,
+        handle	=> $rd0,
+        exec_fh	=> $rd1,
         pid	=> $pid,
+        parent	=> $$,
         in	=> "",
         host	=> $host,
         data	=> $data,
@@ -645,11 +702,52 @@ sub new {
 
     $pinger->{id} = refaddr($pinger);
     weaken($pinger->{icmp} = $icmp);
-    $pinger->{reader} = $fh->add_read($pinger, \&reader);
+    $pinger->{reader} = $rd1->add_read($pinger, \&exec_reader);
 
     ::info("Start ping '$pinger->{host}' (ID $pinger->{id})") if $debug;
 
     return $pinger;
+}
+
+sub wait : method {
+    return if defined $SIG{CHLD} && $SIG{CHLD} eq "IGNORE";
+    my ($pinger) = @_;
+
+    my $pid = $pinger->{pid};
+    return if $pinger->{parent} != $$ || !$pid;
+    my $p = waitpid($pid, 0);
+    $pinger->{pid} = undef;
+    if ($p != $pid) {
+        die "Could not wait for pid '$pid'" if $p < 0;
+        die "Assertion: Invalid pid result" if $p != $pid;
+    }
+    die "Unexpected exitcode $? from ping $pinger->{host} (pid $pid)" if $?;
+}
+
+sub exec_reader {
+    my ($pinger) = @_;
+
+    my $rc = $pinger->{exec_fh}->sysread(my $buffer, $BLOCK_SIZE);
+    if (!defined $rc) {
+        # Error
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        $pinger->{reader} = undef;
+        die "Assertion: Could not read from pinger[$pinger->{pid}] exec handle: $^E";
+    }
+    if ($rc) {
+        $pinger->{in} .= $buffer;
+        return;
+    }
+
+    # EOF
+    $pinger->{reader} = undef;
+    close($pinger->{exec_fh}) || die "Could not close exec ping handle: $^E";
+    if ($pinger->{in} ne "") {
+        close($pinger->{handle}) || die "Could not close ping handle: $^E";
+        $pinger->wait;
+        die $pinger->{in};
+    }
+    $pinger->{reader} = $pinger->{handle}->add_read($pinger, \&reader);
 }
 
 sub reader {
@@ -670,6 +768,7 @@ sub reader {
     # EOF
     $pinger->{reader} = undef;
     close($pinger->{handle});
+    $pinger->wait;
     my $icmp = $pinger->{icmp};
     if (my ($ip, $ttl, $time) = $pinger->{in} =~ /from (\d+\.\d+\.\d\.\d+).* icmp_[sr]eq.* ttl=(\d+).* time=(\S+ (?:ms|usec))/) {
         ::info("Got ping response from '$ip' ttl=$ttl, time=$time (ID $pinger->{id})") if $debug;
@@ -698,12 +797,14 @@ sub new {
     my ($host, $icmp_id, $socket) = $line->socket_icmp("0.0.0.0", 0);
     !$msghdr || !$socket || setsockopt($socket, $IPPROTO_IP, $IP_RECVTTL, 1) ||
         die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
-    # ICMP_FILTER not avialble on UDP sockets (only for raw sockets)
-    # setsockopt($socket, $SOL_RAW, $ICMP_FILTER, 0) ||
+    # ICMP_FILTER always gets me ENOPROTOOPT
+    # However when /bin/ping does it (when sysctl group NOT set) it works...
+    # !$socket || setsockopt($socket, $SOL_RAW, $ICMP_FILTER, 0xffffffff ^ 1<<$ICMP_ECHO_REPLY) ||
     #    die "setsockopt(SOL_RAW, ICMP_FILTER): $^E" if defined $ICMP_FILTER;
 
     my $icmp = bless {
         id		=> $id,
+        pid		=> $$,
         out		=> [],
         socket		=> $socket,
         local_host	=> $host,
@@ -930,6 +1031,9 @@ sub unqueue_ping {
 sub DESTROY {
     my ($icmp) = @_;
 
+    # Avoid new pings being started during cleanup in children
+    $icmp->{pid} == $$ || return;
+
     # Avoid recursive calls to activate from starting stuff again
     @{$icmp->{out}} = ();
     $icmp->unget($_) for values %{$icmp->{pingers}};
@@ -1137,13 +1241,17 @@ sub reader {
     }
     # No special handling for length 0.
     # It's perfectly fine to send and receve empty UDP packets
-    my $debug_str = $debug && sprintf("Received %d bytes on $role UDP socket: %s", $rc, ::display($buffer));
+    my $debug_str = $debug && sprintf("Received %d bytes on listening UDP socket: %s", $rc, ::display($buffer));
     if (length $buffer < 20) {
         ::info($debug_str) if $debug_str;
         return;
     }
     my ($ihl, $ecn, $length, $id, $fragment, $ttl, $proto, $chksum, $nsrc, $ndst) = unpack("CCnnnCCna4a4", $buffer);
-    # print STDERR "TEMP: IHL=$ihl, ECN=$ecn, LEN=$length, ID=$id, FRAGMENT=$fragment, TTL=$ttl, PROTO=$proto, CHK=$chksum, SRC=$nsrc, DST=$ndst\n";
+    if (0) {
+        printf(STDERR "TEMP: IHL=%d, ECN=%d, LEN=%d, ID=%d, FRAGMENT=%#04X, TTL=%d, PROTO=%d, CHK=%#04X, SRC=%s, DST=%s\n",
+               $ihl, $ecn, $length, $id, $fragment, $ttl, $proto, $chksum,
+               inet_ntoa($nsrc), inet_ntoa($ndst));
+    }
 
     # Don't handle spammy multicast stuff
     return if $MULTICAST_BEGIN le $ndst && $ndst lt $MULTICAST_END;
@@ -2379,8 +2487,7 @@ if ($role eq "server") {
     die "Cannot be both server and client\n" if defined $client;
     die "Cannot have stuff in server mode\n" if $stuff;
 
-    my $socket_in  = \*STDIN;
-    my $socket_out = \*STDOUT;
+    my ($socket_in, $socket_out);
     if (defined $server && $server ne "") {
         # Manual start
         my $host = $server =~ s{(.*):}{}s ? $1 :
@@ -2395,7 +2502,18 @@ if ($role eq "server") {
             ::info("Accepted TCP line connection from %s:%d", $host, $port);
         }
         $socket_in = $socket_out = $accepted;
-        $no_control || Control->new;
+        if ($no_control) {
+            open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
+        } else {
+            Control->new;
+        }
+    } else {
+        # Make sure that if we fork/exec things they won't get access to
+        # our communication channel
+        open($socket_in,  "<&STDIN")  || die "Could not dup STDIN: $^E";
+        open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
+        open($socket_out, ">&STDOUT") || die "Could not dup STDOUT: $^E";
+        open(STDIN, ">&", $null) || die "Could not dup to STDOUT: $^E";
     }
     $HOLD = server($socket_in, $socket_out);
 } else {
@@ -2438,6 +2556,7 @@ if ($role eq "server") {
                 open(STDOUT, ">&", $wr1) || die "Could not dup STDOUT: $^E";
                 close $wr1;
 
+                $SIG{CHLD} = "DEFAULT";
                 if ($stuff) {
                     # delete @ENV{qw(LANGUAGE LC_ALL LANG)};
                     my $remote_host = shift;
@@ -2519,12 +2638,16 @@ if ($role eq "server") {
         }
         $HOLD= client($rd1, $wr0, \@udp_local, \@udp_remote);
     }
-    $no_control || Control->new;
+    if ($no_control) {
+        open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
+    } else {
+        Control->new;
+    }
 }
 
 eval { Events->mainloop() };
 $HOLD = undef;
-die "\u$role: $@" if $@;
+die "\u$role DIED: $@" if $@;
 die "Assertion: \u$role fell off the mainloop";
 
 __END__
