@@ -279,7 +279,7 @@ sub delete : method {
 
     my $i = $timer->[INDEX];
     if (!$i) {
-        croak "Not a timer reference" unless defined($i) && $i == 0;
+        croak "Not a timer reference" unless defined($i);
         # Could be a timer sitting on the expired queue @immediate
         $#$timer = INDEX if @$timer > INDEX;
         return;

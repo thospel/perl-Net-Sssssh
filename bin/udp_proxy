@@ -246,28 +246,42 @@ $| = 1;
 print "' . $STUFFED . '";
 ');
 
+my $nr_events = 0;
 {
     package Events;
     # A small event core
     use Carp;
     use Errno qw(EINTR);
 
-    my $read_fixed = 0;
     my $read_mask  = "";
     my $write_mask = "";
     my $error_mask = "";
     my (%read_refs, %write_refs, %error_refs);
 
-    sub fixed {
-        shift;
-        $read_fixed += shift;
-    }
     # All placeholder subs are the same sub
     use constant NOP => sub {};
 
     sub Events::Read::DESTROY {
         defined(my $fd = ${shift()}) || die "No filedescriptor";
         ::caller_info("delete_read $fd") if $debug;
+        # This strange assign after delete is to update the reference the for in
+        # sub mainloop may still have in such a way that element 0 keeps existing
+        # (otherwise a confess during the callback will access freed memory)
+        # We could set either the object (index 0) or the callback (index 1)
+        # But the object is already weak and the callback may be a closure
+        delete($read_refs{$fd})->[1] = NOP;
+        if (%read_refs) {
+            vec($read_mask, $fd, 1) = 0;
+            $read_mask =~ s/\x00+\z//;
+        } else {
+            $read_mask = "";
+        }
+        --$nr_events;
+    }
+
+    sub Events::Read0::DESTROY {
+        defined(my $fd = ${shift()}) || die "No filedescriptor";
+        ::caller_info("delete_read0 $fd") if $debug;
         # This strange assign after delete is to update the reference the for in
         # sub mainloop may still have in such a way that element 0 keeps existing
         # (otherwise a confess during the callback will access freed memory)
@@ -297,11 +311,47 @@ print "' . $STUFFED . '";
         } else {
             $write_mask = "";
         }
+        --$nr_events;
+    }
+
+    sub Events::Write0::DESTROY {
+        defined(my $fd = ${shift()}) || die "No filedescriptor";
+        ::caller_info("delete_write0 $fd") if $debug;
+        # This strange assign after delete is to update the reference the for in
+        # sub mainloop may still have in such a way that element 0 keeps existing
+        # (otherwise a confess during the callback will access freed memory)
+        # We could set either the object (index 0) or the callback (index 1)
+        # But the object is already weak and the callback may be a closure
+        delete($write_refs{$fd})->[1] = NOP;
+        if (%write_refs) {
+            vec($write_mask, $fd, 1) = 0;
+            $write_mask =~ s/\x00+\z//;
+        } else {
+            $write_mask = "";
+        }
     }
 
     sub Events::Error::DESTROY {
         defined(my $fd = ${shift()}) || die "No filedescriptor";
         ::caller_info("delete_error $fd") if $debug;
+        # This strange assign after delete is to update the reference the for in
+        # sub mainloop may still have in such a way that element 0 keeps existing
+        # (otherwise a confess during the callback will access freed memory)
+        # We could set either the object (index 0) or the callback (index 1)
+        # But the object is already weak and the callback may be a closure
+        delete($error_refs{$fd})->[1] = NOP;
+        if (%error_refs) {
+            vec($error_mask, $fd, 1) = 0;
+            $error_mask =~ s/\x00+\z//;
+        } else {
+            $error_mask = "";
+        }
+        --$nr_events;
+    }
+
+    sub Events::Error0::DESTROY {
+        defined(my $fd = ${shift()}) || die "No filedescriptor";
+        ::caller_info("delete_error0 $fd") if $debug;
         # This strange assign after delete is to update the reference the for in
         # sub mainloop may still have in such a way that element 0 keeps existing
         # (otherwise a confess during the callback will access freed memory)
@@ -325,7 +375,17 @@ print "' . $STUFFED . '";
         croak "Descriptor $fd already selected for read" if $read_refs{$fd};
         vec($read_mask, $fd, 1) = 1;
         weaken(($read_refs{$fd} = [shift, shift])->[0]);
+        ++$nr_events;
         return bless \$fd, "Events::Read";
+    }
+
+    sub add_read0 {
+        defined(my $fd = fileno(shift)) || croak "Not a filehandle";
+        ::caller_info("add_read0 $fd") if $debug;
+        croak "Descriptor $fd already selected for read" if $read_refs{$fd};
+        vec($read_mask, $fd, 1) = 1;
+        weaken(($read_refs{$fd} = [shift, shift])->[0]);
+        return bless \$fd, "Events::Read0";
     }
 
     sub add_write {
@@ -334,7 +394,17 @@ print "' . $STUFFED . '";
         croak "Descriptor $fd already selected for write" if $write_refs{$fd};
         vec($write_mask, $fd, 1) = 1;
         weaken(($write_refs{$fd} = [shift, shift])->[0]);
+        ++$nr_events;
         return bless \$fd, "Events::Write";
+    }
+
+    sub add_write0 {
+        defined(my $fd = fileno(shift)) || croak "Not a filehandle";
+        ::caller_info("add_write0 $fd") if $debug;
+        croak "Descriptor $fd already selected for write" if $write_refs{$fd};
+        vec($write_mask, $fd, 1) = 1;
+        weaken(($write_refs{$fd} = [shift, shift])->[0]);
+        return bless \$fd, "Events::Write0";
     }
 
     sub add_error {
@@ -343,20 +413,30 @@ print "' . $STUFFED . '";
         croak "Descriptor $fd already selected for error" if $error_refs{$fd};
         vec($error_mask, $fd, 1) = 1;
         weaken(($error_refs{$fd} = [shift, shift])->[0]);
+        ++$nr_events;
         return bless \$fd, "Events::Error";
+    }
+
+    sub add_error0 {
+        defined(my $fd = fileno(shift)) || croak "Not a filehandle";
+        ::caller_info("add_error0 $fd") if $debug;
+        croak "Descriptor $fd already selected for error" if $error_refs{$fd};
+        vec($error_mask, $fd, 1) = 1;
+        weaken(($error_refs{$fd} = [shift, shift])->[0]);
+        return bless \$fd, "Events::Error0";
     }
 
     sub mainloop {
         ::info("WARNING (can safely be ignored): $msghdr_error") if
             $msghdr_error && ($verbose || $debug);
         ::info("Entering mainloop") if $verbose || $debug;
-        my ($r, $w, $e, $name, $timeout);
-        while (1) {
-            defined($timeout = Timer::timers_collect()) ||
-                (keys %read_refs > $read_fixed || %write_refs || %error_refs || last);
+        my ($r, $w, $e);
+        # my $name;
+        while ($nr_events) {
             if ((select($r = $read_mask,
                         $w = $write_mask,
-                        $e = $error_mask, $timeout) || next) > 0) {
+                        $e = $error_mask,
+                        Timer::timers_collect()) || next) > 0) {
                 # The copy to @tmp is because the stack doesn't keep values
                 # alive, so any deletes on xxx_refs during the loop can make
                 # the value go poof. The copy temporarily increases the
@@ -380,12 +460,12 @@ print "' . $STUFFED . '";
     }
 
     no warnings "once";
-    *IO::Handle::add_read     = \&add_read;
-    *IO::Handle::add_write    = \&add_write;
-    *IO::Handle::add_error    = \&add_error;
-    *IO::Handle::delete_read  = \&delete_read;
-    *IO::Handle::delete_write = \&delete_write;
-    *IO::Handle::delete_error = \&delete_error;
+    *IO::Handle::add_read	= \&add_read;
+    *IO::Handle::add_read0	= \&add_read0;
+    *IO::Handle::add_write	= \&add_write;
+    *IO::Handle::add_write0	= \&add_write0;
+    *IO::Handle::add_error	= \&add_error;
+    *IO::Handle::add_error0	= \&add_error0;
 }
 
 my $CLOCK_TYPE_NAME;
@@ -399,9 +479,10 @@ my $CLOCK_TYPE_NAME;
     # Timer indices
     sub INDEX	() { 0 };
     sub TIME	() { 1 };
-    sub OBJ		() { 2 }; # Must come after TIME
+    sub OBJ	() { 2 }; # Must come after TIME
     sub CODE	() { 3 };
-    sub CALLERS	() { 4 };
+    sub KEEPDEAD() { 4 };
+    sub CALLERS	() { 5 };
 
     my @timers = (undef);
     # @expired must be persistent so no timers get lost if a callback dies
@@ -445,6 +526,14 @@ my $CLOCK_TYPE_NAME;
         my $timer = bless [$i, $time, @_];
         weaken($timer->[OBJ]);
         weaken($timers[$i] = $timer);
+        ++$nr_events;
+        return $timer;
+    }
+
+    sub timer0 {
+        my $timer = timer(@_);
+        $timer->[KEEPDEAD] = 1;
+        --$nr_events;
         return $timer;
     }
 
@@ -461,7 +550,7 @@ my $CLOCK_TYPE_NAME;
         return $timer;
     }
 
-    sub delete : method {
+    sub DESTROY {
         my ($timer) = @_;
 
         my $i = $timer->[INDEX];
@@ -474,16 +563,20 @@ my $CLOCK_TYPE_NAME;
             }
         }
         if (!$i) {
-            croak "Not a timer reference" unless defined($i) && $i == 0;
+            croak "Not a timer reference" unless defined($i);
             # Could be a timer sitting on the expired queue in run_now
-            $#$timer = TIME if @$timer > TIME;
+            if (@$timer > TIME) {
+                --$nr_events unless $timer->[KEEPDEAD];
+                $#$timer = TIME;
+            }
             return;
         }
+        --$nr_events unless $timer->[KEEPDEAD];
         $timer->[INDEX] = 0;
         # Last element or beyond...
         if ($i >= $#timers) {
             croak "Not a timer reference" if $i > $#timers;
-            pop(@timers);
+            pop @timers;
             return;
         }
         my $time = $timers[-1][TIME];
@@ -525,10 +618,6 @@ my $CLOCK_TYPE_NAME;
         }
         weaken($timers[$i] = pop @timers);
         $timers[$i][INDEX] = $i;
-    }
-
-    sub DESTROY {
-        shift->delete;
     }
 
     sub timers_collect {
@@ -1041,6 +1130,9 @@ sub DESTROY {
     $icmp->{pid} == $$ || return;
 
     # Avoid recursive calls to activate from starting stuff again
+    # This only stops recursion into ourselves. Other Sender::ICMP can still be
+    # activated, so this is not perfect during LineProtocol object destruction.
+    # Except that we currently do only one Sender::ICMP object per LineProtocol.
     @{$icmp->{out}} = ();
     $icmp->unget($_) for values %{$icmp->{pingers}};
 }
@@ -1737,6 +1829,9 @@ sub reader {
     }
     if ($rc == 0) {
         ::info("Line $line->{id}: Remote EOF. Closing") if $verbose || $debug;
+        # This currently leaves ping forks running even though their sockets are
+        # disconnected. So repeated connects with slow pings can do a processes
+        # DOS attack
         delete $lines{$line->{id}};
         return;
     }
@@ -2191,9 +2286,6 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK);
             ($h, $p, my $socket) = LineProtocol->socket_tcp($host, $port, 1);
             $socket_in = $socket_out = $socket;
         } else {
-            # STDIN control should not keep the event.loop alive
-            Events->fixed(1);
-
             $socket_in  = \*STDIN;
             $socket_in->blocking(0);
             $socket_out = \*STDOUT;
@@ -2213,10 +2305,13 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK);
             writer	=> undef,
             timeout	=> undef,
         }, $class;
-        $control->{reader} = $socket_in->add_read($control, \&reader);
+
+        # STDIN control should not keep the event.loop alive
+        $control->{reader} = @_ >= 3 ?
+            $socket_in->add_read ($control, \&reader) :
+            $socket_in->add_read0($control, \&reader);
         return $control;
     }
-
 
     sub reader {
         my ($control) = @_;
