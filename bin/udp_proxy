@@ -88,6 +88,9 @@ $Data::Dumper::Useqq	= 1;
 $SIG{PIPE} = "IGNORE";
 $SIG{CHLD} = "IGNORE";
 
+delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
+$ENV{PATH}="/usr/bin:/bin";
+
 my $MULTICAST_BEGIN = inet_aton("224.0.0.0") || die "Assertion: Bad address";
 # multicast range *excludes* this END address
 my $MULTICAST_END   = inet_aton("240.0.0.0") || die "Assertion: Bad address";
@@ -132,6 +135,7 @@ my @PING =
 my %settings_global = (
     EPOCH	=> undef,
     MSGHDR	=> undef,
+    READLINE	=> undef,
     TIMEOUT	=> undef,
     KEEPALIVE	=> undef,
     UDP_MAX	=> undef,
@@ -170,8 +174,11 @@ BEGIN {
     # Can't use "require" later on since Socket::MsgHdr has INIT blocks
     $msghdr_error = eval(sprintf(qq(#line %d "%s"\nuse Socket::MsgHdr qw(pack_cmsghdr unpack_cmsghdr sendmsg recvmsg); 1), __LINE__, __FILE__)) ? "" :
         $@ || "Unknown error loading Socket::MsgHdr\n";
-    $msghdr_error =~ s/^BEGIN failed.*\n\z//m if $msghdr_error;
+    $msghdr_error =~ s/^BEGIN failed.*\n\z//m;
 }
+my $readline_error = eval(sprintf(qq(#line %d "%s"\nuse Term::ReadLine; 1), __LINE__, __FILE__)) ? "" :
+        $@ || "Unknown error loading Term::ReadLine\n";
+$readline_error =~ s/^BEGIN failed.*\n\z//m;
 
 END {
     # Carp.pm can stash objects in @DB::args causing them not to get freed
@@ -427,12 +434,38 @@ my $nr_events = 0;
         return bless \$fd, "Events::Error0";
     }
 
+    sub __unloop {
+        no warnings "exiting";
+        last MAINLOOP;
+    }
+
+    my $unloop;
+    sub _unloop {
+        return if $unloop;
+        $unloop = bless {};
+        $unloop->{timer} = Timer::immediate(
+            $unloop,
+            sub {
+                $unloop = undef;
+                no warnings "exiting";
+                last MAINLOOP;
+            });
+    }
+
     sub mainloop {
-        ::info("WARNING (can safely be ignored): $msghdr_error") if
-            $msghdr_error && ($verbose || $debug);
-        ::info("Entering mainloop") if $verbose || $debug;
+        # ::info("WARNING (can safely be ignored): $msghdr_error") if
+        #    $msghdr_error && ($verbose || $debug);
+        ::info("Entering mainloop $$ (nr_events=$nr_events)") if
+            $verbose || $debug;
+        _mainloop();
+        ::info("Exiting mainloop $$ (nr_events=$nr_events)") if
+            $verbose || $debug;
+    }
+
+    sub _mainloop {
         my ($r, $w, $e);
         # my $name;
+      MAINLOOP:
         while ($nr_events) {
             if ((select($r = $read_mask,
                         $w = $write_mask,
@@ -449,7 +482,7 @@ my $nr_events = 0;
                     @read_refs{ grep vec($r, $_, 1), keys %read_refs},
                     @write_refs{grep vec($w, $_, 1), keys %write_refs},
                     @error_refs{grep vec($e, $_, 1), keys %error_refs});
-            } elsif ($! != EINTR) {
+            } elsif ($! == EINTR) {
                 redo;
             } else {
                 die "Select failed: $^E";
@@ -457,7 +490,6 @@ my $nr_events = 0;
         } continue {
             Timer::timers_run();
         }
-        ::info("Exiting mainloop") if $verbose || $debug;
     }
 
     no warnings "once";
@@ -556,7 +588,7 @@ my $CLOCK_TYPE_NAME;
 
     sub immediate {
         # If we ever expose the TIME element we should put clocktime() there
-        my $timer = bless [0, 0, @_];
+        my $timer = bless [0, 0, shift, shift, 0];
         weaken($timer->[OBJ]);
         weaken($immediate[@immediate] = $timer);
         if ($debug) {
@@ -564,6 +596,7 @@ my $CLOCK_TYPE_NAME;
             $timer->[CALLERS] = $callers;
             ::info("add Immediate Timer(0) %08x [%s]", refaddr($timer), $callers);
         }
+        ++$nr_events;
         return $timer;
     }
 
@@ -796,7 +829,7 @@ sub new {
             exec(@{$PING[0]}, $host, @{$PING[1]}) ||
                 die "Could not exec $PING[0][0]: $^E";
         };
-        print $@;
+        print $@ || "Assertion: Pinger ended without error\n";
         _exit(1);
     }
     # Parent
@@ -830,8 +863,8 @@ sub wait : method {
 
     my $pid = $pinger->{pid};
     return if $pinger->{parent} != $$ || !$pid;
-    my $p = waitpid($pid, 0);
     $pinger->{pid} = undef;
+    my $p = waitpid($pid, 0);
     if ($p != $pid) {
         die "Could not wait for pid '$pid'" if $p < 0;
         die "Assertion: Invalid pid result" if $p != $pid;
@@ -984,6 +1017,12 @@ sub write : method {
         $icmp->{timeout} = Timer::timer($icmp->{line}{settings}{TIMEOUT},
                                         $icmp, \&timeout);
     }
+}
+
+sub timeout {
+    my ($icmp) = @_;
+
+    die "Timeout. Could not ICMP send[$icmp->{id}]";
 }
 
 sub writer {
@@ -1195,7 +1234,7 @@ sub new {
 sub timeout {
     my ($sender) = @_;
 
-    die "Timeout. Could not UDP send[$sender->{id}";
+    die "Timeout. Could not UDP send[$sender->{id}]";
 }
 
 sub write : method {
@@ -1600,7 +1639,7 @@ my @FOU;
 sub timeout {
     my ($fou) = @_;
 
-    die "Timeout. Could not FOU send[$fou->{id}";
+    die "Timeout. Could not FOU send[$fou->{id}]";
 }
 
 sub id {
@@ -1672,7 +1711,7 @@ my %lines;
 {
     my $line_ids = Ids->new;
 
-    sub delete_all {
+    sub _delete_all {
         %lines = ();
     }
 
@@ -1702,8 +1741,6 @@ my %lines;
     }
 }
 
-__PACKAGE__->new;
-
 package LineProtocol;
 # Handle traffic between client and server
 use Errno qw(EINTR EAGAIN EWOULDBLOCK EADDRINUSE EPROTONOSUPPORT EACCES);
@@ -1719,7 +1756,8 @@ use constant {
 
 use base qw(LineProtocol0);
 
-my $BASE_TIME = Timer->realtime();
+my $BASE_TIME  = Timer->realtime();
+my $BASE_CLOCK = Timer->clocktime();
 
 my %process_name = (
     $SET		=> "SET",
@@ -2298,140 +2336,408 @@ sub socket_icmp {
 }
 
 package Control;
-use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+use Scalar::Util qw(weaken);
+use Socket qw(PF_UNIX SOCK_STREAM PF_UNSPEC);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK ECONNRESET);
+use POSIX qw(_exit);
+
+my %commands = (
+    help	=> \&help,
+    status	=> \&status,
+);
 
 {
     my %controls;
     my $ids = Ids->new;
 
-    sub free {
+    sub _delete_all {
         %controls = ();
     }
 
     sub new {
-        my ($class, $host, $port) = @_;
+        my ($class, $line, $term_in, $term_out) = @_;
 
-        my ($h, $p, $socket_in, $socket_out);
-        if (@_ >= 3) {
-            ($h, $p, my $socket) = LineProtocol->socket_tcp($host, $port, 1);
-            $socket_in = $socket_out = $socket;
-        } else {
-            $socket_in  = \*STDIN;
-            $socket_in->blocking(0);
-            $socket_out = \*STDOUT;
-            $socket_out->blocking(0);
+        $line || die "Assertion: No line";
+        $term_in  = \*STDIN  if !defined $term_in;
+        $term_out = \*STDOUT if !defined $term_out;
+        # STDIN and/or STDOUT can be $null if the program was called with closed
+        # STDIN and/or STDOUT
+        die "Input is NULL" if fileno($term_in)  == fileno($null);
+        die "Ouput is NULL" if fileno($term_out) == fileno($null);
+
+        socketpair(my $left, my $right, PF_UNIX, SOCK_STREAM, PF_UNSPEC) ||
+            die "Could not create socketpair: $^E";
+        defined(my $pid = fork()) || die "Could not fork: $^E";
+        if ($pid == 0) {
+            # Child
+            eval {
+                close($left) || die "Could not close socketpair: $^E";
+                $right->blocking(0);
+                my $timeout = $line->{settings}{TIMEOUT};
+                $line = undef;
+                ::delete_all();
+                $SIG{CHLD} = "DEFAULT";
+                $term_in ->blocking(0) if fileno($term_in ) == fileno(STDIN );
+                $term_out->blocking(0) if fileno($term_out) == fileno(STDOUT);
+                Controller->run($term_in, $term_out, $right, $timeout);
+            };
+            select STDERR;
+            $| = 1;
+            print $@ || "Assertion: Control ended without error\n";
+            _exit(1);
         }
-
+        # Parent
+        close($right) || die "Could not close socketpair: $^E";
+        $left->blocking(0);
+        # Caller will close STDIN
+        fileno($term_in) == fileno(STDIN) ||
+            close($term_in) || die "Could not close control input: $^E";
+        # Caller is free to keep using STDOUT
+        fileno($term_out) == fileno(STDOUT) ||
+            close($term_out) || die "Could not close control output: $^E";
         my $id = $ids->id_alloc;
         my $control = $controls{$id} = bless {
             id		=> $id,
-            socket_in	=> $socket_in,
-            socket_out	=> $socket_out,
+            line	=> $line,
+            pid		=> $pid,
+            parent	=> $$,
+            socket	=> $left,
             in		=> "",
             out		=> "",
-            host	=> $h,
-            port	=> $p,
             reader	=> undef,
             writer	=> undef,
             timeout	=> undef,
         }, $class;
+        weaken($control->{line});
 
-        # STDIN control should not keep the event.loop alive
-        $control->{reader} = @_ >= 3 ?
-            $socket_in->add_read ($control, \&reader) :
-            $socket_in->add_read0($control, \&reader);
+        # Control does not keep the event loop alive
+        $control->{reader} = $left->add_read0($control, \&reader);
         return $control;
     }
 
     sub reader {
         my ($control) = @_;
 
-        my $rc = $control->{socket_in}->sysread(my $buffer, $BLOCK_SIZE);
+        my $rc = $control->{socket}->sysread(my $buffer, $BLOCK_SIZE);
         if (!defined $rc) {
             return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
-            die "Could not read from control[$control->{id}]: $^E";
+            $! == ECONNRESET ||
+                die "Could not read from control[$control->{id}]: $^E";
+            $rc = 0;
         }
         if ($rc == 0) {
             # EOF
+            ::info("Control EOF") if $debug;
+            $control->wait;
             $ids->id_free($control->{id});
             delete $controls{$control->{id}};
-            $control->{host} || exit(0);
+            ::delete_all();
             return;
         }
+        ::info("Received %d bytes from Controller[%d]: %s",
+               length($buffer), $control->{id}, ::display($buffer)) if $debug;
+
+        die "Cannot have Control input during output" if $control->{out} ne "";
         $control->{in} .= $buffer;
-        return if index($buffer, "\n") < 0;
-        $control->process($1) while $control->{in} =~ s/^(.*)\n//;
+        my $len = ord $control->{in};
+        next if $len < length $control->{in};
+        die sprintf("Assertion: Overlong control message %d > %d", $len, length $control->{in}) if
+            $len > length $control->{in};
+        my @args = unpack("x(w/a*)*", $control->{in});
+        ::info("Control %d: %s", $control->{id}, "@args") if $debug;
+        $control->{in} = "";
+        my $command = shift @args || die "Assertion: No command";
+        my $fun = $commands{$command} ||
+            die "Assertion: Unknown command '$command'";
+        $control->{out} = "xxxx";
+        $fun->($control, @args);
     }
 }
 
-sub help {
-    my ($control) = @_;
-    $control->write(<<"EOF")
-help	Show this help
-EOF
-        ;
-}
-
-my %commands = (
-    help => \&help,
-);
-
-sub process {
-    my $control = shift;
-    my ($command, @args) = split " ", shift or return;
-    return if $command =~ m{^#|^//|^--};
-    eval {
-        my $code = $commands{lc $command} || die "Unknown command '$command'\n";
-        $code->($control, @args);
-    };
-    $control->write($@) if $@;
-}
-
-sub write : method {
-    my $control = shift;
-
-    my $was_empty = $control->{out} eq "";
-    $control->{out} .= join("", @_);
-    if ($was_empty && $control->{out} ne "") {
-        $control->{writer} = $control->{socket_out}->add_write($control, \&writer);
-        $control->{timeout} = Timer::timer($settings_global{TIMEOUT},
-                                           $control, \&timeout);
-    }
-}
-
-sub writer {
+sub flush : method {
     my ($control) = @_;
 
-    while (1) {
-        my $rc = $control->{socket_out}->syswrite($control->{out}, $BLOCK_SIZE);
-        if (!defined $rc) {
-            if ($! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK) {
-                $control->{timeout} ||=
-                    Timer::timer($control->{settings}{TIMEOUT},
-                                 $control, \&timeout);
-                return;
-            }
-            $control->{writer} = undef;
-            die "Could not write to conrol $control->{id}: $^E"
-        }
-        die "Zero write. Is this even possible ?" if $rc == 0;
-        substr($control->{out}, 0, $rc, "");
-        ::info("Wrote %d bytes to control %s (%d left): %s",
-               $rc, $control->{id}, length($control->{out}),
-               ::display($control->{out})) if $debug;
-
-        $control->{timeout} = undef;
-        if ($control->{out} eq "") {
-            $control->{writer} = undef;
-            return;
-        }
-    }
+    "xxxx" eq substr($control->{out}, 0, 4, pack "N", length $control->{out}) ||
+        die "Unexpected Control state";
+    $control->{writer}  = $control->{socket}->add_write($control, \&writer);
+    $control->{timeout} = Timer::timer($control->{line}{settings}{TIMEOUT}, $control, \&timeout);
 }
 
 sub timeout {
     my ($control) = @_;
 
-    die "Timeout. Could not TCP write[$control->{id}";
+    die "Timeout writing to Controller";
+}
+
+sub writer {
+    my ($control) = @_;
+
+    my $rc = $control->{socket}->syswrite($control->{out}, $BLOCK_SIZE);
+    if (!defined $rc) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Could not write to Controller: $^E"
+    }
+    die "Zero write. Is this even possible ?" if $rc == 0;
+    ::info("Wrote %d bytes to Controller[%d] (%d left): %s",
+           $rc, $control->{id}, length($control->{out}) - $rc,
+           ::display(substr($control->{out}, 0, $rc))) if $debug;
+
+    substr($control->{out}, 0, $rc, "");
+    if ($control->{out} eq "") {
+        $control->{writer}  = undef;
+        $control->{timeout} = undef;
+        return;
+    }
+    $control->{timeout} = Timer::timer($control->{line}{settings}{TIMEOUT}, $control, \&timeout);
+}
+
+# We should be able to combine this with Pinger wait()
+sub wait : method {
+    return if defined $SIG{CHLD} && $SIG{CHLD} eq "IGNORE";
+    my ($control) = @_;
+
+    my $pid = $control->{pid};
+    return if $control->{parent} != $$ || !$pid;
+    $control->{pid} = undef;
+    my $p = waitpid($pid, 0);
+    if ($p != $pid) {
+        die "Could not wait for pid '$pid'" if $p < 0;
+        die "Assertion: Invalid pid result" if $p != $pid;
+    }
+    die "Unexpected exitcode $? from Control (pid $pid)" if $?;
+}
+
+sub help {
+    my ($control) = @_;
+
+    $control->{out} .= <<"EOF"
+help	Show this help
+status  Show connections status
+EOF
+        ;
+    $control->flush;
+}
+
+sub status {
+    my ($control) = @_;
+
+    my $line = $control->{line};
+    local $Data::Dumper::Varname = "VAR";
+    my $settings = ::Dumper($line->{settings});
+    $settings =~ s/\$VAR1 = //g || die "Assertion: No VAR1";
+    $settings =~ s/\s+\z//;
+    $settings =~ s/\n/\n    /g;
+    $control->{out} .= <<"EOF"
+Local:
+  LineProtocol0[$line->{id}]
+    Settings: $settings
+EOF
+        ;
+    $control->flush;
+}
+
+package Controller;
+use FindBin qw($Script);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK ECONNRESET);
+use POSIX qw(_exit);
+
+sub run {
+    my ($class, $term_in, $term_out, $socket, $timeout) = @_;
+
+    $debug = $verbose = 0;
+
+    my $controller = bless {
+        term		=> Term::ReadLine->new($Script, $term_in, $term_out) ||
+        die("Could not create Term::ReadLine"),
+        TIMEOUT		=> $timeout,
+        term_in		=> $term_in,
+        term_out	=> $term_out,
+        in_term		=> "",
+        out_term	=> "",
+        reader_term	=> undef,
+        socket		=> $socket,
+        in		=> "",
+        out		=> "",
+        reader		=> undef,
+    }, $class;
+    if ($debug) {
+        my $backend = $controller->{term}->ReadLine;
+        my $backend_version = $backend->VERSION;
+        $backend_version = "unknown" if !defined $backend_version;
+        ::info("ReadLine backend: $backend $backend_version")
+    }
+    $controller->{term}->event_loop(\&Events::_mainloop);
+    $controller->{reader_term} = $term_in->add_read($controller, \&Events::_unloop);
+    $controller->{reader} = $socket->add_read0($controller, \&reader);
+
+    # my $history_file = "$home/.history_$Script";
+    # $controller->{term}->read_history($history_file);
+    eval { $controller->_run };
+    my $err = $@;
+    # $controller->{term}->write_history($history_file);
+    $controller->{term}->rl_deprep_terminal();
+    if ($err) {
+        _exit(0) if $err eq "\n";
+        die $err;
+    }
+}
+
+sub _run {
+    my ($controller) = @_;
+
+    my $prompt = "$Script>";
+    # mainloop();
+    while (1) {
+        defined(my $line = $controller->{term}->readline($prompt)) || die "\n";
+        # Paranoia
+        utf8::downgrade($line);
+
+        my ($command, @args) = split " ", $line or redo;
+        redo if $command =~ m{^#|^//|^--};
+        my $match = $commands{lc $command};
+        if (!$match) {
+            $controller->write_term("Unknown command '$command'\n");
+            next;
+        }
+        $controller->{out} = pack("x(w/a*)*", lc $command, @args);
+        if (length $controller->{out} > 0xff) {
+            $controller->write_term("Command too long\n");
+            next;
+        }
+        $controller->{writer} = $controller->{socket}->add_write($controller, \&writer);
+        $controller->{timeout} = Timer::timer($controller->{TIMEOUT},
+                                              $controller, \&timeout);
+        substr($controller->{out}, 0, 1, pack("C", length $controller->{out}));
+        # If the $controller->{timeout} assignment comes just before the
+        # } continue { the value is somewhow kept alive
+    } continue {
+        $controller->{reader_term} = undef;
+        Events::_mainloop();
+        $controller->{reader_term} = $controller->{term_in}->add_read($controller, \&Events::_unloop);
+    }
+}
+
+sub write_term {
+    my $controller = shift;
+
+    my $was_empty = $controller->{out_term} eq "";
+    $controller->{out_term} .= join("", @_);
+    if ($controller->{out_term} ne "" && $was_empty) {
+        $controller->{writer_term} = $controller->{term_out}->add_write($controller, \&writer_term);
+        $controller->{timeout_term} = Timer::timer($controller->{TIMEOUT},
+                                                   $controller, \&timeout_term);
+    }
+}
+
+sub writer_term {
+    my ($controller) = @_;
+
+    my $rc = $controller->{term_out}->syswrite($controller->{out_term}, $BLOCK_SIZE);
+    if (!defined $rc) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        die "Could not write to Terminal: $^E"
+    }
+    die "Zero write. Is this even possible ?" if $rc == 0;
+    ::info("Wrote %d bytes to Terminal (%d left): %s",
+           $rc, length($controller->{out_term}) - $rc,
+           ::display(substr($controller->{out_term}, 0, $rc))) if $debug;
+
+    substr($controller->{out_term}, 0, $rc, "");
+    if ($controller->{out_term} eq "") {
+        $controller->{writer_term}  = undef;
+        $controller->{timeout_term} = undef;
+        return;
+    }
+    $controller->{timeout_term} = Timer::timer($controller->{TIMEOUT},
+                                               $controller, \&timeout_term);
+}
+
+sub reader {
+    my ($controller) = @_;
+
+    my $rc = $controller->{socket}->sysread(my $buffer, $BLOCK_SIZE);
+    if (!defined $rc) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        $! == ECONNRESET ||
+            die "Could not read from control[$controller->{id}]: $^E";
+        $rc = 0;
+    }
+    if ($rc == 0) {
+        # EOF
+        ::info("Controller EOF") if $debug;
+        die "\n";
+    }
+    die "Cannot have Controller input during output" if $controller->{out} ne "";
+    ::info("Received %d bytes from Control: %s",
+           length($buffer), ::display($buffer)) if $debug;
+    $controller->{in} .= $buffer;
+    if (length $controller->{in} < 4) {
+        $controller->{timeout} =
+            Timer::timer($controller->{TIMEOUT}, $controller, \&timeout);
+        return;
+    }
+    my $length = unpack("N", $controller->{in}) ||
+        die "Assertion: Zero length not supported";
+    if ($length < length $controller->{in}) {
+        $controller->{timeout} =
+            Timer::timer($controller->{TIMEOUT}, $controller, \&timeout);
+        return;
+    }
+    $length == length $controller->{in} ||
+        die sprintf("Assertion: Overlong Controller message %d > %d",
+                    $length, length $controller->{in});
+    substr($controller->{in}, 0, 4, "");
+    $controller->write_term($controller->{in});
+
+    $controller->{in} = "";
+    $controller->{timeout} = undef;
+    # Return to background reading
+    $controller->{reader}  = undef;
+    $controller->{reader}  =
+        $controller->{socket}->add_read0($controller, \&reader);
+}
+
+sub writer {
+    my ($controller) = @_;
+
+    my $rc = $controller->{socket}->syswrite($controller->{out}, $BLOCK_SIZE);
+    if (!defined $rc) {
+        return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
+        $! == ECONNRESET || die "Could not write to Control: $^E";
+        $rc = 0;
+    }
+    die "Zero write. Is this even possible ?" if $rc == 0;
+    ::info("Wrote %d bytes to Control (%d left): %s",
+           $rc, length($controller->{out}) - $rc,
+           ::display(substr($controller->{out}, 0, $rc))) if $debug;
+
+    substr($controller->{out}, 0, $rc, "");
+    if ($controller->{out} eq "") {
+        $controller->{writer}  = undef;
+        $controller->{timeout} = undef;
+        # Now the answer from Control becomes mandatory
+        # Maybe we should also have a timeout
+        $controller->{reader} = undef;
+        $controller->{reader} =
+            $controller->{socket}->add_read($controller, \&reader);
+        $controller->{timeout} =
+            Timer::timer($controller->{TIMEOUT}, $controller, \&timeout);
+        return;
+    }
+    $controller->{timeout} =
+        Timer::timer($controller->{TIMEOUT}, $controller, \&timeout);
+}
+
+sub timeout_term {
+    my ($controller) = @_;
+
+    die "Timeout writing to Terminal";
+}
+
+sub timeout {
+    my ($controller) = @_;
+
+    die "Timeout communicating with Control";
 }
 
 package Listener;
@@ -2442,7 +2748,7 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK);
     my %listeners;
     my $listen_ids = Ids->new;
 
-    sub delete_all {
+    sub _delete_all {
         %listeners = ();
     }
 
@@ -2567,10 +2873,17 @@ sub display {
     return $data;
 }
 
+sub delete_all {
+    LineProtocol->_delete_all;
+    Listener->_delete_all;
+    Control->_delete_all;
+    $global_timeout = undef;
+    die "Assertion: Still have events" if $nr_events;
+}
+
 sub global_timeout {
     ::info("Global timeout");
-    LineProtocol->delete_all;
-    Listener->delete_all;
+    delete_all();
     $exit = 1;
     # The cleanup of the globals above should be enough to fall off mainloop
     # exit $exit;
@@ -2602,6 +2915,8 @@ sub client {
                 $line->set_peer($name => $BASE_TIME);
             } elsif ($name eq "MSGHDR") {
                 $line->set_peer($name => $msghdr_error || Socket::MsgHdr->VERSION);
+            } elsif ($name eq "READLINE") {
+                $line->set_peer($name => $readline_error || Term::ReadLine->VERSION);
             } else {
                 $line->set_peer($name => $line->{settings}{$name});
             }
@@ -2625,7 +2940,9 @@ sub server {
     eval {
         $line = LineProtocol->new($socket_in, $socket_out);
 
-        $line->set_peer(EPOCH => $BASE_TIME);
+        $line->set_peer(EPOCH	 => $BASE_TIME);
+        $line->set_peer(MSGHDR	 => $msghdr_error || Socket::MsgHdr->VERSION);
+        $line->set_peer(READLINE => $readline_error || Term::ReadLine->VERSION);
     };
     die "\u$role: $@" if $@;
     return $line;
@@ -2685,6 +3002,9 @@ $settings_global{PING_MAX} = $ping_max;
 die "global timeout must not be negative" if
     defined $global_timeout && $global_timeout < 0;
 
+# We can create the fallback line now that %settings_global has been filled
+LineProtocol0->new;
+
 $role = "server" if defined $server;
 $role_peer = $role eq "server" ? "client" : "server";
 
@@ -2700,11 +3020,11 @@ if ($role eq "server") {
         my $host = $server =~ s{(.*):}{}s ? $1 : $default_local_bind;
         $server = "0" if $server eq "";
         Listener->new($host, $server, $loops);
-        if ($no_control) {
-            open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
-        } else {
-            Control->new;
+        if (!$no_control) {
+            Control->new($lines{1});
+            $| = 1;
         }
+        open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
     } else {
         # Make sure that if we fork/exec things they won't get access to
         # our communication channel
@@ -2782,6 +3102,7 @@ if ($role eq "server") {
 
         if ($stuff) {
             my $self = "$Bin/$Script";
+            # Maybe we could get the same info through DATA (if we didn't close)
             open(my $fh, "<", $self) || die "Could not open $self: $^E";
             my $content = qq(#line 1 "$Bin/$Script"\n);
             $content .= do { local $/; <$fh> };
@@ -2790,7 +3111,7 @@ if ($role eq "server") {
             # Leave the \n so line numbers in error messages keep working
             $content =~ s/^[^\S\n]*#(?![^\S\n]*line\s).*//mg;
             # Drop leading spaces. Saves about 20%
-            # (less of course if the ssh does compression, as it does by default)
+            # (less of course if ssh does compression, which it does by default)
             $content =~ s/^[^\S\n]+//mg;
 
             # Change a few variables in the server code
@@ -2812,7 +3133,7 @@ if ($role eq "server") {
                 $value = Dumper($value);
                 $value =~ s/\$\Q$name\E1\b/\$$name/g ||
                     die "Assertion: No VAR1";
-                info("Value=<$value>") if $verbose;
+                # info("Value=<$value>") if $verbose;
                 $content =~ s{^([^\S\n]*(?:my|our)\s*)\$\Q$name\E\s*=[^;\n]*;[^\S\n]*\n}{$1$value\n}m || die "Could not set $name";
             }
 
@@ -2838,11 +3159,11 @@ if ($role eq "server") {
         }
         client($rd1, $wr0, \@udp_local, \@udp_remote);
     }
-    if ($no_control) {
-        open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
-    } else {
-        Control->new;
+    if (!$no_control) {
+        Control->new($lines{1});
+        $| = 1;
     }
+    open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
 }
 
 if (defined $global_timeout) {
@@ -2855,8 +3176,7 @@ if (defined $global_timeout) {
 }
 
 eval { Events->mainloop() };
-LineProtocol->delete_all;
-Listener->delete_all;
+delete_all();
 die "\u$role DIED: $@" if $@;
 # die "Assertion: \u$role fell off the mainloop";
 exit $exit;
