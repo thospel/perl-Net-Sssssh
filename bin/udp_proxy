@@ -111,8 +111,10 @@ my $timeout = 120;
 my $keepalive = 300;
 my $udp_max = 10;
 my $ping_max = 10;
+my $global_timeout = undef;
 my $default_local_bind  = "127.0.0.1";
 my $default_remote_bind = "127.0.0.1";
+my $exit = 0;
 
 # How long a server UDP socket lingers without traffic
 # How long an errored TCP connection tries to push lingering output
@@ -198,8 +200,7 @@ if (!$msghdr_error) {
 }
 
 my $msghdr = $msghdr_error ? undef : Socket::MsgHdr->new();
-my (%lines, $loops);
-my $line_ids = Ids->new;
+my $loops;
 
 my $role = "client";
 my $role_peer;
@@ -511,10 +512,10 @@ my $CLOCK_TYPE_NAME;
             my $d = $debug;
             $debug = 0;
             my $timer = timer(@_);
+            $debug = $d;
             my $callers = ::callers();
             $timer->[CALLERS] = $callers;
             ::info("add Timer(%s) %08x [%s]", $_[0], refaddr($timer), $callers);
-            $debug = $d;
             return $timer;
         }
         my $time = shift() + clocktime();
@@ -523,7 +524,7 @@ my $CLOCK_TYPE_NAME;
             weaken($timers[$i] = $timers[$i >> 1]);
             $i = ($timers[$i][INDEX] = $i) >> 1;
         }
-        my $timer = bless [$i, $time, @_];
+        my $timer = bless [$i, $time, shift, shift, 0];
         weaken($timer->[OBJ]);
         weaken($timers[$i] = $timer);
         ++$nr_events;
@@ -531,9 +532,25 @@ my $CLOCK_TYPE_NAME;
     }
 
     sub timer0 {
-        my $timer = timer(@_);
-        $timer->[KEEPDEAD] = 1;
-        --$nr_events;
+        if ($debug) {
+            my $d = $debug;
+            $debug = 0;
+            my $timer = timer(@_);
+            $debug = $d;
+            my $callers = ::callers();
+            $timer->[CALLERS] = $callers;
+            ::info("add0 Timer(%s) %08x [%s]", $_[0], refaddr($timer), $callers);
+            return $timer;
+        }
+        my $time = shift() + clocktime();
+        my $i = @timers;
+        while ($i > 1 && $time < $timers[$i >> 1][TIME]) {
+            weaken($timers[$i] = $timers[$i >> 1]);
+            $i = ($timers[$i][INDEX] = $i) >> 1;
+        }
+        my $timer = bless [$i, $time, shift, shift, 1];
+        weaken($timer->[OBJ]);
+        weaken($timers[$i] = $timer);
         return $timer;
     }
 
@@ -683,7 +700,10 @@ my $CLOCK_TYPE_NAME;
         my $fun;
 
         # Using while instead of for in case a callback dies
-        ($fun = shift @expired) && $fun->[OBJ] && $fun->[CODE]->($fun->[OBJ]) while @expired;
+        ($fun = shift @expired and
+         $fun->[KEEPDEAD]++ || $nr_events-- and
+         $fun->[OBJ] and
+         $fun->[CODE]->($fun->[OBJ])) while @expired;
     }
 }
 
@@ -1648,31 +1668,41 @@ sub writer {
 package LineProtocol0;
 use base qw(Ids);
 
-my $LINE = __PACKAGE__->new;
-sub new {
-    my ($class) = @_;
+my %lines;
+{
+    my $line_ids = Ids->new;
 
-    my $line = bless {
-        id		=> $line_ids->id_alloc,
-        started		=> undef,	# Normal operations started
-        utime_offset	=> 0,	# Estimated round trip time in microsecond
-        keepalive	=> undef,
-        timeout		=> undef,
-        settings	=> { %settings_global },
-        listeners	=> {},
-        map_udp		=> {},
-        seqno_echo	=> 0,
-        sockets_udp	=> {},
-        sockets_icmp	=> {},
-    }, $class;
-    $line->id_init;
+    sub delete_all {
+        %lines = ();
+    }
 
-    return $lines{$line->{id}} = $line;
+    sub new {
+        my ($class) = @_;
+
+        my $line = bless {
+            id			=> $line_ids->id_alloc,
+            started		=> undef, # Normal operations started
+            utime_offset	=> 0, # Estimated round trip time in microsecond
+            keepalive		=> undef,
+            timeout		=> undef,
+            settings		=> { %settings_global },
+            listeners		=> {},
+            map_udp		=> {},
+            seqno_echo		=> 0,
+            sockets_udp		=> {},
+            sockets_icmp	=> {},
+        }, $class;
+        $line->id_init;
+
+        return $lines{$line->{id}} = $line;
+    }
+
+    sub DESTROY {
+        $line_ids->id_free(shift->{id});
+    }
 }
 
-sub DESTROY {
-    $line_ids->id_free(shift->{id});
-}
+__PACKAGE__->new;
 
 package LineProtocol;
 # Handle traffic between client and server
@@ -1934,7 +1964,7 @@ sub process_UDP_REMOTE {
     my $to_host   = $to_port   =~ s{(.*):}{}s ? $1 :
         $default_local_bind;
 
-    my $l = $separator eq "%" ? $line : $LINE;
+    my $l = $separator eq "%" ? $line : $lines{1};
     my $fou = Fou::UDP->new($to_host, $to_port);
     my $listener = Listener::UDP->new($l, $from_host, $from_port, $fou);
 }
@@ -2412,6 +2442,10 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK);
     my %listeners;
     my $listen_ids = Ids->new;
 
+    sub delete_all {
+        %listeners = ();
+    }
+
     sub new {
         my ($class, $host, $port, $loops) = @_;
 
@@ -2533,6 +2567,15 @@ sub display {
     return $data;
 }
 
+sub global_timeout {
+    ::info("Global timeout");
+    LineProtocol->delete_all;
+    Listener->delete_all;
+    $exit = 1;
+    # The cleanup of the globals above should be enough to fall off mainloop
+    # exit $exit;
+}
+
 sub client {
     my ($socket_in, $socket_out, $udp_locals, $udp_remotes) = @_;
 
@@ -2549,7 +2592,7 @@ sub client {
             $from_host = "0.0.0.0" if $from_host eq "" || $from_host eq "*";
             my $to_host   = $to_port   =~ s{(.*):}{}s ? $1 :
                 $default_local_bind;
-            my $l = $separator eq "%" ? $line : $LINE;
+            my $l = $separator eq "%" ? $line : $lines{1};
             my $fou = Fou::UDP->new($to_host, $to_port);
             my $listener = Listener::UDP->new($l, $from_host, $from_port, $fou);
         }
@@ -2591,6 +2634,7 @@ sub server {
 GetOptions("server:s"		=> \my $server,
            "client=s"		=> \my $client,
            "N|loops=o"		=> \$loops,
+           "T=o"		=> \$global_timeout,
            "n!"			=> \my $no_control,
            "server_lib=s"	=> \my @server_lib,
            "ssh=s"		=> \$ssh,
@@ -2638,6 +2682,8 @@ die "udp_max must be positive" if $udp_max < 1;
 $settings_global{UDP_MAX} = $udp_max;
 die "ping_max must be positive" if $ping_max < 1;
 $settings_global{PING_MAX} = $ping_max;
+die "global timeout must not be negative" if
+    defined $global_timeout && $global_timeout < 0;
 
 $role = "server" if defined $server;
 $role_peer = $role eq "server" ? "client" : "server";
@@ -2669,7 +2715,6 @@ if ($role eq "server") {
         server($socket_in, $socket_out);
     }
 } else {
-
     # From here on we are the client
 
     $verbose        = $debug        if $debug        && !defined $verbose;
@@ -2758,14 +2803,16 @@ if ($role eq "server") {
                  # global settings
                  timeout	=> $timeout,
                  ping_max	=> $ping_max,
+                 global_timeout	=> $global_timeout,
              );
             while (my ($name, $value) = each %replace) {
                 local $Data::Dumper::Indent  = 0;
                 local $Data::Dumper::Purity  = 1;
                 local $Data::Dumper::Varname = $name;
                 $value = Dumper($value);
-                $value =~ s/\$\Q$name\E1\b/\$$name/g || die "Assertion: No VAR1";
-                # info("Value=<$value>") if $verbose;
+                $value =~ s/\$\Q$name\E1\b/\$$name/g ||
+                    die "Assertion: No VAR1";
+                info("Value=<$value>") if $verbose;
                 $content =~ s{^([^\S\n]*(?:my|our)\s*)\$\Q$name\E\s*=[^;\n]*;[^\S\n]*\n}{$1$value\n}m || die "Could not set $name";
             }
 
@@ -2798,10 +2845,21 @@ if ($role eq "server") {
     }
 }
 
+if (defined $global_timeout) {
+    my $obj = bless {
+        global_timeout	=> $global_timeout,
+    };
+    $obj->{timeout} = Timer::timer0($global_timeout, $obj, \&global_timeout);
+    alarm($global_timeout+3);
+    $global_timeout = $obj;
+}
+
 eval { Events->mainloop() };
-%lines = ();
+LineProtocol->delete_all;
+Listener->delete_all;
 die "\u$role DIED: $@" if $@;
 # die "Assertion: \u$role fell off the mainloop";
+exit $exit;
 
 __END__
 Implementation notes:

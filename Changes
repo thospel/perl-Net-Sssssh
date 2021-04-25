@@ -1,5 +1,5 @@
 Revision history for Perl extension Net::Sssssh.
 
-1.000	2021-04-24 21:02:58 UT
+1.000	2021-04-25 09:54:54 UT
 	- original version; created by h2xs 1.23 with options
 		-X -n Net::Sssssh
