@@ -154,6 +154,7 @@ my $SECRET = pack("NNNN", $$ ^ rand 2**32, $^T ^ rand 2**32, rand 2**32, rand 2*
 
 my $STUFFED = "GoNow";
 
+my $PROTOCOL	= 1;
 # Line protocol commands
 my $START	= "1";
 my $SET		= "S";	# sets a server variable
@@ -175,10 +176,13 @@ BEGIN {
     $msghdr_error = eval(sprintf(qq(#line %d "%s"\nuse Socket::MsgHdr qw(pack_cmsghdr unpack_cmsghdr sendmsg recvmsg); 1), __LINE__, __FILE__)) ? "" :
         $@ || "Unknown error loading Socket::MsgHdr\n";
     $msghdr_error =~ s/^BEGIN failed.*\n\z//m;
+    $msghdr_error =~ s/\s+\z//;
+
 }
 my $readline_error = eval(sprintf(qq(#line %d "%s"\nuse Term::ReadLine; 1), __LINE__, __FILE__)) ? "" :
         $@ || "Unknown error loading Term::ReadLine\n";
 $readline_error =~ s/^BEGIN failed.*\n\z//m;
+$readline_error =~ s/\s+\z//;
 
 END {
     # Carp.pm can stash objects in @DB::args causing them not to get freed
@@ -875,7 +879,7 @@ sub wait : method {
 sub exec_reader {
     my ($pinger) = @_;
 
-    my $rc = $pinger->{exec_fh}->sysread(my $buffer, $BLOCK_SIZE);
+    my $rc = sysread($pinger->{exec_fh}, my $buffer, $BLOCK_SIZE);
     if (!defined $rc) {
         # Error
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
@@ -901,7 +905,7 @@ sub exec_reader {
 sub reader {
     my ($pinger) = @_;
 
-    my $rc = $pinger->{handle}->sysread(my $buffer, $BLOCK_SIZE);
+    my $rc = sysread($pinger->{handle}, my $buffer, $BLOCK_SIZE);
     if (!defined $rc) {
         # Error
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
@@ -1391,7 +1395,7 @@ sub id {
 sub reader {
     my ($listener) = @_;
 
-    my $rc = $listener->{socket}->sysread(my $buffer, $UDP_SIZE);
+    my $rc = sysread($listener->{socket}, my $buffer, $UDP_SIZE);
     if (!defined $rc) {
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
         die "Could not read from listening $role UDP socket: $^E";
@@ -1850,7 +1854,7 @@ sub writer {
     my ($line) = @_;
 
     while (1) {
-        my $rc = $line->{socket_out}->syswrite($line->{out}, $BLOCK_SIZE, $line->{out_sent});
+        my $rc = syswrite($line->{socket_out}, $line->{out}, $BLOCK_SIZE, $line->{out_sent});
         if (!defined $rc) {
             if ($! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK) {
                 $line->{timeout} ||= Timer::timer($line->{settings}{TIMEOUT},
@@ -1917,7 +1921,7 @@ sub write : method {
 sub reader {
     my ($line) = @_;
 
-    my $rc = $line->{socket_in}->sysread($line->{in}, $BLOCK_SIZE, length($line->{in}));
+    my $rc = sysread($line->{socket_in}, $line->{in}, $BLOCK_SIZE, length($line->{in}));
     if (!defined $rc) {
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
         die "Could not read from $role_peer: $^E"
@@ -2365,6 +2369,7 @@ sub socket_icmp {
 }
 
 package Control;
+# Communicate with a Controller process
 use Scalar::Util qw(weaken);
 use Socket qw(PF_UNIX SOCK_STREAM PF_UNSPEC);
 use Errno qw(EINTR EAGAIN EWOULDBLOCK ECONNRESET);
@@ -2408,9 +2413,19 @@ my %commands = (
                 $line = undef;
                 ::_cleanup_all();
                 $SIG{CHLD} = "DEFAULT";
-                $term_in ->blocking(0) if fileno($term_in ) == fileno(STDIN );
-                $term_out->blocking(0) if fileno($term_out) == fileno(STDOUT);
-                Controller->run($term_in, $term_out, $right, $timeout);
+                if (fileno($term_in) != fileno(STDIN)) {
+                    open(STDIN, "<&", $term_in) ||
+                        die "Could not dup Terminal to STDIN: $^E";
+                    close($term_in) || die "Could not close Terminal in: $^E";
+                }
+                STDIN->blocking(0);
+                if (fileno($term_out) != fileno(STDOUT)) {
+                    open(STDOUT, ">&", $term_out) ||
+                        die "Could not dup Terminal to STDOU: $^E";
+                    close($term_out) || die "Could not close Terminal out: $^E";
+                }
+                STDOUT->blocking(0);
+                Controller->run($right, $timeout);
             };
             select STDERR;
             $| = 1;
@@ -2449,7 +2464,7 @@ my %commands = (
     sub reader {
         my ($control) = @_;
 
-        my $rc = $control->{socket}->sysread(my $buffer, $BLOCK_SIZE);
+        my $rc = sysread($control->{socket}, my $buffer, $BLOCK_SIZE);
         if (!defined $rc) {
             return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
             $! == ECONNRESET ||
@@ -2503,7 +2518,7 @@ sub timeout {
 sub writer {
     my ($control) = @_;
 
-    my $rc = $control->{socket}->syswrite($control->{out}, $BLOCK_SIZE);
+    my $rc = syswrite($control->{socket}, $control->{out}, $BLOCK_SIZE);
     if (!defined $rc) {
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
         die "Could not write to Controller: $^E"
@@ -2554,8 +2569,25 @@ EOF
 sub command_status {
     my ($control) = @_;
 
+    my $msghdr = $msghdr_error || Socket::MsgHdr->VERSION;
+    my $readline = $readline_error || Term::ReadLine->VERSION;
+
     $control->{out} .= <<"EOF"
 Local:
+  Script $::Script
+  VERSION $VERSION
+  PROTOCOL $PROTOCOL
+  Socket::MsgHdr $msghdr
+  Term::Readline $readline
+EOF
+        ;
+    if (!$readline_error) {
+        my $backend = Term::ReadLine->ReadLine;
+        my $backend_version = $backend->VERSION;
+        $backend_version = "unknown" if !defined $backend_version;
+        $control->{out} .= "    $backend $backend_version\n";
+    }
+    $control->{out} .= <<"EOF"
   debug=$debug
   verbose=$verbose
 EOF
@@ -2593,21 +2625,20 @@ sub command_finish {
 }
 
 package Controller;
+# An extra process that holds the Term::Readline loop
 use FindBin qw($Script);
 use Errno qw(EINTR EAGAIN EWOULDBLOCK ECONNRESET);
 use POSIX qw(_exit);
 
 sub run {
-    my ($class, $term_in, $term_out, $socket, $timeout) = @_;
+    my ($class, $socket, $timeout) = @_;
 
     $debug = $verbose = 0;
 
     my $controller = bless {
-        term		=> Term::ReadLine->new($Script, $term_in, $term_out) ||
+        term		=> Term::ReadLine->new($Script, \*STDIN, \*STDOUT) ||
         die("Could not create Term::ReadLine"),
         TIMEOUT		=> $timeout,
-        term_in		=> $term_in,
-        term_out	=> $term_out,
         in_term		=> "",
         out_term	=> "",
         reader_term	=> undef,
@@ -2616,27 +2647,25 @@ sub run {
         out		=> "",
         reader		=> undef,
     }, $class;
-    if ($debug) {
-        my $backend = $controller->{term}->ReadLine;
-        my $backend_version = $backend->VERSION;
-        $backend_version = "unknown" if !defined $backend_version;
-        ::info("ReadLine backend: $backend $backend_version")
-    }
     $controller->{term}->event_loop(\&Events::_mainloop);
-    $controller->{reader_term} = $term_in->add_read($controller, \&Events::_unloop);
+    $controller->{reader_term} = STDIN->add_read($controller, \&Events::_unloop);
     $controller->{reader} = $socket->add_read0($controller, \&reader);
 
     # my $history_file = "$home/.history_$Script";
     # $controller->{term}->read_history($history_file);
     eval { $controller->_run };
-    my $err = $@;
+    my $err = $@ || "\n";
     # $controller->{term}->write_history($history_file);
-    # $controller->{term}->rl_deprep_terminal();
-    delete $controller->{term};
-    if ($err) {
-        _exit(0) if $err eq "\n";
-        die $err;
+    if ($controller->{term}->ReadLine eq "Term::ReadLine::Gnu") {
+        $controller->{term}->rl_deprep_terminal();
+    } else {
+        ::info("End");
+        # Term::ReadLine::Gnu already adds a newline
+        syswrite(STDOUT, "\n");
     }
+    delete $controller->{term};
+    _exit(0) if $err eq "\n";
+    die $err;
 }
 
 sub _run {
@@ -2670,7 +2699,7 @@ sub _run {
     } continue {
         $controller->{reader_term} = undef;
         Events::_mainloop();
-        $controller->{reader_term} = $controller->{term_in}->add_read($controller, \&Events::_unloop);
+        $controller->{reader_term} = STDIN->add_read($controller, \&Events::_unloop);
     }
 }
 
@@ -2680,7 +2709,7 @@ sub write_term {
     my $was_empty = $controller->{out_term} eq "";
     $controller->{out_term} .= join("", @_);
     if ($controller->{out_term} ne "" && $was_empty) {
-        $controller->{writer_term} = $controller->{term_out}->add_write($controller, \&writer_term);
+        $controller->{writer_term} = STDOUT->add_write($controller, \&writer_term);
         $controller->{timeout_term} = Timer::timer($controller->{TIMEOUT},
                                                    $controller, \&timeout_term);
     }
@@ -2689,7 +2718,7 @@ sub write_term {
 sub writer_term {
     my ($controller) = @_;
 
-    my $rc = $controller->{term_out}->syswrite($controller->{out_term}, $BLOCK_SIZE);
+    my $rc = syswrite(STDOUT, $controller->{out_term}, $BLOCK_SIZE);
     if (!defined $rc) {
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
         die "Could not write to Terminal: $^E"
@@ -2712,7 +2741,7 @@ sub writer_term {
 sub reader {
     my ($controller) = @_;
 
-    my $rc = $controller->{socket}->sysread(my $buffer, $BLOCK_SIZE);
+    my $rc = sysread($controller->{socket}, my $buffer, $BLOCK_SIZE);
     if (!defined $rc) {
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
         $! == ECONNRESET ||
@@ -2758,7 +2787,7 @@ sub reader {
 sub writer {
     my ($controller) = @_;
 
-    my $rc = $controller->{socket}->syswrite($controller->{out}, $BLOCK_SIZE);
+    my $rc = syswrite($controller->{socket}, $controller->{out}, $BLOCK_SIZE);
     if (!defined $rc) {
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
         $! == ECONNRESET || die "Could not write to Control: $^E";
