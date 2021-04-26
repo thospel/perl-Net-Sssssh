@@ -108,7 +108,7 @@ my $ICMP_ECHO_REQUEST = 8;
 my $ICMP_ECHO_REPLY = 0;
 
 my $ssh = "/usr/bin/ssh";
-my $verbose = undef;
+my $verbose = 0;
 my $debug   = 0;
 my $timeout = 120;
 my $keepalive = 300;
@@ -1711,7 +1711,7 @@ my %lines;
 {
     my $line_ids = Ids->new;
 
-    sub _delete_all {
+    sub _cleanup_all {
         %lines = ();
     }
 
@@ -1739,6 +1739,33 @@ my %lines;
     sub DESTROY {
         $line_ids->id_free(shift->{id});
     }
+}
+
+sub status_all {
+    my ($class, $control, $indent) = @_;
+
+    $control->{out} .= "${indent}Lines\n";
+    $indent .= "  ";
+    for my $id (sort {$a <=> $b} keys %lines) {
+        $lines{$id}->status($control, $indent);
+    }
+}
+
+sub status {
+    my ($line, $control, $indent) = @_;
+
+    #local $Data::Dumper::Varname = "VAR";
+    #my $settings = ::Dumper($line->{settings});
+    #$settings =~ s/\$VAR1 = //g || die "Assertion: No VAR1";
+    #$settings =~ s/\s+\z//;
+    my $settings = ::string_from_value($line->{settings});
+    $settings =~ s/\n/\n$indent  /g;
+
+    $control->{out} .= <<"EOF"
+${indent}LineProtocol[$line->{id}]
+${indent}  Settings: $settings
+EOF
+        ;
 }
 
 package LineProtocol;
@@ -1960,8 +1987,10 @@ sub process_START {
     if ($role eq "server") {
         $line->write($START, $ready);
     }
-    ::info($ready);
-    print STDERR "\n";
+    if ($verbose || $debug) {
+        ::info($ready);
+        print STDERR "\n";
+    }
 }
 
 sub process_KEEP {
@@ -2342,15 +2371,17 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK ECONNRESET);
 use POSIX qw(_exit);
 
 my %commands = (
-    help	=> \&help,
-    status	=> \&status,
+    help	=> \&command_help,
+    status	=> \&command_status,
+    set		=> \&command_set,
+    finish	=> \&command_finish,
 );
 
 {
     my %controls;
     my $ids = Ids->new;
 
-    sub _delete_all {
+    sub _cleanup_all {
         %controls = ();
     }
 
@@ -2375,7 +2406,7 @@ my %commands = (
                 $right->blocking(0);
                 my $timeout = $line->{settings}{TIMEOUT};
                 $line = undef;
-                ::delete_all();
+                ::_cleanup_all();
                 $SIG{CHLD} = "DEFAULT";
                 $term_in ->blocking(0) if fileno($term_in ) == fileno(STDIN );
                 $term_out->blocking(0) if fileno($term_out) == fileno(STDOUT);
@@ -2431,7 +2462,7 @@ my %commands = (
             $control->wait;
             $ids->id_free($control->{id});
             delete $controls{$control->{id}};
-            ::delete_all();
+            ::cleanup_all();
             return;
         }
         ::info("Received %d bytes from Controller[%d]: %s",
@@ -2507,33 +2538,58 @@ sub wait : method {
     die "Unexpected exitcode $? from Control (pid $pid)" if $?;
 }
 
-sub help {
+sub command_help {
     my ($control) = @_;
 
     $control->{out} .= <<"EOF"
-help	Show this help
-status  Show connections status
+finish             End the program
+help	           Show this help
+set {var=value}    Set variables
+status             Show connections status
 EOF
         ;
     $control->flush;
 }
 
-sub status {
+sub command_status {
     my ($control) = @_;
 
-    my $line = $control->{line};
-    local $Data::Dumper::Varname = "VAR";
-    my $settings = ::Dumper($line->{settings});
-    $settings =~ s/\$VAR1 = //g || die "Assertion: No VAR1";
-    $settings =~ s/\s+\z//;
-    $settings =~ s/\n/\n    /g;
     $control->{out} .= <<"EOF"
 Local:
-  LineProtocol0[$line->{id}]
-    Settings: $settings
+  debug=$debug
+  verbose=$verbose
 EOF
         ;
+    LineProtocol->status_all($control, "  ");
     $control->flush;
+}
+
+sub command_set {
+    my $control = shift;
+
+    if (@_) {
+        for my $arg (@_) {
+            if ($arg =~ /^verbose=([01])\z/) {
+                $verbose = $1;
+            } elsif ($arg =~ /^debug=([01])\z/) {
+                $debug   = $1;
+            } else {
+                $control->{out} .= "Invalid $arg\n";
+            }
+        }
+        $control->{out} .= "Done";
+    } else {
+        $control->{out} .= "Missing arguments";
+    }
+    $control->flush;
+}
+
+sub command_finish {
+    my $control = shift;
+
+    $control->{out} .= "OK";
+    $control->flush;
+    ::cleanup_all();
 }
 
 package Controller;
@@ -2575,7 +2631,8 @@ sub run {
     eval { $controller->_run };
     my $err = $@;
     # $controller->{term}->write_history($history_file);
-    $controller->{term}->rl_deprep_terminal();
+    # $controller->{term}->rl_deprep_terminal();
+    delete $controller->{term};
     if ($err) {
         _exit(0) if $err eq "\n";
         die $err;
@@ -2687,6 +2744,7 @@ sub reader {
         die sprintf("Assertion: Overlong Controller message %d > %d",
                     $length, length $controller->{in});
     substr($controller->{in}, 0, 4, "");
+    $controller->{in} .= "\n" unless $controller->{in} =~ /\n\z/;
     $controller->write_term($controller->{in});
 
     $controller->{in} = "";
@@ -2748,7 +2806,7 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK);
     my %listeners;
     my $listen_ids = Ids->new;
 
-    sub _delete_all {
+    sub _cleanup_all {
         %listeners = ();
     }
 
@@ -2873,17 +2931,45 @@ sub display {
     return $data;
 }
 
-sub delete_all {
-    LineProtocol->_delete_all;
-    Listener->_delete_all;
-    Control->_delete_all;
+sub string_from_value {
+    # local $Data::Dumper::Varname  = "VAR";
+    local $Data::Dumper::Trailingcomma = 0;
+    local $Data::Dumper::Terse = 1;
+    local $Data::Dumper::Quotekeys = 0;
+    local $Data::Dumper::Sparseseen = 1;
+    my $value = Dumper(shift);
+    $value =~ s/\s+\z//;
+    return $value;
+}
+
+sub deleting {
     $global_timeout = undef;
-    die "Assertion: Still have events" if $nr_events;
+    die "Assertion: Still have $nr_events events" if $nr_events;
+}
+
+# Clean up all events and wait until the next loop in mainloop to exit
+# (needed to give references in the callchain to get freed)
+sub cleanup_all {
+    LineProtocol->_cleanup_all;
+    Listener->_cleanup_all;
+    Control->_cleanup_all;
+
+    $global_timeout = {};
+    $global_timeout->{timeout} = Timer::immediate($global_timeout, \&deleting);
+}
+
+# Try an immediate exit. No references should exist in the callchain
+sub _cleanup_all {
+    LineProtocol->_cleanup_all;
+    Listener->_cleanup_all;
+    Control->_cleanup_all;
+    $global_timeout = undef;
+    die "Assertion: Still have $nr_events events" if $nr_events;
 }
 
 sub global_timeout {
-    ::info("Global timeout");
-    delete_all();
+    ::info("Global timeout") if $debug || $verbose;
+    cleanup_all();
     $exit = 1;
     # The cleanup of the globals above should be enough to fall off mainloop
     # exit $exit;
@@ -3041,8 +3127,8 @@ if ($role eq "server") {
     $client_verbose = $client_debug if $client_debug && !defined $client_verbose;
     $server_verbose = $server_debug if $server_debug && !defined $server_verbose;
 
-    $server_debug   = $client_debug   = 1 if $debug;
-    $server_verbose = $client_verbose = 1 if $verbose;
+    $server_debug   = $client_debug   = $debug   ? 1 : 0;
+    $server_verbose = $client_verbose = $verbose ? 1 : 0;
 
     if (defined $client) {
         die "Cannot have arguments in client mode" if @ARGV;
@@ -3127,14 +3213,9 @@ if ($role eq "server") {
                  global_timeout	=> $global_timeout,
              );
             while (my ($name, $value) = each %replace) {
-                local $Data::Dumper::Indent  = 0;
-                local $Data::Dumper::Purity  = 1;
-                local $Data::Dumper::Varname = $name;
-                $value = Dumper($value);
-                $value =~ s/\$\Q$name\E1\b/\$$name/g ||
-                    die "Assertion: No VAR1";
-                # info("Value=<$value>") if $verbose;
-                $content =~ s{^([^\S\n]*(?:my|our)\s*)\$\Q$name\E\s*=[^;\n]*;[^\S\n]*\n}{$1$value\n}m || die "Could not set $name";
+                $value = string_from_value($value);
+                # info("Value $name=<$value>") if $verbose;
+                $content =~ s{^([^\S\n]*(?:my|our))\s*\$\Q$name\E\s*=[^;\n]*;[^\S\n]*\n}{$1 \$$name=$value;\n}m || die "Could not set $name";
             }
 
             print($wr0 $PRE_STUFFER) || die "Write error:$^E";
@@ -3176,7 +3257,7 @@ if (defined $global_timeout) {
 }
 
 eval { Events->mainloop() };
-delete_all();
+_cleanup_all();
 die "\u$role DIED: $@" if $@;
 # die "Assertion: \u$role fell off the mainloop";
 exit $exit;
