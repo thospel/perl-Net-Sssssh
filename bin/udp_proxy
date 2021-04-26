@@ -3,6 +3,7 @@ my $null;
 BEGIN {
     # This must come before any modules, even use strict/warnings
     # (to avoid these modules keeping open early file handles for __DATA__)
+    $^F == 2 || die "Assertion: Invalid CLO_EXEC range";
     open($null, "+<", "/dev/null") || die "Could not open '/dev/null': $^E";
     die "Assertion: Should at least have the source code open at fileno 0" if
         fileno($null) == 0;
@@ -14,7 +15,6 @@ BEGIN {
         # Perl will automatically subsume fd 2 into STDERR
         open($null = undef, "+>&STDERR") || die "Could not dup STDERR: $^E";
     }
-    $^F == 2 || die "Assertion: Invalid CLO_EXEC range";
     fileno($null) > 2 || die "Assertion: Invalid NULL handle";
     # So now we are absolutely sure $null has CLO_EXEC
 }
@@ -264,6 +264,7 @@ my $nr_events = 0;
     # A small event core
     use Carp;
     use Errno qw(EINTR);
+    use Scalar::Util qw(weaken);
 
     my $read_mask  = "";
     my $write_mask = "";
@@ -377,9 +378,6 @@ my $nr_events = 0;
             $error_mask = "";
         }
     }
-
-    package Events;
-    use Scalar::Util qw(weaken);
 
     sub add_read {
         defined(my $fd = fileno(shift)) || croak "Not a filehandle";
@@ -505,6 +503,153 @@ my $nr_events = 0;
     *IO::Handle::add_error0	= \&add_error0;
 }
 
+package Signals;
+use Scalar::Util qw(weaken);
+
+sub DESTROY {
+    my ($signals) = @_;
+
+    # This makes sure Signal::DESTROY uses the efficient code path
+    $_ &&= 0 for values %{$signals->{count}};
+    @{$signals->{signalled}} = ();
+    %{$signals->{handlers}} = ();
+
+    # The user can be holding on to some Signal objects so their DESTROY
+    # doesn't get called and so some $SIG entries can survive. Kill them.
+    for my $sig_name (sort keys %{$signals->{old}}) {
+        ::caller_info("Restore signal $sig_name") if $debug;
+        $SIG{$sig_name} = $signals->{old}{$sig_name};
+    }
+    %{$signals->{old}} = ();
+}
+
+{
+    my $signals;
+
+    sub init {
+        my ($class) = @_;
+
+        return $signals if $signals;
+
+        my %signals = (
+            signalled 	=> [],
+            handlers	=> {},
+            count	=> {},
+            old		=> {},
+        );
+        pipe($signals{rd}, $signals{wr}) ||
+            die "Could not create signal pipe: $^E";
+        $signals{rd}->blocking(0);
+        # Leave the write side blocking
+        $signals{reader} = $signals{rd}->add_read0(\%signals, \&dealer);
+        return $signals = bless \%signals, $class;
+    }
+
+    sub _cleanup_all {
+        $signals = undef;
+    }
+
+    sub signal_handler {
+        my ($sig_name) = @_;
+
+        $signals || die "Assertion: signal $sig_name without Signals object";
+        $signals->{count}{$sig_name} ||
+            die "Assertion: signal $sig_name without handlers";
+        my $from = @{$signals->{signalled}} or
+            syswrite($signals->{wr}, "x") ||
+            die "Could not write to signal pipe: $^E";
+        push @{$signals->{signalled}}, @{$signals->{handlers}{$sig_name}};
+        for my $i ($from .. $#{$signals->{signalled}}) {
+            weaken($signals->{signalled}[$i]);
+        }
+    }
+}
+
+package Signal;
+use Errno qw(EINTR EAGAIN EWOULDBLOCK);
+use Scalar::Util qw(weaken);
+
+# Signal indices
+use constant {
+    SIGNALS	=> 0,
+    NAME	=> 1,
+    OBJ	=> 2,
+    CODE	=> 3,
+};
+
+# Hard to classify this one. It belongs to both Signals and Signal really
+sub Signals::dealer {
+    my ($signals) = @_;
+
+    while (@{$signals->{signalled}}) {
+        my $handler = shift @{$signals->{signalled}} || next;
+        # No need to check $handler->[SIGNALS] since we KNOW we have $signals
+        defined $handler->[OBJ] || next;
+        $handler->[CODE]->($handler->[OBJ], $handler->[NAME]);
+    }
+
+    # Avoid endless EINTR/read
+    for my $i (1..100) {
+        my $rc = sysread($signals->{rd}, my $buffer, $BLOCK_SIZE) && next;
+        die "Assertion: EOF from signal pipe" if defined $rc;
+        next if $! == EINTR;
+        $! == EAGAIN || $! == EWOULDBLOCK ||
+            die "error reading drom signal pipe: $^E";
+        return;
+    }
+    die "Assertion: Seemingly endless read from signal pipe";
+}
+
+sub DESTROY {
+    my ($handler) = @_;
+
+    my $sig_name = $handler->[NAME];
+    ::caller_info("delete_signal $sig_name") if $debug;
+
+    my $signals = $handler->[SIGNALS] || return;
+
+    if ($signals->{count}{$sig_name} > 1) {
+        # This makes managing lots of handlers for the same signal
+        # O(n^2). We could go for a doubly linked list of handlers or
+        # some other datastructure if this ever becomes relevant
+        my $handlers = $signals->{handlers}{$sig_name};
+        my $to = 0;
+        for my $i (0..$#$handlers) {
+            next if !$handlers->[$i] || !defined $handlers->[$i][OBJ] || $handlers->[$i] == $handler;
+            weaken($handlers->[$to] = $handlers->[$i]) if $i != $to;
+            ++$to;
+        }
+        $#$handlers = $to-1;
+        $to < $signals->{count}{$sig_name} ||
+            die "Assertion: Could not find DESTROYed signal handler";
+        return if $signals->{count}{$sig_name} = $to;
+    }
+    @{$signals->{handlers}{$sig_name}} = ();
+    if (exists $signals->{old}{$sig_name}) {
+        ::caller_info("Restore signal $sig_name") if $debug;
+        $SIG{$sig_name} = delete $signals->{old}{$sig_name};
+    }
+}
+
+sub add {
+    my $sig_name = shift;
+    ::caller_info("add_signal $sig_name") if $debug;
+
+    # We store $signals because if $signals gets cleaned up and restored
+    # before Signal DESTROY we don't want it to impact the wrong object
+    my $signals = Signals->init;
+    my $handler = bless [$signals, $sig_name, shift, shift], "Signal";
+    weaken($handler->[OBJ]);
+    weaken($handler->[SIGNALS]);
+    if (1 == ++$signals->{count}{$sig_name}) {
+        ::caller_info("Take over_signal $sig_name") if $debug;
+        $signals->{old}{$sig_name} = $SIG{$sig_name};
+        $SIG{$sig_name} = \&Signals::signal_handler;
+    }
+    weaken($signals->{handlers}{$sig_name}[@{$signals->{handlers}{$sig_name}}] = $handler);
+    return $handler;
+}
+
 my $CLOCK_TYPE_NAME;
 {
     package Timer;
@@ -514,12 +659,14 @@ my $CLOCK_TYPE_NAME;
     use Time::HiRes qw(clock_gettime CLOCK_REALTIME CLOCK_MONOTONIC);
 
     # Timer indices
-    sub INDEX	() { 0 };
-    sub TIME	() { 1 };
-    sub OBJ	() { 2 }; # Must come after TIME
-    sub CODE	() { 3 };
-    sub KEEPDEAD() { 4 };
-    sub CALLERS	() { 5 };
+    use constant {
+        INDEX	=> 0,
+        TIME	=> 1,
+        OBJ	=> 2,	# Must come after TIME
+        CODE	=> 3,
+        KEEPDEAD=> 4,
+        CALLERS	=> 5,
+    };
 
     my @timers = (undef);
     # @expired must be persistent so no timers get lost if a callback dies
@@ -2574,7 +2721,7 @@ sub command_status {
 
     $control->{out} .= <<"EOF"
 Local:
-  Script $::Script
+  Script $::Script (pid $$)
   VERSION $VERSION
   PROTOCOL $PROTOCOL
   Socket::MsgHdr $msghdr
@@ -2659,7 +2806,6 @@ sub run {
     if ($controller->{term}->ReadLine eq "Term::ReadLine::Gnu") {
         $controller->{term}->rl_deprep_terminal();
     } else {
-        ::info("End");
         # Term::ReadLine::Gnu already adds a newline
         syswrite(STDOUT, "\n");
     }
@@ -2973,6 +3119,7 @@ sub string_from_value {
 
 sub deleting {
     $global_timeout = undef;
+    Signals->_cleanup_all;
     die "Assertion: Still have $nr_events events" if $nr_events;
 }
 
@@ -2992,6 +3139,7 @@ sub _cleanup_all {
     LineProtocol->_cleanup_all;
     Listener->_cleanup_all;
     Control->_cleanup_all;
+    Signals->_cleanup_all;
     $global_timeout = undef;
     die "Assertion: Still have $nr_events events" if $nr_events;
 }
