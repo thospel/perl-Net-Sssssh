@@ -2404,7 +2404,7 @@ my %commands = (
         socketpair(my $left, my $right, PF_UNIX, SOCK_STREAM, PF_UNSPEC) ||
             die "Could not create socketpair: $^E";
         defined(my $pid = fork()) || die "Could not fork: $^E";
-        if ($pid == 0) {
+        if (fileno($term_in) == fileno(STDIN) ? $pid != 0 : $pid == 0) {
             # Child
             eval {
                 close($left) || die "Could not close socketpair: $^E";
@@ -2446,7 +2446,7 @@ my %commands = (
             id		=> $id,
             line	=> $line,
             pid		=> $pid,
-            parent	=> $$,
+            parent	=> fileno($term_in) == fileno(STDIN) ? undef : $$,
             socket	=> $left,
             in		=> "",
             out		=> "",
@@ -3177,8 +3177,8 @@ if ($role eq "server") {
         pipe(my $rd1, my $wr1) || die "Could not pipe: $^E";
         defined(my $pid = fork()) || die "could not fork: $^E";
 
-        if ($pid) {
-            # Parent
+        if (!$pid) {
+            # Child
             # This side does the ssh connection so that ^C goes to ssh
             eval {
                 close $wr0;
@@ -3210,7 +3210,7 @@ if ($role eq "server") {
             die $@ || "No error";
         }
 
-        # Child
+        # Parent
         close $rd0;
         close $wr1;
         $wr0->autoflush(1);
