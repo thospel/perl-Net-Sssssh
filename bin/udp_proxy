@@ -546,7 +546,9 @@ sub DESTROY {
     }
 
     sub _cleanup_all {
+        weaken(my $probe = $signals);
         $signals = undef;
+        die "Assertion: Somebody is holding a reference to signals" if $probe;
     }
 
     sub signal_handler {
@@ -1925,6 +1927,7 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK EADDRINUSE EPROTONOSUPPORT EACCES);
 use Carp;
 use FindBin qw($Script);
 use Socket qw(PF_INET SOCK_DGRAM SOCK_STREAM SOL_SOCKET SO_REUSEADDR
+              IPPROTO_TCP TCP_NODELAY
               inet_ntoa inet_aton pack_sockaddr_in unpack_sockaddr_in);
 use Digest::MD5 qw(md5);
 
@@ -2480,6 +2483,8 @@ sub socket_tcp {
         listen($socket, $LISTEN_BACKLOG) || die "Could not listen: $^E";
     } else {
         connect($socket, $local) || die "Could not connect to $host:$port: $^E";
+        setsockopt($socket, IPPROTO_TCP, TCP_NODELAY,1) ||
+            die "Couldn't disable Nagle's algorithm: $^E";
     }
     $socket->blocking(0);
     wantarray || return $socket;
@@ -2974,7 +2979,7 @@ sub timeout {
 }
 
 package Listener;
-use Socket qw(unpack_sockaddr_in inet_ntoa);
+use Socket qw(unpack_sockaddr_in inet_ntoa IPPROTO_TCP TCP_NODELAY);
 use Errno qw(EINTR EAGAIN EWOULDBLOCK);
 
 {
@@ -3018,6 +3023,8 @@ sub acceptable {
         die "Accept failed: $^E";
     }
     $listener->delete if --$loops == 0;
+    setsockopt($accepted, IPPROTO_TCP, TCP_NODELAY,1) ||
+        die "Couldn't disable Nagle's algorithm: $^E";
     my $line = ::server($accepted, $accepted);
     if ($debug || $verbose) {
         my ($port, $addr) = unpack_sockaddr_in($from);
@@ -3278,7 +3285,7 @@ if ($role eq "server") {
     die "Cannot have stuff in server mode\n" if $stuff;
 
     my ($socket_in, $socket_out);
-    if (defined $server) {
+    if (defined $server && $server ne "-") {
         # Manual start
         my $host = $server =~ s{(.*):}{}s ? $1 : $default_local_bind;
         $server = "0" if $server eq "";
