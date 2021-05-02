@@ -89,7 +89,7 @@ $SIG{PIPE} = "IGNORE";
 $SIG{CHLD} = "IGNORE";
 
 delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
-$ENV{PATH}="/usr/bin:/bin";
+$ENV{PATH}="/usr/bin:/usr/sbin:/bin:/sbin";
 
 my $MULTICAST_BEGIN = inet_aton("224.0.0.0") || die "Assertion: Bad address";
 # multicast range *excludes* this END address
@@ -129,8 +129,8 @@ my $UDP_SIZE = int(2**16);
 my $LISTEN_BACKLOG = 128;
 
 my @PING =
-    $^O eq "solaris" ? (["/bin/ping", "-s"], ["64", "1"]) :
-    (["/bin/ping", "-c", "1"], []);
+    $^O eq "solaris" ? (["ping", "-s"], ["64", "1"]) :
+    (["ping", "-c", "1"], []);
 
 my %settings_global = (
     EPOCH	=> undef,
@@ -627,7 +627,7 @@ sub DESTROY {
     }
 }
 
-sub add {
+sub add0 {
     my $sig_name = shift;
     ::caller_info("add_signal $sig_name") if $debug;
 
@@ -1065,7 +1065,7 @@ sub reader {
     close($pinger->{handle});
     $pinger->wait;
     my $icmp = $pinger->{icmp};
-    if (my ($ip, $ttl, $time) = $pinger->{in} =~ /from (\d+\.\d+\.\d\.\d+).* icmp_[sr]eq.* ttl=(\d+).* time=(\S+ (?:ms|usec))/) {
+    if (my ($ip, $ttl, $time) = $pinger->{in} =~ /from (\d+\.\d+\.\d+\.\d+).* icmp_[sr]eq.* ttl=(\d+).* time=(\S+ (?:ms|usec))/) {
         ::info("Got ping response from '$ip' ttl=$ttl, time=$time (ID $pinger->{id})") if $debug;
         $ip eq $pinger->{host} ||
             die "Asertion: Inconsistent: pinged '$pinger->{host}', got aswer from '$ip'";
@@ -1093,7 +1093,7 @@ sub new {
     !$msghdr || !$socket || setsockopt($socket, $IPPROTO_IP, $IP_RECVTTL, 1) ||
         die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
     # ICMP_FILTER always gets me ENOPROTOOPT
-    # However when /bin/ping does it (when sysctl group NOT set) it works...
+    # However when ping does it (when sysctl group NOT set) it works...
     # !$socket || setsockopt($socket, $SOL_RAW, $ICMP_FILTER, 0xffffffff ^ 1<<$ICMP_ECHO_REPLY) ||
     #    die "setsockopt(SOL_RAW, ICMP_FILTER): $^E" if defined $ICMP_FILTER;
 
@@ -2822,6 +2822,7 @@ sub display {
 }
 
 sub string_from_value {
+    no warnings "once";
     # local $Data::Dumper::Varname  = "VAR";
     local $Data::Dumper::Trailingcomma = 0;
     local $Data::Dumper::Terse = 1;
@@ -2991,7 +2992,7 @@ if ($role eq "server") {
             if (!$ENV{udp_proxy_rlwrap}) {
                 local $ENV{udp_proxy_rlwrap} = "1";
                 no warnings "exec";
-                exec("rlwrap", "-S", "$Script>", "$Bin/$Script", @ARGV_OLD);
+                { exec("rlwrap", "-S", "$Script>", "$Bin/$Script", @ARGV_OLD) };
                 $! == ENOENT || die "Could not exec 'rlwrap': $^E";
                 ::info("Could not exec 'rlwrap': $^E") if $debug;
             }
@@ -3023,7 +3024,7 @@ if ($role eq "server") {
         if (!$ENV{udp_proxy_rlwrap}) {
             local $ENV{udp_proxy_rlwrap} = "1";
             no warnings "exec";
-            exec("rlwrap", "-S", "$Script>", "$Bin/$Script", @ARGV_OLD);
+            { exec("rlwrap", "-S", "$Script>", "$Bin/$Script", @ARGV_OLD) };
             $! == ENOENT || die "Could not exec 'rlwrap': $^E";
             ::info("Could not exec 'rlwrap': $^E") if $debug;
         }
@@ -3074,7 +3075,7 @@ if ($role eq "server") {
                     }
                 } else {
                     push @ARGV, "$Bin/$Script" if @ARGV == 1;
-                    exec($ssh, $ssh_master ? "-M" : (), "-e", "none", @ARGV) ||
+                    exec($ssh, $ssh_master ? "-M" : (), "-e", "none", "-T", @ARGV) ||
                         die "Could not exec $ssh: $^E";
                 }
             };
