@@ -82,17 +82,18 @@ sub parse_address {
     my (@matches, @modes);
     my $regex = "";
     for my $mode (qw(from to)) {
-        my $types = delete $options{$mode} // next;
+        defined(my $types = delete $options{$mode}) || next;
         my $r = build_parser($mode, $types, \@matches);
         $regex = $regex eq "" ? $r : "(?:$regex:)?$r";
         push @modes, $mode;
     }
-    die "Unknown option " . join(", ", map "'$_'", sort keys %options) if %options;
+    croak("Unknown option " . join(", ", map "'$_'", sort keys %options)) if
+        %options;
     my @matched = $str =~ /^$regex\z/ or
         die "Could not parse $context '$str'\n";
     my %matches;
     for my $i (0..$#matched) {
-        my $matched = $matched[$i] // next;
+        defined(my $matched = $matched[$i]) || next;
         my ($mode, $type) = $matches[$i] =~ /^([^-]+)-([^-]+)\z/ or
             die "Assertion: Impossible match name $matches[$i]";
         my @parts = $matched =~ $parse_regex{$type};
@@ -102,22 +103,23 @@ sub parse_address {
             } elsif ($parts[0] eq "") {
                 $parts[0] = $mode eq "from" ? "0.0.0.0" : "127.0.0.1";
             } elsif ($parts[0] eq "*") {
-                die "Cannot connect to the $context '*'" if $mode eq "to";
+                die "Cannot connect to $context '*'\n" if $mode eq "to";
                 $parts[0] = "0.0.0.0";
             }
             $parts[0] = inet_aton($parts[0]) ||
                 die "Could not resolve $context '$parts[0]'\n";
 
             if (!defined $parts[1] || $parts[1] eq "") {
-                die "Missing $context port" if $mode eq "to";
+                die "Missing $context port\n" if $mode eq "to";
                 $parts[1] = 0;
             }
             $parts[1] = $parts[1] =~
+                # There is no port 0 in /etc/services so we can use ||
                 /^0\z|^[1-9][0-9]*\z/ ? int($parts[1]) :
-                $type =~ /^udp/ ? getservbyname($parts[1], "udp") //
-                die("Unknown UDP service '$parts[1]'\n") :
-                $type =~ /^tcp/ ? getservbyname($parts[1], "tcp") //
-                die("Unknown TCP service '$parts[1]'\n") :
+                $type =~ /^udp/ ? getservbyname($parts[1], "udp") ||
+                die("$context: Unknown UDP service '$parts[1]'\n") :
+                $type =~ /^tcp/ ? getservbyname($parts[1], "tcp") ||
+                die("$context: Unknown TCP service '$parts[1]'\n") :
                 die("Assertion: Unknown type '$type'");
 
             #printf(STDERR "$context: UDP4 address %s:%d\n",
@@ -136,6 +138,7 @@ sub parse_address {
 }
 
 sub string_from_value {
+    no warnings "once";
     local $Data::Dumper::Indent	  = 0;
     local $Data::Dumper::Sortkeys = 1;
     local $Data::Dumper::Useqq	  = 1;
@@ -156,7 +159,7 @@ sub fou_encode_udp {
         die "Assertion: Could not unpack to address";
 
     # Avoid real outgoing packet if we are sending to 0.X.X.X
-    $ttl //= $dst =~ /^\0/ ? TTL_LOW : TTL;
+    $ttl = $dst =~ /^\0/ ? TTL_LOW : TTL if !defined $ttl;
 
     my $packet_id = int rand SHORT_MAX;
     my $flags = DF;
@@ -209,13 +212,13 @@ sub fou_encode_udp {
 sub fou_encode_icmp {
     my ($from, $to, $type, $code, $icmp_header, $data, $verbose, $ttl) = @_;
 
-    my $src = inet_aton($from) //
+    my $src = inet_aton($from) ||
         die "Assertion: Could not resolve '$from'";
-    my $dst = inet_aton($to) //
+    my $dst = inet_aton($to) ||
         die "Assertion: Could not resolve '$to'";
 
     # Avoid real outgoing packet if we are sending to 0.X.X.X
-    $ttl //= $dst =~ /^\0/ ? TTL_LOW : TTL;
+    $ttl = $dst =~ /^\0/ ? TTL_LOW : TTL if !defined $ttl;
 
     my $ip_len = IHL * 4;
     my $buffer = pack("x${ip_len}CCx2a4a*x", $type, $code, $icmp_header, $data);
