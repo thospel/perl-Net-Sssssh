@@ -109,12 +109,11 @@ my $ICMP_ECHO_REPLY = 0;
 
 my $ssh = "/usr/bin/ssh";
 my $verbose = undef;
+my $global_timeout = undef;
 my $timeout = 120;
 my $keepalive = 300;
 my $udp_max = 10;
 my $ping_max = 10;
-my $global_timeout = undef;
-my $control_signal = undef;
 my $default_bind  = "127.0.0.1";
 my $exit = 0;
 
@@ -447,6 +446,27 @@ my $nr_events = 0;
             });
     }
 
+    sub events_fd {
+        my $events = shift;
+        push @$events, map {
+            "Read $_" . (ref $read_refs{$_} =~ /0\z/ ? " (dead)" : "")
+        } sort {$a <=> $b} keys %read_refs;
+        push @$events, map {
+            "Write $_" . (ref $write_refs{$_} =~ /0\z/ ? " (dead)" : "")
+        } sort {$a <=> $b} keys %write_refs;
+        push @$events, map {
+            "Error $_" . (ref $error_refs{$_} =~ /0\z/ ? " (dead)" : "")
+        } sort {$a <=> $b} keys %error_refs;
+    }
+
+    sub events {
+        my @events;
+        events_fd(\@events);
+        Timer::events_immediate(\@events);
+        Timer::events_timer(\@events);
+        print STDERR "$_\n" for @events;
+    }
+
     sub mainloop {
         # ::info("WARNING (can safely be ignored): $msghdr_error") if
         #    $msghdr_error && $verbose;
@@ -566,7 +586,7 @@ use Scalar::Util qw(weaken);
 use constant {
     SIGNALS	=> 0,
     NAME	=> 1,
-    OBJ	=> 2,
+    OBJ		=> 2,
     CODE	=> 3,
 };
 
@@ -626,6 +646,7 @@ sub DESTROY {
 
 sub add0 {
     my $sig_name = shift;
+
     ::caller_info("add_signal $sig_name") if $verbose > 1;
 
     # We store $signals because if $signals gets cleaned up and restored
@@ -711,7 +732,7 @@ my $CLOCK_TYPE_NAME;
         if ($verbose > 1) {
             my $v = $verbose;
             $verbose = 0;
-            my $timer = timer(@_);
+            my $timer = timer0(@_);
             $verbose = $v;
             my $callers = ::callers();
             $timer->[CALLERS] = $callers;
@@ -759,6 +780,7 @@ my $CLOCK_TYPE_NAME;
         if (!$i) {
             croak "Not a timer reference" unless defined($i);
             # Could be a timer sitting on the expired queue in run_now
+            # This slicing will only be useful if not called by perl internals
             if (@$timer > TIME) {
                 --$nr_events unless $timer->[KEEPDEAD];
                 $#$timer = TIME;
@@ -874,13 +896,29 @@ my $CLOCK_TYPE_NAME;
 
     sub timers_run {
         @expired || return;
-        my $fun;
+        my $timer;
 
         # Using while instead of for in case a callback dies
-        ($fun = shift @expired and
-         $fun->[KEEPDEAD]++ || $nr_events-- and
-         $fun->[OBJ] and
-         $fun->[CODE]->($fun->[OBJ])) while @expired;
+        ($timer = shift @expired and
+         $timer->[KEEPDEAD]++ || $nr_events-- and
+         $timer->[OBJ] and
+         $timer->[CODE]->($timer->[OBJ])) while @expired;
+    }
+
+    sub events_immediate {
+        my $events = shift;
+        for my $timer (@immediate) {
+            push @$events, sprintf("%s %08x", $timer->[KEEPDEAD] ? "Immediate (dead)" : "Immediate", refaddr($timer)) if $timer;
+        }
+    }
+
+    sub events_timer {
+        my $events = shift;
+        my @t;
+        for my $timer (@timers) {
+            push @t, [$timer, $timer->[KEEPDEAD] ? "Timer (dead)" : "Timer"] if $timer;
+        }
+        push @$events, map sprintf("%s(%s) %08x", $_->[1], $_->[0][TIME], refaddr $_->[0]), sort { $a->[0][TIME] <=> $b->[0][TIME] } @t;
     }
 }
 
@@ -1043,7 +1081,7 @@ sub new {
 
     my $object= bless {
         @_,
-        deleted	=> undef,
+        deleted	=> 0,
         parent	=> $parent,
     }, $class;
     weaken($object->{parent});
@@ -1070,17 +1108,34 @@ sub DESTROY {
     $object->info("DESTROY") if $verbose > 2;
     %{$object->{children}} = () if $object->{children};
     return if $object->{deleted};
-    $object->{deleted} = -1;
     $object->delete("DESTROY");
 }
 
 sub delete : method {
+    my $object = shift;
+
+    if ($object->{deleted}) {
+        die "Double delete on '@_'" if $object->{deleted} > 0;
+        die "Recursive delete on '@_' [", ::callers(), "]";
+    }
+    $object->{deleted} = -1;
+    $object->_delete(@_);
+    $object->{deleted} = 1;
+}
+
+sub _delete {
     my ($object) = @_;
 
     delete $object->{parent}{children}{ref $object}[$object->{id}];
     my $ids = $object->{parent}{ids}{ref $object};
     $ids->id_free($object->{id}) if $ids;
-    $object->{deleted} = 1;
+}
+
+sub die : method {
+    my ($object, $msg) = @_;
+
+    $object->delete($msg);
+    die $object->name . ": " . $msg;
 }
 
 sub id {
@@ -1126,6 +1181,18 @@ sub info {
     goto &::info;
 }
 
+sub caller_info {
+    my $object = shift;
+    my $format = shift;
+    if (@_) {
+        @_ = ("%s: $format [%s]", $object->name, @_, ::callers());
+    } else {
+        @_ = ("%s: %s [%s]", $object->name, $format, ::callers());
+    }
+    goto &::info;
+}
+
+
 sub status {
 }
 
@@ -1135,11 +1202,7 @@ use vars qw(@ISA);
 
 use Carp qw(croak);
 
-my $root;
-
-sub _cleanup_all {
-    $root = undef;
-}
+my $root = 0;
 
 sub new {
     my $class = shift;
@@ -1151,6 +1214,8 @@ sub new {
         id		=> 0,
         id_full		=> "0",
         settings	=> { %settings_global },
+        timeout		=> undef,
+        signals		=> {},
     }, $class;
     $root->info("CREATE") if $verbose > 2;
     return $root;
@@ -1174,6 +1239,39 @@ EOF
         ;
 }
 
+sub _delete {
+    my $root = shift;
+    delete $root->{signals};
+    delete $root->{timeout};
+    $root->SUPER::_delete(@_);
+}
+
+sub signal_add0 {
+    my ($root, $sig_name, $code) = @_;
+
+    $root->die("Already have signal '$sig_name'") if $root->{signals}{$sig_name};
+    $root->{signals}{$sig_name} = Signal::add0($sig_name, $root, $code);
+}
+
+sub immediate {
+    my ($root, $code) = @_;
+    $root->{timeout} = Timer::immediate($root, $code);
+}
+
+sub global_timeout {
+    ::info("Global timeout") if $verbose;
+    ::_cleanup_all();
+    # The cleanup of the globals above should be enough to fall off mainloop
+    # $exit = 1;
+    # exit $exit;
+}
+
+sub timeout {
+    my ($root, $timeout) = @_;
+    $root->{timeout} = Timer::timer0($timeout, $root, \&global_timeout);
+    alarm($timeout+3);
+}
+
 package _Stream;
 use vars qw(@ISA);
 @ISA = qw(Object);
@@ -1195,22 +1293,15 @@ sub new {
     );
 }
 
-sub delete : method {
+sub _delete {
     my $stream = shift;
 
     $stream->{reader} = undef;
     $stream->{writer} = undef;
     $stream->{timeout} = undef;
 
-    $stream->SUPER::delete(@_);
+    $stream->SUPER::_delete(@_);
     ::cleanup_all() if $stream->{exit};
-}
-
-sub die : method {
-    my ($stream, $msg) = @_;
-
-    $stream->delete($msg);
-    die $stream->name . ": " . $msg;
 }
 
 sub eof : method {
@@ -1318,21 +1409,14 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK EMSGSIZE);
 use Socket qw(pack_sockaddr_in unpack_sockaddr_in inet_ntoa
               MSG_TRUNC MSG_CTRUNC);
 
-sub delete : method {
+sub _delete {
     my $udp = shift;
 
     $udp->{reader} = undef;
     $udp->{writer} = undef;
     $udp->{timeout} = undef;
 
-    $udp->SUPER::delete(@_);
-}
-
-sub error {
-    my ($udp, $msg) = @_;
-
-    $udp->delete($msg);
-    die $udp->name . ": " . $msg;
+    $udp->SUPER::_delete(@_);
 }
 
 sub new {
@@ -1511,12 +1595,14 @@ use POSIX qw(_exit);
     sub queue {
         my ($class, $icmp) = @_;
 
+        # $icmp->info("Queue on Pinger, set pending=1");
         die "Assertion: Already pending" if $icmp->{pending};
         weaken($queued[@queued] = $icmp);
         $icmp->{pending} = 1;
     }
 
     sub activate_ping {
+        # ::caller_info("Pinger::activate_ping, queued=%d, ping_max=%d", scalar @queued, $ping_max);
         while (@queued && $ping_max > 0) {
             my $icmp = shift @queued || next;
             $icmp->unqueue_ping();
@@ -1558,6 +1644,15 @@ sub new {
     close($wr1) || die "Could not close pipe: $^E";
     $rd0->blocking(0);
     $rd1->blocking(0);
+
+    # if (!defined $icmp || ref $icmp ne "Sender::ICMP") {
+    #    ::caller_info("BAD ICMP");
+    #    die "Boem";
+    #}
+    #if (!defined $icmp->{parent} || ref $icmp->{parent} ne "LineProtocol") {
+    #    ::caller_info("Bad LineProtocol");
+    #    die "Boem";
+    #}
     my $pinger = $class->SUPER::new(
         $icmp, $rd1, undef,
         waitable	=> undef,
@@ -1567,8 +1662,9 @@ sub new {
         host		=> $host,
         data		=> $data);
 
-    $pinger->info("waiting for exec ping '%s'",
+    $pinger->info("waiting to spawn ping '%s'",
                   $pinger->{host}) if $verbose > 1;
+    # $pinger->info("Created");
 
     return $pinger;
 }
@@ -1599,7 +1695,7 @@ sub eof : method {
             $pinger->die($pinger->{in});
         }
         $pinger->{reader} = $pinger->{socket_in}->add_read($pinger, \&_Stream::reader);
-        $pinger->info("Switch to reading ping result") if $verbose > 1;
+        $pinger->info("Spawned. Switch to reading ping result") if $verbose > 1;
         return;
     }
 
@@ -1624,22 +1720,22 @@ sub eof : method {
     $pinger->delete("Ping result");
 }
 
-sub delete : method {
+sub _delete {
     my $pinger = shift;
 
     $pinger->wait if $pinger->{waitable};
-    $pinger->SUPER::delete(@_);
+    $pinger->SUPER::_delete(@_);
 
+    # $pinger->caller_info("delete");
     my $icmp = $pinger->{parent};
     # Avoid new pings being started during cleanup in fork children
     $icmp->{pid} == $$ || return;
     my $line = $icmp->{parent};
 
     --$line->{nr_pingers};
-    $line->activate_ping;
-
     ++$ping_max;
     Pinger->activate_ping;
+    $line->activate_ping;
 }
 
 sub on_read {
@@ -1707,9 +1803,9 @@ sub on_read {
     $type == $ICMP_ECHO_REPLY || return;
     $code == 0 || return;
 
-    $icmp->info("ICMP ECHO Payload %d bytes (Type %d, Code %d, Id %d, Seqno %d) from %s: %s",
-                length($$bufref), $type, $code, $icmp_id, $seqno,
-                inet_ntoa($addr), ::display($$bufref)) if $verbose > 1;
+    $icmp->info("ICMP ECHO Payload (Type %d, Code %d, Id %d, Seqno %d) from %s: %s",
+                $type, $code, $icmp_id, $seqno, inet_ntoa($addr),
+                ::display($$bufref)) if $verbose > 1;
     $icmp->{parent}->write($RESPONSE_PING, pack("wa4C", $icmp->{id}, $addr, $ttl-1), $$bufref) if $ttl > 1;
 }
 
@@ -1718,12 +1814,18 @@ sub write : method {
     my $icmp = shift;
 
     if (!$icmp->{socket_out}) {
+        $icmp->info("Queue external ping %s", inet_ntoa($_[0])) if $verbose;
+        # We could retry acquiring an ICMP socket here
         push @{$icmp->{out}}, [shift, shift, shift];
         $icmp->activate_ping;
         return;
     }
 
     my $dst = shift;
+    $icmp->info("Need to send ICMP ECHO (Type %d, Code 0, Id %d, Seqno %d, TTL %d) to %s: %s",
+                $ICMP_ECHO_REQUEST, $icmp->{icmp_id}, @_[0,2], inet_ntoa($dst),
+                ::display($_[1])) if $verbose > 1;
+
     my $data = pack("Cx3n2a*x", $ICMP_ECHO_REQUEST, $icmp->{icmp_id},
                     shift, shift);
     my $sum = unpack("%32n*", $data);
@@ -1740,30 +1842,33 @@ sub write : method {
 sub activate_ping {
     my ($icmp) = @_;
 
-    @{$icmp->{out}} || return;
+    # $icmp->caller_info("Try to activate ping size out=%d, ping_max=%d, pending=%d", scalar @{$icmp->{out}}, $ping_max, $icmp->{pending});
     return if $icmp->{pending};
 
-    if ($ping_max <= 0) {
-        Pinger->queue($icmp);
-        return;
-    }
+    while (@{$icmp->{out}}) {
+        if ($ping_max <= 0) {
+            Pinger->queue($icmp);
+            return;
+        }
 
-    my $line = $icmp->{parent};
-    if ($line->{nr_pingers} >= $line->{settings}{PING_MAX}) {
-        $line->queue_ping($icmp);
-        return;
-    }
+        my $line = $icmp->{parent};
+        if ($line->{nr_pingers} >= $line->{settings}{PING_MAX}) {
+            $line->queue_ping($icmp);
+            return;
+        }
 
-    Pinger->new($icmp,
-                inet_ntoa($icmp->{out}[0][0]),
-                shift(@{$icmp->{out}})->[2]);
-    ++$line->{nr_pingers};
-    --$ping_max;
+        Pinger->new($icmp,
+                    inet_ntoa($icmp->{out}[0][0]),
+                    shift(@{$icmp->{out}})->[2]);
+        ++$line->{nr_pingers};
+        --$ping_max;
+    }
 }
 
 sub unqueue_ping {
     my ($icmp) = @_;
 
+    # $icmp->caller_info("Unqueue, set pending=0");
     $icmp->{pending} || die "Assertion: Not pending";
     $icmp->{pending} = 0;
     $icmp->activate_ping;
@@ -2043,11 +2148,11 @@ sub new {
     return $fou;
 }
 
-sub delete : method {
+sub _delete {
     my $fou = shift;
 
     delete $fou->{parent}{lookups}{ref $fou}{$fou->{lookup_id}};
-    $fou->SUPER::delete(@_);
+    $fou->SUPER::_delete(@_);
 }
 
 package LineProtocol;
@@ -2058,6 +2163,7 @@ use vars qw(@ISA);
 use FindBin qw($Script);
 use Errno qw(EINTR EAGAIN EWOULDBLOCK);
 use Socket qw(inet_ntoa);
+use Scalar::Util qw(weaken);
 use Carp qw(croak);
 use Digest::MD5 qw(md5);
 
@@ -2084,7 +2190,7 @@ $_ = __PACKAGE__->can("process_$_") || die "Unknown sub 'process_$_'" for
     values %process;
 
 sub new {
-    my ($class, $socket_in, $socket_out) = @_;
+    my ($class, $parent, $socket_in, $socket_out) = @_;
 
     binmode($socket_in);
     binmode($socket_out);
@@ -2093,8 +2199,8 @@ sub new {
     $socket_out->blocking(0);
 
     return $class->SUPER::new(
-        $root, $socket_in, $socket_out,
-        settings	=> { %{$root->{settings}} },
+        $parent, $socket_in, $socket_out,
+        settings	=> { %{$parent->{settings}} },
         started		=> undef, # Normal operations started
         utime_offset	=> 0,	# Estimated round trip time in microsecond
         keepalive	=> undef,
@@ -2212,6 +2318,7 @@ sub keepalive {
 sub queue_ping {
     my ($line, $icmp) = @_;
 
+    # $icmp->info("Queue on %s, set pending=2", $line->name);
     die "Assertion: Already pending" if $icmp->{pending};
     weaken($line->{queue_ping}[@{$line->{queue_ping}}] = $icmp);
     $icmp->{pending} = 2;
@@ -2220,6 +2327,8 @@ sub queue_ping {
 sub activate_ping {
     my ($line) = @_;
 
+    # $line->info("Activate ping, queued=%d, nr_pingers=%d",
+    #            scalar @{$line->{queue_ping}}, $line->{nr_pingers});
     while (@{$line->{queue_ping}} && $line->{nr_pingers} < $line->{settings}{PING_MAX}) {
         my $icmp = shift @{$line->{queue_ping}} || next;
         $icmp->unqueue_ping();
@@ -2476,9 +2585,7 @@ sub process_PING {
     my ($id, $dst, $seqno, $ttl, $data) = unpack("wa4nCa*", shift);
     # Currently we only ever use one pinger
     $id == 1 || die "Assertion: Pinger socket id $id != 1";
-    $line->info("Need to send ICMP ECHO data (seqno %d, TTL %d) from socket %d to %s: %s",
-                $seqno, $ttl, $id, inet_ntoa($dst), ::display($data))
-        if $verbose > 1;
+    # debug info is written by $pinger->write
     my $pinger = $line->child("Sender::ICMP", $id) ||
         Sender::ICMP->new($line, $id);
     $pinger->write($dst, $seqno, $data, $ttl);
@@ -2585,6 +2692,12 @@ sub acceptable {
     $listener->delete("Maximum connections") if --$loops == 0;
     setsockopt($accepted, IPPROTO_TCP, TCP_NODELAY,1) ||
         die "Couldn't disable Nagle's algorithm: $^E";
+    $listener->on_accept($accepted);
+}
+
+sub on_accept {
+    my ($listener, $accepted) = @_;
+
     my ($target) = ref($listener) =~ /^Listener::(.*)\z/ or
         die "Assertion: Could not parse class of '$listener'";
     $target->new($listener->{parent}, $accepted, $accepted, $listener);
@@ -2651,10 +2764,10 @@ sub new {
         exit	=> fileno($term_in ) == fileno(STDIN));
 }
 
-sub delete : method {
+sub _delete {
     my ($control) = @_;
 
-    $control->SUPER::delete;
+    $control->SUPER::_delete;
     ::cleanup_all() if $control->{exit};
 }
 
@@ -2773,6 +2886,15 @@ use vars qw(@ISA);
 sub new {
     my $class = shift;
     return $class->SUPER::new($root, @_);
+}
+
+sub on_accept {
+    my ($listener, $accepted) = @_;
+
+    # server() does not take parent $root as argument,
+    # so make sure Listener::LineProtocol was called on $root
+    $listener->{parent} == $root || die "Assertion: Inconsistent Listener";
+    ::server($accepted, $accepted);
 }
 
 package main;
@@ -2963,30 +3085,24 @@ sub parse_address {
 
 # Try an immediate exit. No references should exist in the callchain
 sub _cleanup_all {
-    Root->_cleanup_all;
+    $root &&= 0;
     Signals->_cleanup_all;
-    $global_timeout = undef;
-    $control_signal = undef;
-    die "Assertion: Still have $nr_events events" if $nr_events;
+    if ($nr_events && defined $root) {
+        $root = undef;
+        print STDERR "Pid=$$\n";
+        Events::events();
+        die "Assertion: Still have $nr_events events";
+    }
 }
 
 # Clean up all events and wait until the next loop in mainloop to exit
 # (needed to give references in the callchain to get freed)
 sub cleanup_all {
     ::caller_info("cleanup_all()") if $verbose > 1;
-    $global_timeout = {};
-    $global_timeout->{timeout} = Timer::immediate($global_timeout, \&_cleanup_all);
+    $root->immediate(\&_cleanup_all) if $root;
 }
 
-sub global_timeout {
-    ::info("Global timeout") if $verbose;
-    cleanup_all();
-    $exit = 1;
-    # The cleanup of the globals above should be enough to fall off mainloop
-    # exit $exit;
-}
-
-sub add_cotrol {
+sub add_control {
     my ($parent) = @_;
 
     my $address = parse_address("127.0.0.1:0", "Control", from => "TCP4", resolve => 1);
@@ -2998,7 +3114,7 @@ sub client {
 
     my $line;
     eval {
-        $line = LineProtocol->new($socket_in, $socket_out);
+        $line = LineProtocol->new($root, $socket_in, $socket_out);
 
         for my $udp (@$udp_locals) {
             my ($from_port, $separator, $to_port) =
@@ -3041,7 +3157,7 @@ sub server {
 
     my $line;
     eval {
-        $line = LineProtocol->new($socket_in, $socket_out);
+        $line = LineProtocol->new($root, $socket_in, $socket_out);
 
         $line->set_peer(EPOCH	 => $BASE_TIME);
         $line->set_peer(MSGHDR	 => $msghdr_error || Socket::MsgHdr->VERSION);
@@ -3108,10 +3224,6 @@ $verbose ||= 0;
 $client_verbose = $verbose if !defined $client_verbose;
 $server_verbose = $verbose if !defined $server_verbose;
 
-# We can create the fallback line now that %settings_global has been filled
-$root = Root->new(
-);
-
 $role = "server" if defined $server;
 $role_peer = $role eq "server" ? "client" : "server";
 
@@ -3126,6 +3238,7 @@ if ($role eq "server") {
         # Manual start
         if ($no_control) {
             open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
+            $root = Root->new();
         } else {
             if (!$ENV{udp_proxy_rlwrap}) {
                 die "Assertion: Already queued events" if $nr_events;
@@ -3135,6 +3248,7 @@ if ($role eq "server") {
                 $! == ENOENT || die "Could not exec 'rlwrap': $^E";
                 ::info("Could not exec 'rlwrap': $^E") if $verbose > 1;
             }
+            $root = Root->new();
             Control->new($root);
             $| = 1;
         }
@@ -3143,6 +3257,7 @@ if ($role eq "server") {
         $loops = -1 if !defined $loops;
         Listener::LineProtocol->new($address, $loops) if $loops;
     } else {
+        $root = Root->new();
         # Make sure that if we fork/exec things they won't get access to
         # our communication channel
         open(my $socket_in,  "<&STDIN")  || die "Could not dup STDIN: $^E";
@@ -3151,13 +3266,14 @@ if ($role eq "server") {
         open(STDIN, ">&", $null) || die "Could not dup to STDOUT: $^E";
         server($socket_in, $socket_out);
     }
-    $control_signal = Signal::add0("USR1", $root, \&add_cotrol) if defined $server && $no_control < 2;
+    $root->signal_add0("USR1", \&add_control) if defined $server && $no_control < 2;
 } else {
     # From here on we are the client
     $verbose = $client_verbose;
 
     if ($no_control) {
         open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
+        $root = Root->new();
     } else {
         if (!$ENV{udp_proxy_rlwrap}) {
             die "Assertion: Already queued events" if $nr_events;
@@ -3167,10 +3283,11 @@ if ($role eq "server") {
             $! == ENOENT || die "Could not exec 'rlwrap': $^E";
             ::info("Could not exec 'rlwrap': $^E") if $verbose > 1;
         }
+        $root = Root->new();
         Control->new($root);
         $| = 1;
     }
-    $control_signal = Signal::add0("USR1", $root, \&add_cotrol) if $no_control < 2;
+    $root->signal_add0("USR1", \&add_control) if $no_control < 2;
     if (defined $client) {
         die "Cannot have arguments in client mode" if @ARGV;
         die "Cannot have stuff in client mode" if $stuff;
@@ -3282,14 +3399,7 @@ if ($role eq "server") {
     }
 }
 
-if (defined $global_timeout) {
-    my $obj = bless {
-        global_timeout	=> $global_timeout,
-    };
-    $obj->{timeout} = Timer::timer0($global_timeout, $obj, \&global_timeout);
-    alarm($global_timeout+3);
-    $global_timeout = $obj;
-}
+$root->timeout($global_timeout) if defined $global_timeout;
 
 eval {
     for my $control (@control_local) {
