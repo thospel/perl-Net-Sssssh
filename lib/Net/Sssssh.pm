@@ -51,7 +51,7 @@ use Exporter::Tidy
     constants => [qw(SHORT_MAX IP_VERSION IHL UDP_HEADER DF TTL PROTO_UDP
                      LINUX FREE_BSD
                      IP_PKTINFO IP_RECVDSTADDR IP_RECVTTL IP_TTL IPPROTO_IP
-                     ICMP_ECHO_REPLY ICMP_ECHO_REQUEST)],
+                     ICMP_ECHO_REPLY ICMP_ECHO_REQUEST TTL TTL_LOW)],
     other => [qw(parse_address string_from_value fou_encode_udp fou_encode_icmp
                  fou_decode)];
 

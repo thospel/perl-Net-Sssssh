@@ -1,0 +1,170 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+
+my $VERSION = "1.000";
+
+use FindBin qw($Script);
+our $Bin;
+
+# If the program runs as /foobar/bin/program, find libraries in /foobar/lib
+BEGIN {
+    # Even on windows FindBin uses / in the reported path
+    $Bin = $FindBin::Bin;
+    $Bin =~ s{/+\z}{};
+    $Bin =~
+        ($^O eq "MSWin32" ?
+         qr{^((?:[A-Z]:)?(?:/[a-zA-Z0-9_:.~ -]+)*)/[a-zA-Z0-9_.-]+/*\z} :
+         qr{^((?:/[a-zA-Z0-9_:.-]+)*)/[a-zA-Z0-9_.-]+/*\z}) ||
+         die "Could not parse bin directory '$Bin'";
+    # Use untainted version of lib
+    require lib;
+    # Support a simple --blib option for pre-install testing
+    "lib"->import(@ARGV && $ARGV[0] eq "--blib" ? shift && "$1/blib/lib" : "$1/lib");
+}
+
+use Getopt::Long 2.24 qw(:config bundling require_order);
+use IO::Socket::INET qw(inet_ntoa inet_aton unpack_sockaddr_in pack_sockaddr_in);
+
+use Socket::MsgHdr;
+use Net::Sssssh qw
+    (IPPROTO_IP IP_PKTINFO IP_RECVTTL IP_RECVDSTADDR IP_TTL
+     fou_decode fou_encode_udp parse_address string_from_value);
+
+my $loops = -1;
+die "Could not parse your command line. Try $0 -h\n" unless
+    GetOptions(
+        "f|fou!"	=> \my $fou,
+        "l|loops=o"	=> \$loops,
+        "from_port=o"	=> \my $from_port,
+        "from_host=s"	=> \my $from_host,
+        "to_port=o"	=> \my $to_port,
+        "to_host=s"	=> \my $to_host,
+        "v|verbose!"	=> \my $verbose,
+        "version!"	=> \my $version,
+        "U|unsafe!"	=> \my $unsafe,
+        "h|help!"	=> \my $help);
+
+if ($version) {
+    ## no critic (UselessNoCritic RequireCheckedSyscalls)
+    require Net::Sssssh::Package;
+    print <<"EOF";
+udp_recv $VERSION (Net::Sssssh $Net::Sssssh::Package::VERSION)
+EOF
+    exit 0;
+}
+if ($help) {
+    require Config;
+    $ENV{PATH} .= ":" unless $ENV{PATH} eq "";
+    $ENV{PATH} = "$ENV{PATH}$Config::Config{'installscript'}";
+    exit system("perldoc", "-F", $unsafe ? "-U" : (), "$Bin/$Script") ? 1 : 0;
+    # make parser happy
+    %Config::Config = ();
+}
+
+my %replace;
+$replace{src} = inet_aton($from_host) || die "Could not resolve '$from_host" if
+    defined $from_host;
+$replace{dst} = inet_aton($to_host  ) || die "Could not resolve '$to_host"   if
+    defined $to_host;
+$replace{sprt} = $from_port if defined $from_port;
+$replace{dprt} = $to_port   if defined $to_port;
+
+my ($recv, $send) = @ARGV;
+$recv = parse_address($recv, "Receiver", from => "UDP4");
+my ($recv_port, $recv_addr) = unpack_sockaddr_in($recv);
+my $recv_host = inet_ntoa($recv_addr);
+print "Listening on $recv_host:$recv_port\n" if $verbose;
+
+$send = parse_address($send, "Sender",   to   => "UDP4");
+my ($send_port, $send_addr) = unpack_sockaddr_in($send);
+my $send_host = inet_ntoa($send_addr);
+print "Sending   to $send_host:$send_port\n" if $verbose;
+
+my $msghdr = Socket::MsgHdr->new();
+my $s = IO::Socket::INET->new(
+    Proto	=> "udp",
+    ReUse	=> 1,
+    LocalHost	=> $recv_host,
+    LocalPort	=> $recv_port) || die "Could not create socket: $!";
+setsockopt($s, IPPROTO_IP, IP_PKTINFO, 1) ||
+    die "setsockopt(IPPROTO_IP, IP_PKTINFO): $^E";
+setsockopt($s, IPPROTO_IP, IP_RECVTTL, 1) ||
+    die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
+
+print "=" x 25 . "\n" if $verbose;
+while ($loops--) {
+    $msghdr->controllen(256);
+    $msghdr->namelen(256);
+    $msghdr->buflen(2**16);
+    $s->recvmsg($msghdr) || die "Could not recvmsg: $!";
+
+    my ($local, $msg_dst, $ttl);
+    my @cmsg = $msghdr->cmsghdr();
+    for my $i (0 .. $#cmsg / 3) {
+        $i *= 3;
+        my ($level, $type, $data) = @cmsg[$i..$i+2];
+        $level == IPPROTO_IP || next;
+        if (defined IP_RECVDSTADDR && $type == IP_RECVDSTADDR) {
+            # FreeBSD
+            length $data == 4 || die "Unexpected IP_RECVDSTADDR length";
+            $local = inet_ntoa($data);
+            $msg_dst = $local;
+        } elsif (defined IP_PKTINFO && $type == IP_PKTINFO) {
+            # Linux
+            length $data == 12 || die "Unexpected IP_PKTINFO length";
+            my ($interface, $dst, $to) = unpack("Ia4a4", $data);
+            $local = inet_ntoa($to);
+            $msg_dst = inet_ntoa($dst);
+        } elsif ($type == IP_TTL) {
+            length $data == 4 || die "Unexpected IP_TTL length";
+            $ttl = unpack("I", $data);
+            $cmsg[$i+2] = pack("I", $ttl-1);
+        }
+    }
+    $local // die "Assertion: No local addr";
+    $ttl   // die "Assertion: No TTL";
+
+    my $sender = $msghdr->name;
+    my ($peer_port, $peer_addr) = unpack_sockaddr_in($sender);
+    my $peer = inet_ntoa($peer_addr);
+
+    my $buffer = $msghdr->buf;
+    my $props;
+    if ($fou) {
+        $props = fou_decode($buffer, $verbose && \*STDOUT, 1);
+        $props->{data} // redo;
+        $props->{proto} eq "udp" || redo;
+    } else {
+        $props = {
+            proto	=> "udp",
+            data	=> $buffer,
+            dprt	=> $recv_port,
+            dst		=> inet_aton($local),
+            sprt	=> $peer_port,
+            src		=> $peer_addr,
+            # Let fou_encode_udp fill in TTL
+            # ttl		=> TTL,
+        };
+    }
+    print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n" if $verbose;
+    print "Received: ", length($props->{data}), " bytes (TTL $ttl) ", string_from_value($props->{data}), "\n" if $verbose;
+
+    next if defined $props->{ttl} && $props->{ttl} <= 1;
+
+    @$props{keys %replace} = values %replace;
+    # print string_from_value($props), "\n";
+    print "\nWill Send:\n" if $verbose;
+    $buffer = fou_encode_udp(
+        pack_sockaddr_in($props->{sprt}, $props->{src}),
+        pack_sockaddr_in($props->{dprt}, $props->{dst}),
+        $props->{data},
+        $verbose && \*STDOUT,
+        $props->{ttl});
+    $msghdr->buf($buffer);
+    $msghdr->name($send);
+    $msghdr->cmsghdr(defined $props->{ttl} ?
+                     (IPPROTO_IP, IP_TTL, pack("I", $props->{ttl}-1)) : ());
+    $s->sendmsg($msghdr) || die "Could not send: $^E";
+    print "=" x 25 . "\n" if $verbose;
+}

@@ -86,7 +86,7 @@ my ($buffer, $msg_src, $msg_dst, $ttl, $sender);
 
 if ($fou) {
     my ($fou_from, $fou_to) = parse_address($fou, "Fou",
-                                                from => "UDP4", to => "UDP4");
+                                            from => "UDP4", to => "UDP4");
     my ($to_port, $to_addr) = unpack_sockaddr_in($fou_to) or
         die "Assertion: Could not unpack parse_address result from '$fou'";
     my ($from_port, $from_addr);

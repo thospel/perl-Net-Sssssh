@@ -96,7 +96,6 @@ while ($loops--) {
     $msghdr->namelen(256);
     $msghdr->buflen(2**16);
     $s->recvmsg($msghdr) || die "Could not recvmsg: $!";
-    my $buffer = $msghdr->buf;
 
     # Socket::MsgHdr 0.05 does in fact not set flags after recvmsg
     die "Yikes! Buffer was truncated\n" if
@@ -134,10 +133,11 @@ while ($loops--) {
     my ($peer_port, $peer) = unpack_sockaddr_in($sender);
     $peer = inet_ntoa($peer);
 
+    my $buffer = $msghdr->buf;
     my $props;
     if ($fou) {
         $props = fou_decode($buffer, $verbose && \*STDOUT, 1);
-        $buffer = $props->{data} // next;
+        $buffer = $props->{data} // redo;
     }
     print "Sender $peer:$peer_port, Receiver $local [$msg_dst]\n" if $verbose;
     print "Received: ", length($buffer), " bytes (TTL $ttl) ", string_from_value($buffer), "\n" if $verbose;
@@ -174,10 +174,10 @@ while ($loops--) {
                 } else {
                     die "Protocol '$props->{proto}' not implemented (yet)";
                 }
-                    # fou_decode($buffer, \*STDOUT) if $verbose;
+                # fou_decode($buffer, \*STDOUT) if $verbose;
             }
             $msghdr->buf($buffer);
-            $s->sendmsg($msghdr) || die "Could not send: $!";
+            $s->sendmsg($msghdr) || die "Could not send: $^E";
             printf("Sent: %d bytes (TTL %d) %s\n",
                    length($buffer), $ttl-1, string_from_value($buffer)) if $verbose;
         } else {

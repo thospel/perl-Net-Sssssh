@@ -12,7 +12,7 @@ use Carp;
 use Errno qw(ENOENT ESTALE);
 BEGIN { $^W = 1 };
 
-use Test::More tests => 4;
+use Test::More tests => 5;
 use FindBin qw($Bin);
 
 my $t_dir;
@@ -57,7 +57,7 @@ sub check {
 
 $Bin =~ s{/t/?\z}{} || die "No /t at end of $Bin";
 
-for my $script (qw(sssssh udp_proxy udp_send udp_recv)) {
+for my $script (qw(sssssh udp_nat udp_proxy udp_send udp_recv)) {
     ok(!check("-I", "$Bin/blib/lib", "-I", "$Bin/blib/arch",
               "$Bin/bin/$script"),
        "Can compile $Bin/bin/$script");
