@@ -49,7 +49,18 @@ use warnings;
 # ip route add default via 10.253.4.1 table 101
 
 # Avoid other stuff sneaking into the tunnel
-# (not sure how, but when using deluge (torrent): external traffic not on the marked port gets into the tunnel)
+# (not sure how, but when using deluge (torrent): external traffic not on the marked port gets into the tunnel. Deluge for some reason sometimes uses the tunnel IP as its source address)
+# ---- Targeted (124 is uid of deluge -----
+# iptables -A OUTPUT -o ppp0 -m owner --uid-owner 124 -j DROP
+# iptables -A OUTPUT -s 10.253.0.8 -m owner --uid-owner 124 -j ACCEPT
+# iptables -A OUTPUT -s 10.253.1.8 -m owner --uid-owner 124 -j ACCEPT
+# iptables -A OUTPUT -s 127.0.0.0/8 -m owner --uid-owner 124 -j ACCEPT
+# iptables -A OUTPUT -m owner --uid-owner 124 -j DROP
+# OSPF (bird)
+# iptables -A OUTPUT -p 89 -s 10.253.4.1 -j DROP
+# SSDP. Who is doing this ?
+# iptables -A OUTPUT -p udp -s 10.253.4.1 -d 239.255.255.250 -j DROP
+# ---- Brute force -----
 # iptables -t mangle -A INPUT -d 10.253.4.1 -j DROP
 # iptables -t mangle -A OUTPUT -s 10.253.4.1 -j DROP
 
@@ -261,7 +272,12 @@ my $nr_events = 0;
     my $read_mask  = "";
     my $write_mask = "";
     my $error_mask = "";
-    my (%read_refs, %write_refs, %error_refs);
+    my @refs = qw(read write error);
+    my %refs = (
+        read	=> \my %read_refs,
+        write	=> \my %write_refs,
+        error	=> \my %error_refs,
+    );
 
     # All placeholder subs are the same sub
     use constant NOP => sub {};
@@ -448,23 +464,28 @@ my $nr_events = 0;
 
     sub events_fd {
         my $events = shift;
-        push @$events, map {
-            "Read $_" . (ref $read_refs{$_} =~ /0\z/ ? " (dead)" : "")
-        } sort {$a <=> $b} keys %read_refs;
-        push @$events, map {
-            "Write $_" . (ref $write_refs{$_} =~ /0\z/ ? " (dead)" : "")
-        } sort {$a <=> $b} keys %write_refs;
-        push @$events, map {
-            "Error $_" . (ref $error_refs{$_} =~ /0\z/ ? " (dead)" : "")
-        } sort {$a <=> $b} keys %error_refs;
+        for my $name (@refs) {
+            my $refs = $refs{$name};
+            push @$events, map {
+                $refs->{$_} ?
+                    sprintf("%-5s%s %2d -> %s",
+                            ucfirst $name,
+                            ref $refs->{$_} =~ /0\z/ ? " (dead)" : "",
+                            $_,
+                            defined $refs->{$_}[0] ? ref $refs->{$_}[0] : "undef") : ()
+                } sort { $a <=> $b } keys %$refs;
+        }
     }
 
-    sub events {
+    sub _events {
         my @events;
         events_fd(\@events);
         Timer::events_immediate(\@events);
         Timer::events_timer(\@events);
-        print STDERR "$_\n" for @events;
+        return \@events;
+    }
+    sub events {
+        return join("", map "$_\n", @{_events()});
     }
 
     sub mainloop {
@@ -639,7 +660,7 @@ sub DESTROY {
     }
     @{$signals->{handlers}{$sig_name}} = ();
     if (exists $signals->{old}{$sig_name}) {
-        ::caller_info("Restore signal $sig_name") if $verbose > 1;
+        ::info("Restore signal $sig_name (deleted all signal callbacks)") if $verbose > 1;
         $SIG{$sig_name} = delete $signals->{old}{$sig_name};
     }
 }
@@ -908,17 +929,25 @@ my $CLOCK_TYPE_NAME;
     sub events_immediate {
         my $events = shift;
         for my $timer (@immediate) {
-            push @$events, sprintf("%s %08x", $timer->[KEEPDEAD] ? "Immediate (dead)" : "Immediate", refaddr($timer)) if $timer;
+            push @$events, sprintf("Immediate%s -> %s (id=%08x)",
+                    $timer->[KEEPDEAD] ?  " (dead)" : "",
+                    defined $timer->[OBJ] ? ref $timer->[OBJ] : "undef",
+                    refaddr($timer)) if $timer;
         }
     }
 
     sub events_timer {
         my $events = shift;
-        my @t;
-        for my $timer (@timers) {
-            push @t, [$timer, $timer->[KEEPDEAD] ? "Timer (dead)" : "Timer"] if $timer;
-        }
-        push @$events, map sprintf("%s(%s) %08x", $_->[1], $_->[0][TIME], refaddr $_->[0]), sort { $a->[0][TIME] <=> $b->[0][TIME] } @t;
+        my $now = clocktime();
+        push @$events, map {
+            sprintf("Timer%s %2d -> %s (id=%08x timeout=%.3f)",
+                    $_->[KEEPDEAD] ?  " (dead)" : "",
+                    $_->[INDEX],
+                    defined $_->[OBJ] ? ref $_->[OBJ] : "undef",
+                    refaddr($_),
+                    $_->[TIME]-$now,
+                )
+        } sort { $a->[TIME] <=> $b->[TIME] } grep defined, @timers;
     }
 }
 
@@ -1202,6 +1231,8 @@ use vars qw(@ISA);
 
 use Carp qw(croak);
 
+my $BASE_TIME  = Timer->realtime();
+my $BASE_CLOCK = Timer->clocktime();
 my $root = 0;
 
 sub new {
@@ -1270,6 +1301,63 @@ sub timeout {
     my ($root, $timeout) = @_;
     $root->{timeout} = Timer::timer0($timeout, $root, \&global_timeout);
     alarm($timeout+3);
+}
+
+sub client {
+    my ($root, $socket_in, $socket_out, $udp_locals, $udp_remotes) = @_;
+
+    my $line;
+    eval {
+        $line = LineProtocol->new($root, $socket_in, $socket_out);
+
+        for my $udp (@$udp_locals) {
+            my ($from, $to) =
+                $udp =~ m{^([^%]+)%([^%]+)\z} or
+                die "Invalid udp_local '$udp'";
+            $from = ::parse_address($from, "FOU local", from => "UDP4");
+            $to   = ::parse_address($to  , "FOU local", to   => "UDP4", resolve => 1);
+            my $fou = Fou::UDP->new($to);
+            my $listener = Listener::UDP->new($line, $from->{host}, $from->{port}, $fou);
+        }
+
+        for my $name (sort keys %{$line->{settings}}) {
+            if ($name eq "EPOCH") {
+                $line->set_peer($name => $BASE_TIME);
+            } elsif ($name eq "MSGHDR") {
+                $line->set_peer($name => $msghdr_error || Socket::MsgHdr->VERSION);
+            } else {
+                $line->set_peer($name => $line->{settings}{$name});
+            }
+        }
+
+        for my $udp (@$udp_remotes) {
+            my ($from, $to) =
+                $udp =~ m{^([^%]+)%([^%]+)\z} or
+                die "Invalid udp_remote '$udp'";
+            # Pure syntax check, resolving will be done remotely
+            ::parse_address($from, "FOU remote", from => "UDP4");
+            ::parse_address($to  , "FOU remote", to   => "UDP4");
+            $line->write($UDP_REMOTE, $udp);
+        }
+
+        $line->write($START);
+    };
+    die "\u$role: $@" if $@;
+    return $line;
+}
+
+sub server {
+    my ($root, $socket_in, $socket_out) = @_;
+
+    my $line;
+    eval {
+        $line = LineProtocol->new($root, $socket_in, $socket_out);
+
+        $line->set_peer(EPOCH	 => $BASE_TIME);
+        $line->set_peer(MSGHDR	 => $msghdr_error || Socket::MsgHdr->VERSION);
+    };
+    die "\u$role: $@" if $@;
+    return $line;
 }
 
 package _Stream;
@@ -1928,14 +2016,14 @@ sub on_read {
     my ($listener, undef, undef, undef, $bufref) = @_;
 
     my ($ihl, $ecn, $length, $id, $fragment, $ttl, $proto, $chksum, $nsrc, $ndst) = unpack("CCnnnCCna4a4", $$bufref);
-    if (0) {
+    if ($verbose > 2) {
         $listener->info(
             "TEMP: IHL=%d, ECN=%d, LEN=%d, ID=%d, FRAGMENT=%#04X, TTL=%d, PROTO=%d, CHK=%#04X, SRC=%s, DST=%s\n",
             $ihl, $ecn, $length, $id, $fragment, $ttl, $proto, $chksum,
             inet_ntoa($nsrc), inet_ntoa($ndst));
     }
 
-    # Don't handle spammy multicast stuff
+    # Don't handle spammy multicast stuff (in my case mostly OSPF)
     return if $MULTICAST_BEGIN le $ndst && $ndst lt $MULTICAST_END;
 
     my $version = $ihl >> 4;
@@ -2120,18 +2208,13 @@ use vars qw(@ISA);
 use Scalar::Util qw(weaken);
 use Socket qw(inet_aton inet_ntoa pack_sockaddr_in);
 
+# Called with a resolved address (see parse_address)
 sub new {
-    my ($class, $host, $port) = @_;
+    my ($class, $address_to) = @_;
 
-    my $addr = inet_aton($host) || die "Could not resolve '$host'";
-    $host = inet_ntoa($addr);
-    $port = $port =~ /^0\z|^[1-9][0-9]*\z/ ? int($port) :
-        getservbyname($port, "udp") || die "Unknown UDP service '$port'";
-    my $lookup_id = "$host:$port";
+    my $lookup_id = "$address_to->{host}:$address_to->{port}";
     my $fou = $root->{lookups}{$class}{$lookup_id};
     return $fou if $fou;
-
-    my $to = pack_sockaddr_in($port, $addr);
 
     # For now listen on any with a random port. Make this an option
     my ($h, $p, $socket) = Connection->socket_udp("0.0.0.0", 0);
@@ -2139,9 +2222,9 @@ sub new {
     $fou = $class->SUPER::new(
         $root, undef, $socket,
         lookup_id	=> $lookup_id,
-        to		=> $to,
-        host		=> $host,
-        port		=> $port,
+        to		=> $address_to->{packed},
+        host		=> $address_to->{host},
+        port		=> $address_to->{port},
         host_local	=> $h,
         port_local	=> $p);
     weaken($root->{lookups}{$class}{$lookup_id} = $fou);
@@ -2170,9 +2253,6 @@ use Digest::MD5 qw(md5);
 use constant {
     ACK_MASK	=> 0xffffffff,
 };
-
-my $BASE_TIME  = Timer->realtime();
-my $BASE_CLOCK = Timer->clocktime();
 
 my %process_name = (
     $SET		=> "SET",
@@ -2368,7 +2448,7 @@ sub process_START {
 
     defined $line->{settings}{EPOCH} || die "Lost early epoch message";
 
-    my $ready = "$Script $role $me\@$hostname ready (clock=$CLOCK_TYPE_NAME, pid=$$)";
+    my $ready = "$Script $role $me\@$hostname ready (clock $CLOCK_TYPE_NAME, pid $$)";
     $line->{started} = 1;
 
     if ($role eq "server") {
@@ -2409,19 +2489,14 @@ sub process_KEEP {
 sub process_UDP_REMOTE {
     my ($line, $udp) = @_;
 
-    my ($from_port, $separator, $to_port) =
-        $udp =~ m{^([^%=]+)([%=])([^%=]+)\z} or
+    my ($from, $to) =
+        $udp =~ m{^([^%]+)%([^%]+)\z} or
         die "Invalid udp_remote '$udp'";
-    my $from_host = $from_port =~ s{(.*):}{}s ? $1 :
-        $default_bind;
-    $from_host = "0.0.0.0" if $from_host eq "" || $from_host eq "*";
-    my $to_host   = $to_port   =~ s{(.*):}{}s ? $1 :
-        $default_bind;
+    $from = ::parse_address($from, "FOU remote", from => "UDP4");
+    $to   = ::parse_address($to  , "FOU remote", to   => "UDP4", resolve => 1);
 
-    my $fou = Fou::UDP->new($to_host, $to_port);
-    # my $l = $separator eq "%" ? $line : $root;
-    my $l = $line;
-    my $listener = Listener::UDP->new($l, $from_host, $from_port, $fou);
+    my $fou = Fou::UDP->new($to);
+    my $listener = Listener::UDP->new($line, $from->{host}, $from->{port}, $fou);
 }
 
 sub process_DATA_UDP {
@@ -2574,8 +2649,8 @@ sub process_RESPONSE_UDP {
 
         ::info("SPRT=$sprt, DPRT=$dprt, LEN=$udp_len, CHK=$udp_chksum");
     }
-    $line->info("Queue UDP packet (TTL %d) for FOU[%s]: %s:%d -> %s:%d",
-                $ttl, $map->{fou_id}, $src, $sprt, $map->{host}, $map->{port})
+    $line->info("Queue UDP packet (TTL %d) for %s: %s:%d -> %s:%d",
+                $ttl, $fou->name, $src, $sprt, $map->{host}, $map->{port})
         if $verbose > 1;
     $fou->write($buffer, $ttl);
 }
@@ -2740,6 +2815,7 @@ my %commands = (
     set		=> \&command_set,
     finish	=> \&command_finish,
     dump	=> \&command_dump,
+    events	=> \&command_events,
     pid		=> \&command_pid,
     quit	=> \&command_exit,
     exit	=> \&command_exit,
@@ -2800,6 +2876,7 @@ sub command_help {
 quit               Close connection
 exit               Close connection
 dump               Dump internal datastructure
+events             Dump internal Events
 finish             End the program
 help               Show this help
 pid                Show program pid
@@ -2872,6 +2949,13 @@ sub command_dump {
     $control->flush();
 }
 
+sub command_events {
+    my ($control) = @_;
+
+    $control->{out} .= Events::events();
+    $control->flush();
+}
+
 sub command_pid {
     my ($control) = @_;
 
@@ -2891,10 +2975,7 @@ sub new {
 sub on_accept {
     my ($listener, $accepted) = @_;
 
-    # server() does not take parent $root as argument,
-    # so make sure Listener::LineProtocol was called on $root
-    $listener->{parent} == $root || die "Assertion: Inconsistent Listener";
-    ::server($accepted, $accepted);
+    $listener->{parent}->server($accepted, $accepted);
 }
 
 package main;
@@ -3069,7 +3150,7 @@ sub parse_address {
             } else {
                 $matches{$mode} = {
                     type => $type,
-                    host => $parts[0].
+                    host => $parts[0],
                     port => $parts[1],
                 };
             }
@@ -3089,8 +3170,7 @@ sub _cleanup_all {
     Signals->_cleanup_all;
     if ($nr_events && defined $root) {
         $root = undef;
-        print STDERR "Pid=$$\n";
-        Events::events();
+        print STDERR "Pid=$$\n" . Events::events();
         die "Assertion: Still have $nr_events events";
     }
 }
@@ -3107,63 +3187,6 @@ sub add_control {
 
     my $address = parse_address("127.0.0.1:0", "Control", from => "TCP4", resolve => 1);
     Listener::Control->new($parent, $address);
-}
-
-sub client {
-    my ($socket_in, $socket_out, $udp_locals, $udp_remotes) = @_;
-
-    my $line;
-    eval {
-        $line = LineProtocol->new($root, $socket_in, $socket_out);
-
-        for my $udp (@$udp_locals) {
-            my ($from_port, $separator, $to_port) =
-                $udp =~ m{^([^%=]+)([%=])([^%=]+)\z} or
-                die "Invalid udp_local '$udp'";
-            my $from_host = $from_port =~ s{(.*):}{}s ? $1 :
-                $default_bind;
-            $from_host = "0.0.0.0" if $from_host eq "" || $from_host eq "*";
-            my $to_host   = $to_port   =~ s{(.*):}{}s ? $1 :
-                $default_bind;
-            my $fou = Fou::UDP->new($to_host, $to_port);
-            # my $l = $separator eq "%" ? $line : $root;
-            my $l = $line;
-            my $listener = Listener::UDP->new($l, $from_host, $from_port, $fou);
-        }
-
-        for my $name (sort keys %{$line->{settings}}) {
-            if ($name eq "EPOCH") {
-                $line->set_peer($name => $BASE_TIME);
-            } elsif ($name eq "MSGHDR") {
-                $line->set_peer($name => $msghdr_error || Socket::MsgHdr->VERSION);
-            } else {
-                $line->set_peer($name => $line->{settings}{$name});
-            }
-        }
-
-        for my $udp (@$udp_remotes) {
-            $udp =~ m{^[^%=]+[%=][^%=]+\z} or die "Invalid udp remote '$udp'";
-            $line->write($UDP_REMOTE, $udp);
-        }
-
-        $line->write($START);
-    };
-    die "\u$role: $@" if $@;
-    return $line;
-}
-
-sub server {
-    my ($socket_in, $socket_out) = @_;
-
-    my $line;
-    eval {
-        $line = LineProtocol->new($root, $socket_in, $socket_out);
-
-        $line->set_peer(EPOCH	 => $BASE_TIME);
-        $line->set_peer(MSGHDR	 => $msghdr_error || Socket::MsgHdr->VERSION);
-    };
-    die "\u$role: $@" if $@;
-    return $line;
 }
 
 my @ARGV_OLD = @ARGV;
@@ -3264,7 +3287,7 @@ if ($role eq "server") {
         open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
         open(my $socket_out, ">&STDOUT") || die "Could not dup STDOUT: $^E";
         open(STDIN, ">&", $null) || die "Could not dup to STDOUT: $^E";
-        server($socket_in, $socket_out);
+        $root->server($socket_in, $socket_out);
     }
     $root->signal_add0("USR1", \&add_control) if defined $server && $no_control < 2;
 } else {
@@ -3294,7 +3317,7 @@ if ($role eq "server") {
 
         my $host = $client =~ s{(.*):}{}s ? $1 : "127.0.0.1";
         my $socket = Connection->socket_tcp($host, $client);
-        client($socket, $socket, \@udp_local, \@udp_remote);
+        $root->client($socket, $socket, \@udp_local, \@udp_remote);
     } else {
         @ARGV || die "Missing remote host argument, Try $Script -h\n";
         $stuff = 1 if !defined $stuff;
@@ -3395,7 +3418,7 @@ if ($role eq "server") {
             alarm(0);
             $line eq $STUFFED || die "Bad server confirm $line";
         }
-        client($rd1, $wr0, \@udp_local, \@udp_remote);
+        $root->client($rd1, $wr0, \@udp_local, \@udp_remote);
     }
 }
 
