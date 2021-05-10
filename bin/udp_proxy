@@ -70,13 +70,15 @@ use warnings;
 # ip fou del port 1237 ipproto 4 local 127.0.0.1
 # ip link del name fou1
 
-# Ping forwarding needs permission to open a IPPROTO_ICMP sockets on the
+# Native ping forwarding needs permission to open a IPPROTO_ICMP sockets on the
 # forwarded host.
 # E.g. On linux:
 #   Query current permissions:
 #      sysctl net.ipv4.ping_group_range
 #   Allow group 1014:
 #      sysctl net.ipv4.ping_group_range='1014 1014'
+# If this permission is not available (or not supported on the OS) the program
+# falls back to running an external ping program
 
 our $VERSION = "1.000";
 
@@ -87,6 +89,7 @@ use Sys::Hostname;
 use Errno qw(EINTR ENOENT);
 use Time::Local qw(timegm);
 use Socket qw(inet_aton);
+use POSIX qw(_exit);
 
 use Data::Dumper;
 $Data::Dumper::Indent   = 1;
@@ -97,7 +100,6 @@ $Data::Dumper::Useqq	= 1;
     die "Could not parse ", __FILE__ if $Script eq "-" && __FILE__ ne "-";
 
 $SIG{PIPE} = "IGNORE";
-$SIG{CHLD} = "IGNORE";
 
 delete @ENV{'IFS', 'CDPATH', 'ENV', 'BASH_ENV'};
 $ENV{PATH}="/usr/bin:/usr/sbin:/bin:/sbin";
@@ -1435,6 +1437,7 @@ use vars qw(@ISA);
 @ISA = qw(Object);
 
 use Carp qw(croak);
+use Scalar::Util qw(weaken);
 
 my $BASE_TIME  = Timer->realtime();
 my $BASE_CLOCK = Timer->clocktime();
@@ -1452,6 +1455,8 @@ sub new {
         settings	=> { %settings_global },
         timeout		=> undef,
         signals		=> {},
+        ping_queued	=> [],
+        pingers		=> 0,
     }, $class;
     $root->info("CREATE") if $verbose > 2;
     return $root;
@@ -1471,6 +1476,7 @@ sub status {
     $control->{out} .= <<"EOF"
 $indent$name
 $indent  Settings: $settings
+$indent  pingers $root->{pingers}
 EOF
         ;
 }
@@ -1566,6 +1572,29 @@ sub server {
     };
     die "\u$role: $@" if $@;
     return $line;
+}
+
+sub ping_activate {
+    my ($root, $line, $icmp) = @_;
+
+    if ($root->{pingers} >= $root->{settings}{PING_MAX}) {
+        weaken($root->{ping_queued}[@{$root->{ping_queued}}] = $line);
+        return 0;
+    }
+    Pinger->new($root, $icmp);
+    ++$root->{pingers};
+    return 1;
+}
+
+sub ping_finished {
+    my ($root) = @_;
+
+    --$root->{pingers};
+    while (@{$root->{ping_queued}} && $root->{pingers} < $root->{settings}{PING_MAX}) {
+        my $line = shift @{$root->{ping_queued}} || next;
+        weaken($root->{ping_queued}[@{$root->{ping_queued}}] = $line) if
+            $line->ping_finished($root);
+    }
 }
 
 package Connection;
@@ -2052,37 +2081,15 @@ sub resume_read {
 package Pinger;
 use vars qw(@ISA);
 # We maybe should introduce a StreamReader for only the read part of Stream
-@ISA = qw(Stream);
+@ISA = qw(Stream0);
 
 use Scalar::Util qw(weaken);
 use Socket qw(inet_aton);
-use POSIX qw(_exit);
-
-{
-    my @queued;
-    sub queue {
-        my ($class, $icmp) = @_;
-
-        # $icmp->info("Queue on Pinger, set pending=1");
-        die "Assertion: Already pending" if $icmp->{pending};
-        weaken($queued[@queued] = $icmp);
-        $icmp->{pending} = 1;
-    }
-
-    sub activate_ping {
-        # ::caller_info("Pinger::activate_ping, queued=%d, ping_max=%d", scalar @queued, $ping_max);
-        while (@queued && $ping_max > 0) {
-            my $icmp = shift @queued || next;
-            $icmp->unqueue_ping();
-        }
-    }
-}
 
 sub new {
-    my ($class, $icmp, $host, $data) = @_;
+    my ($class, $root, $client) = @_;
 
-    $ping_max > 0 || die "Assertion: Ping max $ping_max > 0";
-
+    my ($host, $data) = $client->host_data;
     pipe(my $rd0, my $wr0) || die "Could not open pipe: $^E";
     pipe(my $rd1, my $wr1) || die "Could not open pipe: $^E";
 
@@ -2122,13 +2129,14 @@ sub new {
     #    die "Boem";
     #}
     my $pinger = $class->SUPER::new(
-        $icmp, $rd1, undef,
+        $root, $rd1, undef,
         waitable	=> undef,
         handle		=> $rd0,
         pid		=> $pid,
         parent_pid	=> $$,
         host		=> $host,
         data		=> $data);
+    weaken($pinger->{client} = $client);
 
     $pinger->info("waiting to spawn ping '%s'",
                   $pinger->{host}) if $verbose > 1;
@@ -2149,7 +2157,7 @@ sub wait : method {
         die "Could not wait for pid '$pid'" if $p < 0;
         die "Assertion: Invalid pid result" if $p != $pid;
     }
-    die "Unexpected exitcode $? from ping $pinger->{host} (pid $pid)" if $?;
+    # die "Unexpected exitcode $? from ping $pinger->{host} (pid $pid)" if $?;
 }
 
 sub eof : method {
@@ -2158,32 +2166,32 @@ sub eof : method {
     if ($pinger->{handle}) {
         # Read from the probe pipe
         $pinger->{socket_in} = delete $pinger->{handle};
-        if ($pinger->{in} ne "") {
-            $pinger->wait;
-            $pinger->die($pinger->{in});
-        }
-        $pinger->{reader} = Events::add_read($pinger->{socket_in}, $pinger, \&_Stream::reader);
+        $pinger->die($pinger->{in}) if $pinger->{in} ne "";
+        $pinger->{reader} = Events::add_read0($pinger->{socket_in}, $pinger, \&_Stream::reader);
         $pinger->info("Spawned. Switch to reading ping result") if $verbose > 1;
         return;
     }
 
     $pinger->{waitable} = 1;
-    my $icmp = $pinger->{parent};
+    my $client = $pinger->{client};
     if (my ($ip, $ttl, $time) =
         $pinger->{in} =~ /from (\d+\.\d+\.\d+\.\d+).* icmp_[sr]eq.* ttl=(\d+).* time=(\S+ (?:ms|usec))/) {
         $pinger->info("Response from '%s' ttl=%d, time=%s",
                       $ip, $ttl, $time) if $verbose > 1;
         $ip eq $pinger->{host} ||
-            $pinger->bug("Inconsistent: pinged '$pinger->{host}', got aswer from '$ip'");
-        $icmp->{parent}->write($RESPONSE_PING, pack("wa4C", $icmp->{id}, inet_aton($pinger->{host}), $ttl-1), $pinger->{data}) if $ttl > 1;
-    } elsif ($verbose > 1) {
-        if ($pinger->{in} eq "") {
-            $pinger->info("No response from '%s'",
-                          $pinger->{host}) if $verbose > 1;
-        } else {
-            $pinger->info("No result in response from '%s': %s",
-                          $pinger->{host}, ::display($pinger->{in})) if $verbose > 1;
+            $pinger->bug("Inconsistent: pinged '$pinger->{host}', got answer from '$ip'");
+        $client->ping_result($pinger->{data}, $ttl, $time) if $client;
+    } else {
+        if ($verbose > 1) {
+            if ($pinger->{in} eq "") {
+                $pinger->info("No response from '%s'",
+                              $pinger->{host}) if $verbose > 1;
+            } else {
+                $pinger->info("No result in response from '%s': %s",
+                              $pinger->{host}, ::display($pinger->{in})) if $verbose > 1;
+            }
         }
+        $client->ping_result($pinger->{data}) if $client;
     }
     $pinger->delete("Ping result");
 }
@@ -2191,19 +2199,18 @@ sub eof : method {
 sub _finish {
     my $pinger = shift;
 
+    delete $pinger->{data};
     $pinger->wait if $pinger->{waitable};
     $pinger->SUPER::_finish(@_);
+}
 
-    # $pinger->caller_info("delete");
-    my $icmp = $pinger->{parent};
-    # Avoid new pings being started during finish in fork children
-    $icmp->{pid} == $$ || return;
-    my $line = $icmp->{parent};
-
-    --$line->{nr_pingers};
-    ++$ping_max;
-    Pinger->activate_ping;
-    $line->activate_ping;
+# This code belongs in _finish really
+# But that would allow new Pingers to be started while the finished one is
+# not freed yet, so the ids would go above ping_max which looks super confusing
+sub _delete {
+    my $pinger = shift;
+    $pinger->SUPER::_delete(@_);
+    $pinger->{parent}->ping_finished;
 }
 
 sub on_read {
@@ -2282,10 +2289,10 @@ sub write : method {
     my $icmp = shift;
 
     if (!$icmp->{socket_out}) {
-        $icmp->info("Queue external ping %s", inet_ntoa($_[0])) if $verbose;
+        $icmp->info("Queue external ping %s [seqno %d]", inet_ntoa($_[0]), $_[1]) if $verbose;
         # We could retry acquiring an ICMP socket here
-        push @{$icmp->{out}}, [shift, shift, shift];
-        $icmp->activate_ping;
+        $icmp->{parent}->ping_activate($icmp) if
+            1 == push @{$icmp->{out}}, [shift, shift, shift];
         return;
     }
 
@@ -2307,39 +2314,24 @@ sub write : method {
     $icmp->SUPER::write(0, $dst, $data, shift);
 }
 
-sub activate_ping {
+sub host_data {
     my ($icmp) = @_;
-
-    # $icmp->caller_info("Try to activate ping size out=%d, ping_max=%d, pending=%d", scalar @{$icmp->{out}}, $ping_max, $icmp->{pending});
-    return if $icmp->{pending};
-
-    while (@{$icmp->{out}}) {
-        if ($ping_max <= 0) {
-            Pinger->queue($icmp);
-            return;
-        }
-
-        my $line = $icmp->{parent};
-        if ($line->{nr_pingers} >= $line->{settings}{PING_MAX}) {
-            $line->queue_ping($icmp);
-            return;
-        }
-
-        Pinger->new($icmp,
-                    inet_ntoa($icmp->{out}[0][0]),
-                    shift(@{$icmp->{out}})->[2]);
-        ++$line->{nr_pingers};
-        --$ping_max;
-    }
+    my $out = shift @{$icmp->{out}} || $icmp->bug("Empty ping queue");
+    return inet_ntoa($out->[0]), $out;
 }
 
-sub unqueue_ping {
-    my ($icmp) = @_;
+sub ping_result {
+    my ($icmp, $out, $ttl, $time) = @_;
 
-    # $icmp->caller_info("Unqueue, set pending=0");
-    $icmp->{pending} || die "Assertion: Not pending";
-    $icmp->{pending} = 0;
-    $icmp->activate_ping;
+    $icmp->{parent}->write($RESPONSE_PING, pack("wa4C", $icmp->{id}, $out->[0], $ttl-1), $out->[2]) if defined $ttl && $ttl > 1;
+}
+
+sub ping_finished {
+    my ($icmp, $line, $root) = @_;
+
+    @{$icmp->{out}} || $icmp->bug("Empty out was queued");
+    $root->ping_activate($line, $icmp);
+    return scalar @{$icmp->{out}};
 }
 
 package Sender::UDP;
@@ -2874,8 +2866,7 @@ sub new {
         in_acked	=> 0,
         out_sent	=> 0,
         out_base	=> 0,
-        nr_pingers	=> 0,
-        queue_ping	=> [],
+        ping_queued	=> [],
         @_);
 }
 
@@ -3007,24 +2998,26 @@ sub keepalive {
     $line->{unacked} = 0;
 }
 
-sub queue_ping {
+sub ping_activate {
     my ($line, $icmp) = @_;
 
-    # $icmp->info("Queue on %s, set pending=2", $line->name);
-    die "Assertion: Already pending" if $icmp->{pending};
-    weaken($line->{queue_ping}[@{$line->{queue_ping}}] = $icmp);
-    $icmp->{pending} = 2;
+    if (@{$line->{ping_queued}} || !$line->{parent}->ping_activate($line, $icmp)) {
+        weaken($line->{ping_queued}[@{$line->{ping_queued}}] = $icmp);
+        return 0;
+    }
+    return 1;
 }
 
-sub activate_ping {
-    my ($line) = @_;
+sub ping_finished {
+    my ($line, $root) = @_;
 
-    # $line->info("Activate ping, queued=%d, nr_pingers=%d",
-    #            scalar @{$line->{queue_ping}}, $line->{nr_pingers});
-    while (@{$line->{queue_ping}} && $line->{nr_pingers} < $line->{settings}{PING_MAX}) {
-        my $icmp = shift @{$line->{queue_ping}} || next;
-        $icmp->unqueue_ping();
+    while (@{$line->{ping_queued}}) {
+        my $icmp = shift @{$line->{ping_queued}} || next;
+        weaken($line->{ping_queued}[@{$line->{ping_queued}}] = $icmp) if
+            $icmp->ping_finished($line, $root);
+        return scalar @{$line->{ping_queued}};
     }
+    return 0;
 }
 
 sub status {
@@ -3431,7 +3424,7 @@ sub new_suspended {
         $parent,
         @_,
         local	=> \%local,
-        loop	=> $loops,
+        loops	=> $loops,
         socket	=> $socket,
         reader	=> undef);
     $address->{host} = $h;
@@ -4012,7 +4005,8 @@ if ($role eq "server") {
                         die "Could not exec $ssh: $^E";
                 }
             };
-            die $@ || "No error";
+            print STDERR $@ || "No error";
+            _exit(1);
         }
 
         # Parent
