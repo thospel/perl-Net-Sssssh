@@ -1014,6 +1014,27 @@ sub count {
     return $ids->{free_id} - @{$ids->{free_ids}} + (1-INIT_ID);
 }
 
+package Ids2;
+use vars qw(@ISA);
+@ISA = qw(Ids);
+
+sub new {
+    my $class = shift;
+    my $ids = $class->SUPER::new(@_);
+    $ids->{offset} = $ids->{free_id} + ($role eq "client" ? 1 : 0);
+    return $ids;
+}
+
+sub id_alloc {
+    return 2*$_[0]->SUPER::id_alloc() - $_[0]->{offset};
+}
+
+sub id_free {
+    my $ids = shift;
+    my $id = $ids->{ofset} + shift;
+    $ids->SUPER::id_free($id >> 1) unless $id &1;
+}
+
 package ConnUtils;
 use Socket
     qw(AF_INET PF_INET SOCK_DGRAM SOCK_STREAM SO_REUSEADDR IPPROTO_TCP
@@ -1297,8 +1318,10 @@ sub delete : method {
         die "Recursive delete on '@_' [", ::callers(), "]";
     }
     $object->{deleted} = -1;
+    $object->info("DELETING") if $verbose > 2;
     $object->finish(@_) unless $object->{finished};
     $object->_delete(@_);
+    $object->info("DELETED") if $verbose > 2;
     $object->{deleted} = 1;
 }
 
@@ -1380,6 +1403,14 @@ sub child {
     return $object->{children}{$class}[$id];
 }
 
+sub ids_set {
+    my ($object, $class, $ids) = @_;
+
+    $ids ||= Ids->new;
+    $object->bug("Already have ids for class '$class'") if $object->{ids}{$class};
+    $object->{ids}{$class} = $ids;
+}
+
 sub info {
     my $object = shift;
     my $format = shift;
@@ -1410,10 +1441,9 @@ sub immediate {
 sub count_children {
     my ($object, $class) = @_;
 
-    local $object->{parent};
-    return $object->{ids}{$class}->count if $object->{ids} && $object->{ids}{$class};
-    $object->{children} && $object->{children}{$class} || return 0;
-    return scalar grep defined, @{$object->{children}{$class}};
+    my $ids = $object->{ids}{$class} ||
+        $object->bug("No counter for class '$class'");
+    return $ids->count;
 }
 
 sub status_all {
@@ -1456,9 +1486,9 @@ sub new {
         timeout		=> undef,
         signals		=> {},
         ping_queued	=> [],
-        pingers		=> 0,
     }, $class;
     $root->info("CREATE") if $verbose > 2;
+    $root->ids_set("Pinger");
     return $root;
 }
 
@@ -1476,7 +1506,6 @@ sub status {
     $control->{out} .= <<"EOF"
 $indent$name
 $indent  Settings: $settings
-$indent  pingers $root->{pingers}
 EOF
         ;
 }
@@ -1577,20 +1606,19 @@ sub server {
 sub ping_activate {
     my ($root, $line, $icmp) = @_;
 
-    if ($root->{pingers} >= $root->{settings}{PING_MAX}) {
+    if ($root->count_children("Pinger") >= $root->{settings}{PING_MAX}) {
         weaken($root->{ping_queued}[@{$root->{ping_queued}}] = $line);
         return 0;
     }
     Pinger->new($root, $icmp);
-    ++$root->{pingers};
     return 1;
 }
 
 sub ping_finished {
     my ($root) = @_;
 
-    --$root->{pingers};
-    while (@{$root->{ping_queued}} && $root->{pingers} < $root->{settings}{PING_MAX}) {
+    while (@{$root->{ping_queued}} &&
+           $root->count_children("Pinger") < $root->{settings}{PING_MAX}) {
         my $line = shift @{$root->{ping_queued}} || next;
         weaken($root->{ping_queued}[@{$root->{ping_queued}}] = $line) if
             $line->ping_finished($root);
@@ -2854,7 +2882,7 @@ sub new {
     my $socket_in	= shift;
     my $socket_out	= shift;
 
-    return $class->SUPER::new(
+    my $line = $class->SUPER::new(
         $parent, $socket_in, $socket_out,
         settings	=> { %{$parent->{settings}} },
         started		=> undef, # Normal operations started
@@ -2868,6 +2896,8 @@ sub new {
         out_base	=> 0,
         ping_queued	=> [],
         @_);
+    $line->ids_set("TCP::Forward", Ids2->new);
+    return $line;
 }
 
 sub on_read {
@@ -3801,6 +3831,7 @@ sub string_from_value {
 
 # Try an immediate exit. No references should exist in the call chain
 sub _cleanup_all {
+    $root->delete("Cleanup all") if $root && !$root->{deleted};
     $root &&= 0;
     Signals->_cleanup_all;
     if ($nr_events && defined $root) {
