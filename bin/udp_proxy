@@ -171,14 +171,11 @@ my $SET		= "S";	# sets a server variable
 my $FOU_REMOTE	= "r";
 my $PING	= "P";
 my $RESPONSE_PING= "p";
-my $RESPONSE_UDP= "d";
-my $DATA_UDP	= "D";
-my $DATA_TCP_LR	= "T";	# Local to Remote DATA
-my $DATA_TCP_RL	= "t";	# Remote to Local DATA
-my $DATA_EOF_LR	= "E";	# Local to Remote EOF
-my $DATA_EOF_RL	= "e";	# Remote to Local EOF
-my $DATA_FIN_LR	= "F";	# Local to Remote FINISH (will never more about this id)
-my $DATA_FIN_RL	= "f";	# Remote to Local FINISH (will never more about this id)
+my $RESPONSE_UDP= "u";
+my $UDP_DATA	= "U";
+my $TCP_DATA	= "D";	# Local to Remote DATA
+my $TCP_EOF	= "E";	# Local to Remote EOF
+my $TCP_FIN	= "F";	# Local to Remote FINISH (will never more about this id)
 my $KEEP	= "K";	# Keepalive/ACK packet
 my $CONNECT	= "C";
 
@@ -1014,6 +1011,10 @@ sub count {
     return $ids->{free_id} - @{$ids->{free_ids}} + (1-INIT_ID);
 }
 
+sub id_check {
+    die "Assertion: Inconsistent id usage [", ::callers() . "]\n";
+}
+
 package Ids2;
 use vars qw(@ISA);
 @ISA = qw(Ids);
@@ -1031,8 +1032,14 @@ sub id_alloc {
 
 sub id_free {
     my $ids = shift;
-    my $id = $ids->{ofset} + shift;
+    my $id = $ids->{offset} + shift;
     $ids->SUPER::id_free($id >> 1) unless $id &1;
+}
+
+sub id_check {
+    my $ids = shift;
+    my $id = $ids->{offset} + shift;
+    $ids->SUPER::id_check($id)  unless $id &1;
 }
 
 package ConnUtils;
@@ -1292,8 +1299,8 @@ sub new {
     weaken($object->{parent});
     if (defined $object->{id}) {
         # Caller managed IDs
-        die "Assertion: Inconsistent id usage" if $parent->{ids}{$class};
-        die "Assertion: ", ref $object, "[$object->{id}] already exists" if
+        $parent->{ids}{$class}->id_check($object->{id}) if $parent->{ids}{$class};
+        $parent->bug("Child " . $object->name() . " already exists") if
             $parent->{children}{$class}[$object->{id}];
     } else {
         # Local managed IDs
@@ -1552,7 +1559,7 @@ sub client {
         for my $tcp (@{$connections->{tcp_local}}) {
             my ($from, $to) = ConnUtils->parse_address($tcp, "TCP local", from => "TCP4", to => "TCP4");
             ConnUtils->resolve($from, "TCP local");
-            Listener::TCP::Local->new_suspended($line, $from, -1, remote => $to);
+            Listener::TCP::Forward->new_suspended($line, $from, -1, remote => $to);
         }
         for my $udp (@{$connections->{fou_local}}) {
             my ($from, $to) =
@@ -1862,26 +1869,29 @@ use Socket qw(SOL_SOCKET SO_ERROR);
 sub new {
     my $class  = shift;
     my $parent = shift;
-    my $from   = shift;
-    my $to     = shift;
+    my $local  = shift;
+    my $peer   = shift;
 
-    my $socket = ConnUtils->socket_tcp($from->{host}, $from->{port}, 0);
-    # pass undef for socket_in. This avoid reader being started by Stream
+    # pass undef for socket_in.  This avoid reader being started by Stream
+    # pass undef for socket_out. This allows alternate call without connect()
     my $connect = $class->SUPER::new(
-        $parent, undef, $socket,
-        peer	=> $to,
+        $parent, undef, undef,
+        peer	=> $peer,
         local	=> undef,
         @_,
     );
-    if (connect($socket, $to->{packed})) {
-        # Immediate connect
-        $connect->{timeout} = Timer::immediate($connect, \&on_connect);
-    } elsif ($! == EINPROGRESS || $! == EWOULDBLOCK) {
-        $connect->info("Connecting to '$to->{user}' [$to->{display}]") if $verbose > 1;
-        $connect->{writer} = Events::add_write0($connect->{socket_out}, $connect, \&connected);
-        $connect->{timeout} = Timer::timer($connect->{parent}{settings}{TIMEOUT}, $connect, \&connection_timeout);
-    } else {
-        $connect->error("Could not connect to '$to->{user}' [$to->{display}]: $^E");
+    if (!defined $connect->{socket_out}) {
+        my $socket = $connect->{socket_out} = ConnUtils->socket_tcp($local->{host}, $local->{port}, 0);
+        if (connect($socket, $peer->{packed})) {
+            # Immediate connect
+            $connect->{timeout} = Timer::immediate($connect, \&on_connect);
+        } elsif ($! == EINPROGRESS || $! == EWOULDBLOCK) {
+            $connect->info("Connecting to '$peer->{user}' [$peer->{display}]") if $verbose > 1;
+            $connect->{writer} = Events::add_write0($connect->{socket_out}, $connect, \&connected);
+            $connect->{timeout} = Timer::timer($connect->{parent}{settings}{TIMEOUT}, $connect, \&connection_timeout);
+        } else {
+            $connect->error("Could not connect to '$peer->{user}' [$peer->{display}]: $^E");
+        }
     }
     return $connect;
 }
@@ -2552,7 +2562,7 @@ sub on_read {
             $map_src->[2][$id] = $map;
         }
         # print STDERR ::Dumper($id, $line->{map_udp});
-        $line->write($DATA_UDP, pack("wa4nC", $id, $ndst, $dprt, $ttl-1), $$bufref);
+        $line->write($UDP_DATA, pack("wa4nC", $id, $ndst, $dprt, $ttl-1), $$bufref);
     } elsif ($proto == $PROTO_ICMP) {
         # Must have ToS 0
         $dscp == 0 && $ecn == 0 || return;
@@ -2638,204 +2648,121 @@ sub _finish {
     $fou->SUPER::_finish(@_);
 }
 
-package Listener::TCP::Local;
+package Listener::TCP::Forward;
 use vars qw(@ISA);
 @ISA = qw(Listener);
 
-package TCP::Local;
-use vars qw(@ISA);
-@ISA = qw(Stream);
+sub on_accept {
+    my ($listener, $accepted, $local, $peer) = @_;
 
-sub new {
-    my ($class, $line, $socket_in, $socket_out, $listener, $local, $peer) = @_;
-
+    my $line = $listener->{parent};
     my %remote = %{$listener->{remote}};
     $remote{port} ||= $local->{port};
     $remote{host} = $local->{host} if $remote{host} eq "0.0.0.0";
     $remote{display} = "$remote{host}:$remote{port}";
-    my $tcp_local = $class->SUPER::new(
-        $line, $socket_in, $socket_out,
-        local	=> $local,
-        peer	=> $peer,
-        remote	=> \%remote,
+
+    my $forward = TCP::Forward->new(
+        $line, undef, $peer,
+        socket_in	=> $accepted,
+        socket_out	=> $accepted,
+        local		=> $local,
+        remote		=> \%remote,
     );
-    $tcp_local->info("Start forwarding from %s to %s (remote connect may still fail though)", $peer->{display}, $remote{display}) if $verbose > 1;
+    $forward->info("Start forwarding from %s to %s (remote connect may still fail though)", $peer->{display}, $remote{display}) if $verbose > 1;
     $line->write($CONNECT, pack("ww/a*a*",
-                                $tcp_local->{id},
+                                $forward->{id},
                                 @remote{qw(type display)}));
-    return $tcp_local;
+    return $forward;
 }
 
-sub on_read {
-    my ($local) = @_;
-
-    $local->info("Sending data: %s", ::display($local->{in})) if $verbose > 1;
-    $local->{parent}->write($DATA_TCP_LR, pack("w", $local->{id}), $local->{in});
-    $local->{in} = "";
-}
-
-sub eof : method {
-    my $local = shift;
-
-    if ($local->{socket_out}) {
-        $local->info("@_: Shutdown read, stop writing to remote") if $verbose > 1;
-        shutdown($local->{socket_in}, 0) ||
-            $local->die("Could not shutdown read: $^E");
-        delete $local->{socket_in};
-        # Tell the other side that we won't send any more data
-        $local->{parent}->write($DATA_EOF_LR, pack("w", $local->{id}));
-    } else {
-        # We already stopped writing. We are now completely useless
-        $local->info("@_") if $verbose > 1;
-        $local->finished_local(@_);
-    }
-}
-
-sub remote_eof {
-    my ($local) = @_;
-
-    $local->info("Remote EOF") if $verbose > 1;
-
-    $local->{reason} = "@_";
-    if ($local->{out} eq "") {
-        $local->write_end;
-    } else {
-        $local->{on_written} = \&write_end;
-    }
-}
-
-sub write_end {
-    my ($local) = @_;
-
-    if ($local->{socket_in}) {
-        $local->info("Shutdown write, keep reading");
-        shutdown($local->{socket_out}, 1) ||
-            $local->die("Could not shutdown write: $^E");
-        delete $local->{socket_out};
-        # Keep reading
-    } else {
-        # We already stopped reading. We are now completely useless
-        $local->finished_local($local->{reason});
-    }
-}
-
-sub finish_remote {
-    my ($local, $reason) = @_;
-
-    $local->info("Tell remote to finish after local $reason") if $verbose > 1;
-    $local->{parent}->write($DATA_FIN_LR, pack("w", $local->{id}), $reason);
-}
-
-sub finish_local {
-    my $local = shift;
-
-    $local->{reason} = "@_";
-    $local->{reader} = undef if delete $local->{socket_in};
-
-    if ($local->{out} eq "") {
-        $local->local_end;
-    } else {
-        $local->{on_written} = \&local_end;
-    }
-}
-
-sub local_end {
-    my ($local) = @_;
-    $local->finished_local($local->{reason});
-}
-
-sub error {
-    my $local = shift;
-    $local->finished_local(@_);
-}
-
-package TCP::Remote;
+package TCP::Forward;
 use vars qw(@ISA);
 @ISA = qw(Connect);
 
 sub on_read {
-    my ($remote) = @_;
+    my ($forward) = @_;
 
-    $remote->info("Sending data: %s", ::display($remote->{in})) if $verbose > 1;
-    $remote->{parent}->write($DATA_TCP_RL, pack("w", $remote->{id}), $remote->{in});
-    $remote->{in} = "";
+    $forward->info("Sending data: %s", ::display($forward->{in})) if $verbose > 1;
+    $forward->{parent}->write($TCP_DATA, pack("w", $forward->{id}), $forward->{in});
+    $forward->{in} = "";
 }
 
 sub eof : method {
-    my $remote = shift;
+    my $forward = shift;
 
-    $remote->info("@_") if $verbose > 1;
-    if ($remote->{socket_out}) {
-        $remote->info("@_: Shutdown read, stop writing to remote") if $verbose > 1;
-        shutdown($remote->{socket_in}, 0) ||
-            $remote->die("Could not shutdown read: $^E");
-        delete $remote->{socket_in};
+    if ($forward->{socket_out}) {
+        $forward->info("@_: Shutdown read, stop writing to remote") if $verbose > 1;
+        shutdown($forward->{socket_in}, 0) ||
+            $forward->die("Could not shutdown read: $^E");
+        delete $forward->{socket_in};
         # Tell the other side that we won't send any more data
-        $remote->{parent}->write($DATA_EOF_RL, pack("w", $remote->{id}));
+        $forward->{parent}->write($TCP_EOF, pack("w", $forward->{id}));
     } else {
         # We already stopped writing. We are now completely useless
-        $remote->{parent}->write($DATA_FIN_RL, pack("w", $remote->{id}), "Connection closed");
+        $forward->info("@_") if $verbose > 1;
+        $forward->finished_local(@_);
     }
 }
 
 sub remote_eof {
-    my ($remote) = @_;
+    my ($forward) = @_;
 
-    $remote->info("Remote EOF") if $verbose > 1;
+    $forward->info("Remote EOF") if $verbose > 1;
 
-    if ($remote->{out} eq "") {
-        $remote->write_end;
+    $forward->{reason} = "@_";
+    if ($forward->{out} eq "") {
+        $forward->write_end;
     } else {
-        $remote->{on_written} = \&write_end;
+        $forward->{on_written} = \&write_end;
     }
 }
 
 sub write_end {
-    my ($remote) = @_;
+    my ($forward) = @_;
 
-    if ($remote->{socket_in}) {
+    if ($forward->{socket_in}) {
         # this implies we are connected and did not yet get EOF
-        $remote->info("Shutdown write, keep reading");
-        shutdown($remote->{socket_out}, 1) ||
-            $remote->die("Could not shutdown write: $^E");
-        delete $remote->{socket_out};
+        $forward->info("Shutdown write, keep reading");
+        shutdown($forward->{socket_out}, 1) ||
+            $forward->die("Could not shutdown write: $^E");
+        delete $forward->{socket_out};
         # Keep reading
     } else {
-        # !$remote->{local} implies we are connecting. Abort
-        delete @$remote{qw(socket_out timeout writer)} if !$remote->{local};
+        # !$forward->{local} implies we are connecting. Abort
+        delete @$forward{qw(socket_out timeout writer)} if !$forward->{local};
         # We already stopped reading. We are now completely useless
-        $remote->finished_local($remote->{reason});
+        $forward->finished_local($forward->{reason});
     }
 }
 
 sub finish_remote {
-    my ($local, $reason) = @_;
+    my ($forward, $reason) = @_;
 
-    $local->info("Tell remote to finish after local $reason") if $verbose > 1;
-    $local->{parent}->write($DATA_FIN_RL, pack("w", $local->{id}), $reason);
+    $forward->info("Tell remote to finish after local $reason") if $verbose > 1;
+    $forward->{parent}->write($TCP_FIN, pack("w", $forward->{id}), $reason);
 }
 
 sub finish_local {
-    my $remote = shift;
+    my $forward = shift;
 
-    $remote->{reason} = "@_";
-    $remote->{reader} = undef if delete $remote->{socket_in};
+    $forward->{reason} = "@_";
+    $forward->{reader} = undef if delete $forward->{socket_in};
 
-    if ($remote->{out} eq "" || !$remote->{local}) {
-        $remote->local_end;
+    if ($forward->{out} eq "" || !$forward->{local}) {
+        $forward->local_end;
     } else {
-        $remote->{on_written} = \&local_end;
+        $forward->{on_written} = \&local_end;
     }
 }
 
 sub local_end {
-    my ($remote) = @_;
-    $remote->finished_local($remote->{reason});
+    my ($forward) = @_;
+    $forward->finished_local($forward->{reason});
 }
 
 sub error {
-    my $remote = shift;
-    $remote->finished_local(@_);
+    my $forward = shift;
+    $forward->finished_local(@_);
 }
 
 package LineProtocol;
@@ -2859,17 +2786,14 @@ my %process_name = (
     $START		=> "START",
     $KEEP		=> "KEEP",
     $FOU_REMOTE		=> "FOU_REMOTE",
-    $DATA_UDP		=> "DATA_UDP",
+    $UDP_DATA		=> "UDP_DATA",
     $PING		=> "PING",
     $RESPONSE_UDP	=> "RESPONSE_UDP",
     $RESPONSE_PING	=> "RESPONSE_PING",
     $CONNECT		=> "CONNECT",
-    $DATA_TCP_LR	=> "TCP_LOCAL_TO_REMOTE",
-    $DATA_TCP_RL	=> "TCP_REMOTE_TO_LOCAL",
-    $DATA_EOF_LR	=> "EOF_LOCAL_TO_REMOTE",
-    $DATA_EOF_RL	=> "EOF_REMOTE_TO_LOCAL",
-    $DATA_FIN_LR	=> "FINISH_LOCAL_TO_REMOTE",
-    $DATA_FIN_RL	=> "FINISH_REMOTE_TO_LOCAL",
+    $TCP_DATA		=> "TCP_DATA",
+    $TCP_EOF		=> "TCP_EOF",
+    $TCP_FIN		=> "TCP_FIN",
 );
 
 my %process = %process_name;
@@ -3130,7 +3054,7 @@ sub process_FOU_REMOTE {
     my $listener = Receiver::Fou->new($line, $from->{host}, $from->{port}, $fou);
 }
 
-sub process_DATA_UDP {
+sub process_UDP_DATA {
     my $line = shift;
     my ($id, $dst, $port, $ttl, $data) = unpack("wa4nCa*", shift);
     $id || die "Assertion: Sender socket id $id == 0";
@@ -3359,63 +3283,35 @@ sub process_CONNECT {
 
     my $to = ConnUtils->parse_address($target, "TCP connect",
                                       to => $type, resolve => 1);
-    TCP::Remote->new($line, {}, $to, id => $id);
+    TCP::Forward->new($line, {}, $to, id => $id);
 }
 
-sub process_TCP_LOCAL_TO_REMOTE {
+sub process_TCP_DATA {
     my $line = shift;
 
     my ($id, $pos) = unpack("w.", $_[0]);
     substr($_[0], 0, $pos, "");
-    my $tcp_remote = $line->child("TCP::Remote", $id) ||
-        $line->bug("Could not find TCP::Remote[$id]");
-    $tcp_remote->write(shift) unless $tcp_remote->{finished};
+    my $forward = $line->child("TCP::Forward", $id) ||
+        $line->bug("Could not find TCP::Forward[$id]");
+    $forward->write(shift) unless $forward->{finished};
 }
 
-sub process_TCP_REMOTE_TO_LOCAL {
-    my $line = shift;
-
-    my ($id, $pos) = unpack("w.", $_[0]);
-    substr($_[0], 0, $pos, "");
-    my $tcp_local = $line->child("TCP::Local", $id) ||
-        $line->bug("Could not find TCP::Local[$id]");
-    $tcp_local->write(shift) unless $tcp_local->{finished};
-}
-
-sub process_EOF_LOCAL_TO_REMOTE {
+sub process_TCP_EOF {
     my $line = shift;
 
     my $id = unpack("w", shift);
-    my $tcp_remote = $line->child("TCP::Remote", $id) ||
-        $line->bug("Could not find TCP::Remote[$id]");
-    $tcp_remote->remote_eof() unless $tcp_remote->{finished};
+    my $forward = $line->child("TCP::Forward", $id) ||
+        $line->bug("Could not find TCP::Forward[$id]");
+    $forward->remote_eof() unless $forward->{finished};
 }
 
-sub process_EOF_REMOTE_TO_LOCAL {
-    my $line = shift;
-
-    my $id = unpack("w", shift);
-    my $tcp_local = $line->child("TCP::Local", $id) ||
-        $line->bug("Could not find TCP::Local[$id]");
-    $tcp_local->remote_eof() unless $tcp_local->{finished};
-}
-
-sub process_FINISH_LOCAL_TO_REMOTE {
+sub process_TCP_FIN {
     my $line = shift;
 
     my ($id, $msg) = unpack("wa*", shift);
-    my $tcp_remote = $line->child("TCP::Remote", $id) ||
-        $line->bug("Could not find TCP::Remote[$id]");
-    $tcp_remote->finished_remote($msg);
-}
-
-sub process_FINISH_REMOTE_TO_LOCAL {
-    my $line = shift;
-
-    my ($id, $msg) = unpack("wa*", shift);
-    my $tcp_local = $line->child("TCP::Local", $id) ||
-        $line->bug("Could not find TCP::Local[$id]");
-    $tcp_local->finished_remote($msg);
+    my $forward = $line->child("TCP::Forward", $id) ||
+        $line->bug("Could not find TCP::Forward[$id]");
+    $forward->finished_remote($msg);
 }
 
 sub set_peer {
