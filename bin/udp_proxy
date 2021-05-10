@@ -395,6 +395,7 @@ my $nr_events = 0;
     }
 
     sub die_no_handle {
+        ::caller_info("DIE: Assertion: Not a filehandle") if $verbose > 1;
         die sprintf("Assertion: Not a filehandle [%s]\n", ::callers());
     }
 
@@ -965,6 +966,9 @@ my $CLOCK_TYPE_NAME;
 package Ids;
 # Allocate and free unique numbers
 
+# First id that will be given out
+use constant INIT_ID => 1;
+
 sub new {
     my $ids = bless {}, shift;
     $ids->id_init;
@@ -975,7 +979,7 @@ sub id_init {
     my ($ids) = @_;
 
     $ids->{free_ids} = [];
-    $ids->{free_id}  = 0;
+    $ids->{free_id}  = INIT_ID() - 1;
 }
 
 sub id_alloc {
@@ -1000,6 +1004,12 @@ sub id_free {
             last;
         }
     }
+}
+
+sub count {
+    my ($ids) = @_;
+
+    return $ids->{free_id} - @{$ids->{free_ids}} + (1-INIT_ID);
 }
 
 package ConnUtils;
@@ -1327,8 +1337,15 @@ sub _finish {
 sub die : method {
     my ($object, $msg) = @_;
 
+    $object->info("DIE: $msg") if $verbose > 1;
     $object->delete($msg) unless $object->{deleted};
     die sprintf("%s: %s [%s]\n", $object->name, $msg, ::callers());
+}
+
+sub dump : method {
+    my ($object) = @_;
+    local $object->{parent};
+    print STDERR ::Dumper($object);
 }
 
 sub bug {
@@ -1361,19 +1378,6 @@ sub child {
     return $object->{children}{$class}[$id];
 }
 
-sub status_all {
-    my ($object, $control, $indent) = @_;
-
-    $object->status($control, $indent);
-    $indent .= "  ";
-    for my $class (sort keys %{$object->{children} || {}}) {
-        my @objects = grep defined, @{$object->{children}{$class}} or next;
-        $control->{out} .= sprintf("%s%s: %s\n",
-                                   $indent, $class, scalar @objects);
-        $_->status($control, $indent) for @objects;
-    }
-}
-
 sub info {
     my $object = shift;
     my $format = shift;
@@ -1399,6 +1403,28 @@ sub caller_info {
 sub immediate {
     my ($object, $code) = @_;
     $object->{timeout} = Timer::immediate($object, $code);
+}
+
+sub count_children {
+    my ($object, $class) = @_;
+
+    local $object->{parent};
+    return $object->{ids}{$class}->count if $object->{ids} && $object->{ids}{$class};
+    $object->{children} && $object->{children}{$class} || return 0;
+    return scalar grep defined, @{$object->{children}{$class}};
+}
+
+sub status_all {
+    my ($object, $control, $indent) = @_;
+
+    $object->status($control, $indent);
+    $indent .= "  ";
+    for my $class (sort keys %{$object->{children} || {}}) {
+        my @objects = grep defined, @{$object->{children}{$class}} or next;
+        $control->{out} .= sprintf("%s%s: %s\n",
+                                   $indent, $class, scalar @objects);
+        $_->status($control, $indent) for @objects;
+    }
 }
 
 sub status {
@@ -1479,12 +1505,20 @@ sub timeout {
 }
 
 sub client {
-    my ($root, $socket_in, $socket_out, $connections) = @_;
+    my ($root, $socket_in, $socket_out, $connections, $client_only) = @_;
 
     my $line;
     eval {
-        $line = LineProtocol->new($root, $socket_in, $socket_out);
+        $line = LineProtocol->new(
+            $root, $socket_in, $socket_out,
+            client_only	=> $client_only,
+        );
 
+        for my $tcp (@{$connections->{tcp_local}}) {
+            my ($from, $to) = ConnUtils->parse_address($tcp, "TCP local", from => "TCP4", to => "TCP4");
+            ConnUtils->resolve($from, "TCP local");
+            Listener::TCP::Local->new_suspended($line, $from, -1, remote => $to);
+        }
         for my $udp (@{$connections->{fou_local}}) {
             my ($from, $to) =
                 $udp =~ m{^([^%]+)%([^%]+)\z} or
@@ -1492,7 +1526,7 @@ sub client {
             $from = ConnUtils->parse_address($from, "FOU local", from => "UDP4");
             $to   = ConnUtils->parse_address($to  , "FOU local", to   => "UDP4", resolve => 1);
             my $fou = Fou::UDP->new($to);
-            Receiver::Fou->new($line, $from->{host}, $from->{port}, $fou);
+            Receiver::Fou->new_suspended($line, $from->{host}, $from->{port}, $fou);
         }
 
         for my $name (sort keys %{$line->{settings}}) {
@@ -1513,12 +1547,6 @@ sub client {
             ConnUtils->parse_address($from, "FOU remote", from => "UDP4");
             ConnUtils->parse_address($to  , "FOU remote", to   => "UDP4");
             $line->write($FOU_REMOTE, $udp);
-        }
-
-        for my $tcp (@{$connections->{tcp_local}}) {
-            my ($from, $to) = ConnUtils->parse_address($tcp, "TCP local", from => "TCP4", to => "TCP4");
-            ConnUtils->resolve($from, "TCP local");
-            Listener::TCP::Local->new($line, $from, -1, remote => $to);
         }
         $line->write($START);
     };
@@ -1614,7 +1642,7 @@ sub finished_remote {
 
     $connection->die("Already finished remote") if $connection->{finished_remote};
     $reason ||= "Unknown reason";
-    $connection->info("Remote finished: $reason") if $verbose > 1;
+    $connection->info("Finished remote: $reason") if $verbose > 1;
     $connection->{finished_remote} = $reason = "Remote: $reason";
     if ($connection->{finished}) {
         $connection->delete($reason);
@@ -1633,6 +1661,7 @@ sub finish_remote {
 sub finished_local {
     my ($connection, $reason) = @_;
 
+    $connection->info("Finished local: $reason") if $verbose;
     $connection->die("Already finished local") if $connection->{finished};
     if ($connection->{finished_remote}) {
         $connection->delete($reason);
@@ -1654,6 +1683,8 @@ use vars qw(@ISA);
 
 use Errno qw(EINTR EAGAIN EWOULDBLOCK ECONNRESET);
 
+# Leave the option open to redirect conn_reset() to eof()
+# If you do don't forget to deactivate events (reader, writer, timeout etc)
 sub conn_reset {
     my $stream = shift;
 
@@ -1829,7 +1860,7 @@ sub on_connect {
     my $sockaddr = getsockname($connect->{socket_out}) ||
         die "Assertion: Could not getsockname: $^E";
     $connect->{local} = ConnUtils->address_from_packed($sockaddr, "tcp4");
-    $connect->info("Connected from '$connect->{local}{display}' to '$connect->{peer}{user}' [$connect->{peer}{display}]: $!") if $verbose > 1;
+    $connect->info("Connected from '$connect->{local}{display}' to '$connect->{peer}{user}' [$connect->{peer}{display}]: $!") if $verbose;
 
     $connect->{socket_in} = $connect->{socket_out};
     $connect->{reader} = Events::add_read($connect->{socket_in}, $connect, \&_Stream::reader);
@@ -1844,7 +1875,7 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK EMSGSIZE);
 use Socket qw(pack_sockaddr_in unpack_sockaddr_in inet_ntoa
               MSG_TRUNC MSG_CTRUNC);
 
-sub new {
+sub new_suspended {
     my $class = shift;
 
     my $udp = $class->SUPER::new(
@@ -1852,6 +1883,13 @@ sub new {
         out => [],
         @_,
     );
+    return $udp;
+}
+
+sub new {
+    my $class = shift;
+    my $udp = $class->new_suspended(@_);
+    $udp->resume_read if $udp->{socket_in};
     return $udp;
 }
 
@@ -1991,17 +2029,24 @@ package UDP;
 use vars qw(@ISA);
 @ISA = qw(_UDP);
 
-sub new {
+sub new_suspended {
     my $class = shift;
 
-    my $udp = $class->SUPER::new(@_);
+    my $udp = $class->SUPER::new_suspended(@_);
     if ($udp->{socket_in}) {
         !$msghdr ||
             setsockopt($udp->{socket_in}, $IPPROTO_IP, $IP_RECVTTL, 1) ||
             $udp->die("setsockopt(IPPROTO_IP, IP_RECVTTL): $^E");
-        $udp->{reader} = Events::add_read($udp->{socket_in}, $udp, \&_UDP::reader);
     }
     return $udp;
+}
+
+sub resume_read {
+    my $udp = shift;
+
+    $udp->info("resume_read") if $verbose > 1;
+    $udp->{reader} && $udp->die("Read not suspended");
+    $udp->{reader} = Events::add_read($udp->{socket_in}, $udp, \&_UDP::reader);
 }
 
 package Pinger;
@@ -2172,7 +2217,7 @@ use vars qw(@ISA);
 
 use Socket qw(inet_ntoa);
 
-sub new {
+sub new_suspended {
     my ($class, $line, $id) = @_;
 
     # Notice this can return nothing if we can't open an UDP icmp socket
@@ -2185,7 +2230,7 @@ sub new {
     # !$socket || setsockopt($socket, $SOL_RAW, $ICMP_FILTER, 0xffffffff ^ 1<<$ICMP_ECHO_REPLY) ||
     #    die "setsockopt(SOL_RAW, ICMP_FILTER): $^E" if defined $ICMP_FILTER;
 
-    my $icmp = $class->SUPER::new(
+    my $icmp = $class->SUPER::new_suspended(
         $line, $socket, $socket,
         id		=> $id,
         pid		=> $$,
@@ -2302,12 +2347,12 @@ package Sender::UDP;
 use vars qw(@ISA);
 @ISA = qw(UDP);
 
-sub new {
+sub new_suspended {
     my ($class, $line, $id) = @_;
 
     my ($host, $port, $socket) = ConnUtils->socket_udp("0.0.0.0", 0);
 
-    my $sender = $class->SUPER::new(
+    my $sender = $class->SUPER::new_suspended(
         $line, $socket, $socket,
         id		=> $id,
         local_host	=> $host,
@@ -2331,12 +2376,12 @@ use vars qw(@ISA);
 use Socket qw(inet_ntoa);
 use Digest::MD5 qw(md5);
 
-sub new {
+sub new_suspended {
     my ($class, $line, $host, $port, $fou) = @_;
 
     my ($h, $p, $socket) = ConnUtils->socket_udp($host, $port);
 
-    my $listener = $class->SUPER::new(
+    my $listener = $class->SUPER::new_suspended(
         $line, $socket, undef,
         local_host	=> $h,
         local_port	=> $p,
@@ -2612,16 +2657,17 @@ sub on_read {
 sub eof : method {
     my $local = shift;
 
-    $local->info("@_") if $verbose > 1;
     if ($local->{socket_out}) {
-        # Tell the other side that we won't send any more data
-        $local->{parent}->write($DATA_EOF_LR, pack("w", $local->{id}));
+        $local->info("@_: Shutdown read, stop writing to remote") if $verbose > 1;
         shutdown($local->{socket_in}, 0) ||
             $local->die("Could not shutdown read: $^E");
         delete $local->{socket_in};
+        # Tell the other side that we won't send any more data
+        $local->{parent}->write($DATA_EOF_LR, pack("w", $local->{id}));
     } else {
         # We already stopped writing. We are now completely useless
-        $local->finished_local("Connection closed");
+        $local->info("@_") if $verbose > 1;
+        $local->finished_local(@_);
     }
 }
 
@@ -2642,20 +2688,21 @@ sub write_end {
     my ($local) = @_;
 
     if ($local->{socket_in}) {
+        $local->info("Shutdown write, keep reading");
         shutdown($local->{socket_out}, 1) ||
             $local->die("Could not shutdown write: $^E");
         delete $local->{socket_out};
         # Keep reading
     } else {
         # We already stopped reading. We are now completely useless
-        $local->finished_local("Connection closed");
+        $local->finished_local($local->{reason});
     }
 }
 
 sub finish_remote {
     my ($local, $reason) = @_;
 
-    $local->info("Tell remote to finish: $reason") if $verbose > 1;
+    $local->info("Tell remote to finish after local $reason") if $verbose > 1;
     $local->{parent}->write($DATA_FIN_LR, pack("w", $local->{id}), $reason);
 }
 
@@ -2699,11 +2746,12 @@ sub eof : method {
 
     $remote->info("@_") if $verbose > 1;
     if ($remote->{socket_out}) {
-        # Tell the other side that we won't send any more data
-        $remote->{parent}->write($DATA_EOF_RL, pack("w", $remote->{id}));
+        $remote->info("@_: Shutdown read, stop writing to remote") if $verbose > 1;
         shutdown($remote->{socket_in}, 0) ||
             $remote->die("Could not shutdown read: $^E");
         delete $remote->{socket_in};
+        # Tell the other side that we won't send any more data
+        $remote->{parent}->write($DATA_EOF_RL, pack("w", $remote->{id}));
     } else {
         # We already stopped writing. We are now completely useless
         $remote->{parent}->write($DATA_FIN_RL, pack("w", $remote->{id}), "Connection closed");
@@ -2727,6 +2775,7 @@ sub write_end {
 
     if ($remote->{socket_in}) {
         # this implies we are connected and did not yet get EOF
+        $remote->info("Shutdown write, keep reading");
         shutdown($remote->{socket_out}, 1) ||
             $remote->die("Could not shutdown write: $^E");
         delete $remote->{socket_out};
@@ -2735,14 +2784,14 @@ sub write_end {
         # !$remote->{local} implies we are connecting. Abort
         delete @$remote{qw(socket_out timeout writer)} if !$remote->{local};
         # We already stopped reading. We are now completely useless
-        $remote->{parent}->write($DATA_FIN_RL, pack("w", $remote->{id}), "Connection closed");
+        $remote->finished_local($remote->{reason});
     }
 }
 
 sub finish_remote {
     my ($local, $reason) = @_;
 
-    $local->info("Tell remote to finish: $reason") if $verbose > 1;
+    $local->info("Tell remote to finish after local $reason") if $verbose > 1;
     $local->{parent}->write($DATA_FIN_RL, pack("w", $local->{id}), $reason);
 }
 
@@ -2808,7 +2857,10 @@ $_ = __PACKAGE__->can("process_$_") || die "Unknown sub 'process_$_'" for
     values %process;
 
 sub new {
-    my ($class, $parent, $socket_in, $socket_out) = @_;
+    my $class		= shift;
+    my $parent		= shift;
+    my $socket_in	= shift;
+    my $socket_out	= shift;
 
     return $class->SUPER::new(
         $parent, $socket_in, $socket_out,
@@ -2823,7 +2875,8 @@ sub new {
         out_sent	=> 0,
         out_base	=> 0,
         nr_pingers	=> 0,
-        queue_ping	=> []);
+        queue_ping	=> [],
+        @_);
 }
 
 sub on_read {
@@ -2907,6 +2960,32 @@ sub writer {
     }
 }
 
+sub ready {
+    my ($line, $msg, $peer_msg) = @_;
+
+    if ($verbose) {
+        ::peer_info($peer_msg) if $line->{client_only};
+        if ($verbose > 1) {
+            $line->info($msg);
+        } else {
+            ::info($msg);
+        }
+        # Add extra line to make this stand out
+        print STDERR "\n";
+    }
+    $line->activate_read;
+}
+
+sub activate_read {
+    my $line = shift;
+
+    my $children = $line->{children} || return;
+    for my $class (sort keys %$children) {
+        $class =~ /^(?:Listener|Receiver)::/ || next;
+        $_ && $_->resume_read for @{$children->{$class}};
+    }
+}
+
 sub keepalive {
     my ($line) = @_;
 
@@ -2981,16 +3060,12 @@ sub process_START {
 
     defined $line->{settings}{EPOCH} || die "Lost early epoch message";
 
-    my $ready = "$Script $role $me\@$hostname ready (clock $CLOCK_TYPE_NAME, pid $$)";
     $line->{started} = 1;
 
-    if ($role eq "server") {
-        $line->write($START, $ready);
-    }
-    if ($verbose) {
-        ::info($ready);
-        print STDERR "\n";
-    }
+    my $msg = "$Script $role $me\@$hostname ready (clock $CLOCK_TYPE_NAME, pid $$)";
+
+    $line->write($START, $msg) if $role eq "server";
+    $line->ready($msg, shift);
 }
 
 sub process_KEEP {
@@ -3339,23 +3414,38 @@ use vars qw(@ISA);
 use Errno qw(EINTR EAGAIN EWOULDBLOCK ECONNABORTED);
 use Socket qw(IPPROTO_TCP TCP_NODELAY AF_INET unpack_sockaddr_in inet_ntoa);
 
-sub new {
+sub new_suspended {
     my $class = shift;
     my $parent = shift;
     my $address = shift;
     my $loops = shift;
 
     my ($h, $p, $socket) = ConnUtils->socket_tcp($address->{host}, $address->{port}, 1);
+    my %local = (
+        %$address,
+        host	=> $h,
+        port	=> $p,
+        display	=> "$h:$p",
+    );
     my $listener = $class->SUPER::new(
         $parent,
         @_,
-        local	=> $address,
+        local	=> \%local,
         loop	=> $loops,
         socket	=> $socket,
         reader	=> undef);
-    $listener->info("Listening on %s:%d", $h, $p) if $address->{port} == 0 || $verbose > 1;
     $address->{host} = $h;
     $address->{port} = $p;
+    $address->{display} = "$h:$p";
+    $listener->info("Listening on %s [%s]", $local{display}, $local{user}) if
+        $address->{port} == 0 || $verbose > 1;
+    return $listener;
+}
+
+sub new {
+    my $class = shift;
+    my $listener = $class->new_suspended(@_);
+    $listener->resume_read;
     return $listener;
 }
 
@@ -3401,26 +3491,36 @@ sub on_accept {
     $target->new($listener->{parent}, $accepted, $accepted, $listener, @_);
 }
 
+sub suspend_read {
+    my $listener = shift;
+
+    $listener->info("suspend_read") if $verbose > 1;
+    $listener->{reader} || $listener->die("Read already suspended");
+    $listener->{reader} = undef;
+}
+
 package Listener;
 use vars qw(@ISA);
 @ISA = qw(_Listener);
 
-sub new {
-    my $class = shift;
-    my $listener = $class->SUPER::new(@_);
+sub resume_read {
+    my $listener = shift;
+
+    $listener->info("resume_read") if $verbose > 1;
+    $listener->{reader} && $listener->die("Read not suspended");
     $listener->{reader} = Events::add_read($listener->{socket}, $listener, \&_Listener::acceptable);
-    return $listener;
 }
 
 package Listener0;
 use vars qw(@ISA);
 @ISA = qw(_Listener);
 
-sub new {
-    my $class = shift;
-    my $listener = $class->SUPER::new(@_);
+sub resume_read {
+    my $listener = shift;
+
+    $listener->info("resume_read") if $verbose > 1;
+    $listener->{reader} && $listener->die("Read not suspended");
     $listener->{reader} = Events::add_read0($listener->{socket}, $listener, \&_Listener::acceptable);
-    return $listener;
 }
 
 package Listener::Control;
@@ -3603,11 +3703,6 @@ sub command_pid {
 package Listener::LineProtocol;
 use vars qw(@ISA);
 @ISA = qw(Listener);
-
-sub new {
-    my $class = shift;
-    return $class->SUPER::new($root, @_);
-}
 
 sub on_accept {
     my ($listener, $accepted) = @_;
@@ -3834,7 +3929,7 @@ if ($role eq "server") {
         my $address = ConnUtils->parse_address($server, "Server", from => "TCP4", resolve => 1);
 
         $loops = -1 if !defined $loops;
-        Listener::LineProtocol->new($address, $loops) if $loops;
+        Listener::LineProtocol->new($root, $address, $loops) if $loops;
     } else {
         $root = Root->new();
         # Make sure that if we fork/exec things they won't get access to
@@ -3875,7 +3970,7 @@ if ($role eq "server") {
 
         my $host = $client =~ s{(.*):}{}s ? $1 : "127.0.0.1";
         my $socket = ConnUtils->socket_tcp($host, $client);
-        $root->client($socket, $socket, \%connections);
+        $root->client($socket, $socket, \%connections, 1);
     } else {
         @ARGV || die "Missing remote host argument, Try $Script -h\n";
         $stuff = 1 if !defined $stuff;
@@ -3978,7 +4073,7 @@ if ($role eq "server") {
             alarm(0);
             $line eq $STUFFED || die "Bad server confirm $line";
         }
-        $root->client($rd1, $wr0, \%connections);
+        $root->client($rd1, $wr0, \%connections, 0);
     }
 }
 
@@ -3987,7 +4082,7 @@ $root->timeout($global_timeout) if defined $global_timeout;
 eval {
     for my $control (@{$connections{control_local}}) {
         my $address = ConnUtils->parse_address($control, "Control", from => "TCP4", resolve => 1);
-        Listener::Control->new($root, $address);
+        Listener::Control->new_suspended($root, $address);
     }
 
     Events->mainloop();
