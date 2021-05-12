@@ -6,8 +6,8 @@ use strict;
 use warnings;
 use vars qw($VERSION $SUB_VERSION $release_time %history);
 $VERSION = "1.000";
-$SUB_VERSION = "054";
-$release_time = 1620810541;	## no critic (UselessNoCritic MagicNumbers)
+$SUB_VERSION = "055";
+$release_time = 1620810837;	## no critic (UselessNoCritic MagicNumbers)
 %history = (
   'Changes' => {
     '1.000' => '1.000'
@@ -24,10 +24,10 @@ $release_time = 1620810541;	## no critic (UselessNoCritic MagicNumbers)
   'README' => {
     '1.000' => '1.000'
   },
-  'bin/udp_nat' => {
+  'bin/sssssh' => {
     '1.000' => '1.000'
   },
-  'bin/udp_proxy' => {
+  'bin/udp_nat' => {
     '1.000' => '1.000'
   },
   'bin/udp_recv' => {

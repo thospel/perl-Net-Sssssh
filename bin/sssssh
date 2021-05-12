@@ -4274,7 +4274,7 @@ sub command_status {
 
     my $msghdr = $msghdr_error || Socket::MsgHdr->VERSION;
 
-    my $rlwrap = $ENV{udp_proxy_rlwrap} || 0;
+    my $rlwrap = $ENV{sssssh_rlwrap} || 0;
     $control->{out} .= <<"EOF"
 Local:
   Script $::Script (pid $$)
@@ -4519,7 +4519,7 @@ GetOptions("server:s"		=> \my $server,
 
 if ($version) {
     print<<"EOF";
-udp_proxy $VERSION (Net::Sssssh) $VERSION
+sssssh $VERSION (Net::Sssssh) $VERSION
 EOF
     exit 0;
 }
@@ -4571,9 +4571,9 @@ if ($role eq "server") {
             open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
             $root = Root->new();
         } else {
-            if (!$ENV{udp_proxy_rlwrap}) {
+            if (!$ENV{sssssh_rlwrap}) {
                 die "Assertion: Already queued events" if $nr_events;
-                local $ENV{udp_proxy_rlwrap} = "1";
+                local $ENV{sssssh_rlwrap} = "1";
                 no warnings "exec";
                 { exec("rlwrap", "-w", 100, "-S", "$Script>", "$Bin/$Script", @ARGV_OLD) };
                 $! == ENOENT || die "Could not exec 'rlwrap': $^E";
@@ -4608,9 +4608,9 @@ if ($role eq "server") {
         open(STDIN, "<&", $null) || die "Could not dup to STDIN: $^E";
         $root = Root->new();
     } else {
-        if (!$ENV{udp_proxy_rlwrap}) {
+        if (!$ENV{sssssh_rlwrap}) {
             die "Assertion: Already queued events" if $nr_events;
-            local $ENV{udp_proxy_rlwrap} = "1";
+            local $ENV{sssssh_rlwrap} = "1";
             no warnings "exec";
             { exec("rlwrap", "-w", 100, "-S", "$Script>", "$Bin/$Script", @ARGV_OLD) };
             $! == ENOENT || die "Could not exec 'rlwrap': $^E";
