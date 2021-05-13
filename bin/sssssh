@@ -313,12 +313,17 @@ my $nr_events = 0;
         CODE	=> 1,
     };
 
+    sub die_no_handle {
+        ::caller_info("DIE: Assertion: Not a filehandle") if $verbose > 1;
+        die sprintf("Assertion: Not a filehandle [%s]\n", ::callers());
+    }
+
     sub Events::Read::DESTROY {
         defined(my $fd = ${shift()}) || die "No filedescriptor";
         ::caller_info("delete_read(%d, %s)", $fd,
                       ::object_name($read_refs{$fd}->[OBJ])) if $verbose > 1;
         # This strange assign after delete is to update the reference the for in
-        # sub mainloop may still have in such a way that element 0 keeps existing
+        # sub mainloop may still have in such a way that OBJ keeps existing
         # (otherwise a confess during the callback will access freed memory)
         # We could set either the object or the callback
         # But the object is already weak and the callback may be a closure
@@ -337,7 +342,7 @@ my $nr_events = 0;
         ::caller_info("delete_read0(%d, %s)", $fd,
                       ::object_name($read_refs{$fd}->[OBJ])) if $verbose > 1;
         # This strange assign after delete is to update the reference the for in
-        # sub mainloop may still have in such a way that element 0 keeps existing
+        # sub mainloop may still have in such a way that OBJ keeps existing
         # (otherwise a confess during the callback will access freed memory)
         # We could set either the object or the callback
         # But the object is already weak and the callback may be a closure
@@ -355,7 +360,7 @@ my $nr_events = 0;
         ::caller_info("delete_write(%d, %s)", $fd,
                       ::object_name($write_refs{$fd}->[OBJ])) if $verbose > 1;
         # This strange assign after delete is to update the reference the for in
-        # sub mainloop may still have in such a way that element 0 keeps existing
+        # sub mainloop may still have in such a way that OBJ keeps existing
         # (otherwise a confess during the callback will access freed memory)
         # We could set either the object or the callback
         # But the object is already weak and the callback may be a closure
@@ -374,7 +379,7 @@ my $nr_events = 0;
         ::caller_info("delete_write0(%d, %s)", $fd,
                       ::object_name($write_refs{$fd}->[OBJ])) if $verbose > 1;
         # This strange assign after delete is to update the reference the for in
-        # sub mainloop may still have in such a way that element 0 keeps existing
+        # sub mainloop may still have in such a way that OBJ keeps existing
         # (otherwise a confess during the callback will access freed memory)
         # We could set either the object or the callback
         # But the object is already weak and the callback may be a closure
@@ -392,7 +397,7 @@ my $nr_events = 0;
         ::caller_info("delete_error(%d, %s)", $fd,
                       ::object_name($error_refs{$fd}->[OBJ])) if $verbose > 1;
         # This strange assign after delete is to update the reference the for in
-        # sub mainloop may still have in such a way that element 0 keeps existing
+        # sub mainloop may still have in such a way that OBJ keeps existing
         # (otherwise a confess during the callback will access freed memory)
         # We could set either the object or the callback
         # But the object is already weak and the callback may be a closure
@@ -411,7 +416,7 @@ my $nr_events = 0;
         ::caller_info("delete_error0(%d, %s)", $fd,
                       ::object_name($error_refs{$fd}->[OBJ])) if $verbose > 1;
         # This strange assign after delete is to update the reference the for in
-        # sub mainloop may still have in such a way that element 0 keeps existing
+        # sub mainloop may still have in such a way that OBJ keeps existing
         # (otherwise a confess during the callback will access freed memory)
         # We could set either the object or the callback
         # But the object is already weak and the callback may be a closure
@@ -422,11 +427,6 @@ my $nr_events = 0;
         } else {
             $error_mask = "";
         }
-    }
-
-    sub die_no_handle {
-        ::caller_info("DIE: Assertion: Not a filehandle") if $verbose > 1;
-        die sprintf("Assertion: Not a filehandle [%s]\n", ::callers());
     }
 
     sub add_read {
@@ -1125,9 +1125,6 @@ sub resolve {
 
     $address->{type} eq "udp4" || $address->{type} eq "tcp4" || next;
 
-    $address->{h} = $address->{host};
-    $address->{p} = $address->{port};
-
     $address->{addr} = inet_aton($address->{host}) ||
         die "Could not resolve $context '$address->{host}'\n";
     $address->{port} = $address->{port} =~
@@ -1211,14 +1208,17 @@ sub address_from_packed {
     return {
         type	=> $type || croak("Missing type"),
         family	=> AF_INET,
-        packed	=> $packed,
         addr	=> $addr,
         host	=> $host,
         port	=> $port,
         display	=> "$host:$port",
+        user	=> "$host:$port",
+        # Normalize packed so it has no random bytes in any padding
+        packed	=> pack_sockaddr_in($port, $addr),
     };
 }
 
+# The format we use on the LineProtocol wire
 sub address_decode {
     my ($class, $family, $address, $type) = @_;
 
@@ -1228,7 +1228,7 @@ sub address_decode {
 }
 
 # Return a copy of $value (which is assumed to be resolved) but fill in the
-# old attribute (user, h, p) from the new attributes  (display, host, port) of
+# old attribute (user) from the new attributes (display) of
 # $template (which is assumed to be unresolved)
 sub address_merge {
     my ($class, $template, $value) = @_;
@@ -1236,8 +1236,6 @@ sub address_merge {
     $template->{type} eq $value->{type} || croak "Inconsistent type";
     return {
         %$value,
-        h	=> $template->{host},
-        p	=> $template->{port},
         user	=> $template->{display}
     };
 }
@@ -1333,11 +1331,8 @@ sub _socket_tcp {
     my $sockaddr = getsockname($socket) ||
         die "Assertion: Could not getsockname: $^E";
     my $local = ConnUtils->address_from_packed($sockaddr, "tcp4");
-    if (defined $listen && defined $address->{user}) {
-        $local->{user} = $address->{user};
-        $local->{h} = $address->{h};
-        $local->{p} = $address->{p};
-    }
+    $local->{user} = $address->{user} if
+        defined $listen && defined $address->{user};
     return $local, $socket;
 }
 
@@ -1698,10 +1693,6 @@ sub new {
 sub status {
     my ($root, $control, $indent) = @_;
 
-    #local $Data::Dumper::Varname = "VAR";
-    #my $settings = ::Dumper($line->{settings});
-    #$settings =~ s/\$VAR1 = //g || die "Assertion: No VAR1";
-    #$settings =~ s/\s+\z//;
     my $name = $root->name;
     my $settings = ::string_from_value($root->{settings});
     $settings =~ s/\n/\n$indent  /g;
@@ -2133,8 +2124,8 @@ sub new_suspended {
     # pass undef for socket_out. This allows alternate call without connect()
     my $connect = $class->SUPER::new_suspended(
         $parent, undef, undef,
-        local		=> $local,
-        peer		=> $peer,
+        local	=> $local,
+        peer	=> $peer,
         @_,
     );
     if (!defined $connect->{socket_out} && $peer) {
@@ -2432,18 +2423,19 @@ sub new_suspended {
 }
 
 sub wait : method {
-    return if defined $SIG{CHLD} && $SIG{CHLD} eq "IGNORE";
+    return undef if defined $SIG{CHLD} && $SIG{CHLD} eq "IGNORE";
     my ($pinger) = @_;
 
     my $pid = $pinger->{pid};
-    return if $pinger->{parent_pid} != $$ || !$pid;
+    return undef if $pinger->{parent_pid} != $$ || !$pid;
     $pinger->{pid} = undef;
     my $p = waitpid($pid, 0);
     if ($p != $pid) {
-        die "Could not wait for pid '$pid'" if $p < 0;
-        die "Assertion: Invalid pid result" if $p != $pid;
+        $pinger->die("Could not wait for pid '$pid'") if $p < 0;
+        $pinger->bug("Invalid pid result") if $p != $pid;
     }
     # die "Unexpected exitcode $? from ping $pinger->{host} (pid $pid)" if $?;
+    return $?;
 }
 
 sub eof : method {
@@ -2916,6 +2908,27 @@ package TCP::Remote;
 use vars qw(@ISA);
 @ISA = qw(Object);
 
+sub write : method {
+    my $remote = shift;
+
+    $remote->{out} .= join("", @_);
+}
+
+sub writing {
+    shift->bug("No writing should be triggered");
+}
+
+sub status {
+    my ($remote, $control, $indent) = @_;
+
+    my $name = $remote->name;
+    $control->{out} .= <<"EOF"
+$indent$name
+$indent  Local Connect to '$remote->{remote}{display}'
+EOF
+        ;
+}
+
 package Listener::TCP::Forward;
 # Listen for incoming connections that need forwarding on the client side
 use vars qw(@ISA);
@@ -2946,6 +2959,14 @@ sub on_accept {
                                 $forward->{id},
                                 @remote{qw(type display)}));
     return $forward;
+}
+
+sub status {
+    my ($listener, $control, $indent) = @_;
+
+    $listener->SUPER::status($control, $indent);
+
+    $control->{out} .= "$indent  Remote Connect to '$listener->{remote}{user}'\n";
 }
 
 package Listener::TCP::Remote;
@@ -3064,6 +3085,16 @@ sub error {
     $forward->finished_local(@_);
 }
 
+sub status {
+    my ($forward, $control, $indent) = @_;
+
+    my $name = $forward->name;
+    $control->{out} .= "$indent$name\n";
+    $control->{out} .= "$indent  peer:   '$forward->{peer}{user}' [$forward->{peer}{display}]\n" if $forward->{peer};
+    $control->{out} .= "$indent  local:  '$forward->{local}{user}' [$forward->{local}{display}]\n" if $forward->{local};
+    $control->{out} .= "$indent  remote: '$forward->{remote}{user}' [$forward->{remote}{display}]\n" if $forward->{remote};
+}
+
 package Listener::Socks::Local;
 # Listen for incoming socks connections
 use vars qw(@ISA);
@@ -3090,11 +3121,10 @@ sub on_accept {
         socket_out	=> $accepted,
         local		=> $local,
         state		=> \&Socks::Local::version,
-        remote		=> {
+        request		=> {
             seqno	=> 0,
             type	=> "tcp4",
         },
-        partner		=> 0,
         finished_remote	=> "No remote (yet)",
     );
     $socks->info("Socks connect from %s", $peer->{display}) if $verbose > 1;
@@ -3136,11 +3166,8 @@ sub socks_result {
     if ($remote->{version} == 5) {
         $socks->write(pack("CCxCa4n", 5, $status, 1, @$address{qw(addr port)}));
     } elsif ($remote->{version} == 4) {
-        if ($seqno == 1) {
-            # Socks 4 answers only once
-            $socks->write(
-                pack("xCna4", $status ? 0x5B : 0x5A, @$address{qw(port addr)}));
-        }
+        $socks->write(
+            pack("xCna4", $status ? 0x5B : 0x5A, @$address{qw(port addr)}));
     } else {
         $socks->bug("Unknown socks version $remote->{version}");
     }
@@ -3155,6 +3182,7 @@ sub socks_result {
     } elsif ($remote->{cmd} == 2) {
         return if $seqno == 1;
         $seqno == 2 || $socks->bug("Response packet $seqno");
+        $socks->{remote} = ConnUtils->address_merge($remote, $address);
     } else {
         $socks->bug("Unimplemented SOCKS command '$remote->{cmd}'");
     }
@@ -3169,7 +3197,7 @@ sub socks_result {
 sub finish_remote {
     my $socks = shift;
 
-    $socks->SUPER::finish_remote(@_) if $socks->{partner};
+    $socks->SUPER::finish_remote(@_) if $socks->{remote};
 }
 
 sub eof {
@@ -3188,18 +3216,20 @@ sub version {
     my ($socks) = @_;
 
     return if $socks->{in} eq "";
-    $socks->{remote}{version} = ord substr($socks->{in}, 0, 1, "");
-    if ($socks->{remote}{version} == 4) {
+    $socks->{request}{version} = ord substr($socks->{in}, 0, 1, "");
+    if ($socks->{request}{version} == 4) {
         $socks->cmd4;
-    } elsif ($socks->{remote}{version} == 5) {
+    } elsif ($socks->{request}{version} == 5) {
         $socks->greeting5;
     } else {
         $socks->{state} = \&state_bug;
-        $socks->finish_local("Unknown SOCKS version $socks->{remote}{version}");
+        $socks->finish_local("Unknown SOCKS version $socks->{request}{version}");
         return;
     }
 }
 
+# For a better explanation of SOCKS4 than the wikipedia article see for example
+# https://github.com/h12w/socks/blob/master/spec/SOCKS4.protocol.txt
 sub cmd4 {
     my ($socks) = @_;
 
@@ -3207,10 +3237,10 @@ sub cmd4 {
         $socks->{state} = \&cmd4;
         return;
     }
-    $socks->{remote}{cmd} = ord substr($socks->{in}, 0, 1, "");
-    if ($socks->{remote}{cmd} < 1 || $socks->{remote}{cmd} > 2) {
+    $socks->{request}{cmd} = ord substr($socks->{in}, 0, 1, "");
+    if ($socks->{request}{cmd} < 1 || $socks->{request}{cmd} > 2) {
         $socks->{state} = \&state_bug;
-        $socks->finish_local("Unknown SOCKS4 command $socks->{remote}{cmd}");
+        $socks->finish_local("Unknown SOCKS4 command $socks->{request}{cmd}");
         return;
     }
     $socks->greeting4;
@@ -3223,7 +3253,7 @@ sub greeting4 {
         $socks->{state} = \&greeting4;
         return;
     }
-    @{$socks->{remote}}{qw(port addr)} =
+    @{$socks->{request}}{qw(port addr)} =
         unpack("na4", substr($socks->{in}, 0, 6, ""));
     $socks->username4;
 }
@@ -3236,12 +3266,12 @@ sub username4 {
         return;
     }
 
-    $socks->{remote}{username} = $1;
-    if ($socks->{remote}{addr} =~ /^\0\0\0[^\0]/) {
+    $socks->{request}{username} = $1;
+    if ($socks->{request}{addr} =~ /^\0\0\0[^\0]/) {
         $socks->greeting4a;
         return;
     }
-    $socks->{remote}{host} = inet_ntoa($socks->{remote}{addr});
+    $socks->{request}{host} = inet_ntoa($socks->{request}{addr});
     $socks->execute();
 }
 
@@ -3252,7 +3282,7 @@ sub greeting4a {
         $socks->{state} = \&greeting4a;
         return;
     }
-    $socks->{remote}{host} = $1;
+    $socks->{request}{host} = $1;
     $socks->execute();
 }
 
@@ -3263,37 +3293,37 @@ sub greeting5 {
         $socks->{state} = \&greeting5;
         return;
     }
-    $socks->{remote}{nauth} = ord substr($socks->{in}, 0, 1, "");
+    $socks->{request}{nauth} = ord substr($socks->{in}, 0, 1, "");
     $socks->auth5;
 }
 
 sub auth5 {
     my ($socks) = @_;
 
-    if (length $socks->{in} < $socks->{remote}{nauth}) {
+    if (length $socks->{in} < $socks->{request}{nauth}) {
         $socks->{state} = \&auth5;
         return;
     }
-    $socks->{remote}{auth} = substr($socks->{in}, 0, $socks->{remote}{nauth}, "");
+    $socks->{request}{auth} = substr($socks->{in}, 0, $socks->{request}{nauth}, "");
 
-    if ($socks->{remote}{auth} !~ /\0/) {
+    if ($socks->{request}{auth} !~ /\0/) {
         $socks->end_on_flushed("User does not support 'No authentication'",
                                "\x05\xff");
         return;
     }
     $socks->write("\x05\x00");
-    $socks->request5;
+    $socks->remote5;
 }
 
-sub request5 {
+sub remote5 {
     my ($socks) = @_;
 
     if (length $socks->{in} < 4) {
-        $socks->{state} = \&request5;
+        $socks->{state} = \&remote5;
         return;
     }
     my ($version, $cmd, $rsv, $type) = unpack("C4", substr($socks->{in}, 0, 4, ""));
-    $socks->{remote}{cmd} = $cmd;
+    $socks->{request}{cmd} = $cmd;
 
     if ($version != 5) {
         $socks->{state} = \&state_bug;
@@ -3330,8 +3360,8 @@ sub address_ipv4 {
         $socks->{state} = \&address_ipv4;
         return;
     }
-    $socks->{remote}{addr} = substr($socks->{in}, 0, 4, "");
-    $socks->{remote}{host} = inet_ntoa($socks->{remote}{addr});
+    $socks->{request}{addr} = substr($socks->{in}, 0, 4, "");
+    $socks->{request}{host} = inet_ntoa($socks->{request}{addr});
     $socks->port5;
 }
 
@@ -3342,18 +3372,18 @@ sub address_name_len {
         $socks->{state} = \&address_name_len;
         return;
     }
-    $socks->{remote}{host_length} = ord substr($socks->{in}, 0, 1, "");
+    $socks->{request}{host_length} = ord substr($socks->{in}, 0, 1, "");
     $socks->address_name;
 }
 
 sub address_name {
     my ($socks) = @_;
 
-    if (length $socks->{in} < $socks->{remote}{host_length}) {
+    if (length $socks->{in} < $socks->{request}{host_length}) {
         $socks->{state} = \&address_name;
         return;
     }
-    $socks->{remote}{host} = substr($socks->{in}, 0, $socks->{remote}{host_length}, "");
+    $socks->{request}{host} = substr($socks->{in}, 0, $socks->{request}{host_length}, "");
     $socks->port5;
 }
 
@@ -3364,7 +3394,7 @@ sub port5 {
         $socks->{state} = \&port5;
         return;
     }
-    $socks->{remote}{port} = unpack("n", substr($socks->{in}, 0, 2, ""));
+    $socks->{request}{port} = unpack("n", substr($socks->{in}, 0, 2, ""));
     $socks->execute;
 }
 
@@ -3372,46 +3402,51 @@ sub execute {
     my ($socks) = @_;
 
     $socks->{state} = \&state_bug;
-    my $remote = $socks->{remote};
-    $remote->{user} = $remote->{display} = "$remote->{host}:$remote->{port}";
-    if ($remote->{cmd} == 1) {
-        $remote->{command} = "connect";
-    } elsif ($remote->{cmd} == 2) {
-        $remote->{command} = "bind";
-    } elsif ($remote->{cmd} == 3) {
-        $remote->{command} = "UDP relay";
-        $remote->{type} = "udp4";
+    my $request = delete $socks->{request};
+    $request->{user} = $request->{display} = "$request->{host}:$request->{port}";
+    if ($request->{cmd} == 1) {
+        $request->{command} = "connect";
+    } elsif ($request->{cmd} == 2) {
+        $request->{command} = "bind";
+    } elsif ($request->{cmd} == 3) {
+        $request->{command} = "UDP relay";
+        $request->{type} = "udp4";
     } else {
-        $socks->bug("Unknown command '$remote->{cmd}'");
+        $socks->bug("Unknown command '$request->{cmd}'");
     }
     $socks->info("User %srequests %s to %s",
-                 defined $remote->{username} ? "'$remote->{username}' " : "",
-                 $remote->{command}, $remote->{user}) if $verbose;
+                 defined $request->{username} ? "'$request->{username}' " : "",
+                 $request->{command}, $request->{user}) if $verbose;
 
-    if ($remote->{port} == 0 && $remote->{cmd} == 1) {
+    if ($request->{port} == 0 && $request->{cmd} == 1) {
         $socks->end_on_flushed(
             "Cannot connect to port 0",
-            $remote->{version} == 4 ? pack("xCx6", 0x5B) :
-            $remote->{version} == 5 ? pack("CCxCx6", 5, 2, 1) :
-            $socks->bug("Unknown SOCKS version '$remote->{version}'"));
+            $request->{version} == 4 ? pack("xCx6", 0x5B) :
+            $request->{version} == 5 ? pack("CCxCx6", 5, 2, 1) :
+            $socks->bug("Unknown SOCKS version '$request->{version}'"));
         return;
     }
 
     $socks->suspend_read;
     $socks->{parent}->write(
-        $SOCKS, pack("www/a*a*", $socks->{id}, @$remote{qw(cmd type display)}));
+        $SOCKS, pack("www/a*a*", $socks->{id}, @$request{qw(cmd type display)}));
     $socks->{finished_remote} = undef;
-    $socks->{partner} = 1;
+    $socks->{remote} = $request;
 }
 
 sub state_bug {
     shift->bug("Invalid socks state");
 }
 
-package Socks::Connect;
-# Process socks request (local side)
+package Socks::Remote;
+# Process socks request (remote side)
 use vars qw(@ISA);
 @ISA = qw(Socks::Forward);
+
+package Socks::Connect;
+# Process socks connect request (remote side)
+use vars qw(@ISA);
+@ISA = qw(Socks::Remote);
 
 use Errno qw(ENETUNREACH EHOSTUNREACH ECONNREFUSED ETIMEDOUT);
 
@@ -3456,10 +3491,19 @@ use vars qw(@ISA);
 sub on_accept {
     my ($listener, $socket, $local, $peer) = @_;
 
-    # Listener loops = 1 will already have autodetached the $listener
     my $accept = $listener->{parent};
     my $line = $accept->{parent};
 
+    if ($accept->{remote}{host} ne "0.0.0.0" &&
+        $accept->{remote}{host} ne $peer->{host}) {
+        # Paranoia as described in the SOCKS4 specification
+        # Only accept connections from the same host that the request mentioned
+        # as the destination
+        # The SOCKS5 RFC doesn't mention this, but it seems like a good idea
+        $accept->info("Reject incoming connection from '$peer->{display}', does not match the expected host from '$accept->{remote}{user}' [$accept->{remote}{display}]") if $verbose;
+        return;
+    }
+    $listener->delete("Acceptable connection");
     $accept->{local} = $local;
     $accept->{peer}  = $peer;
     $accept->{socket_in} = $accept->{socket_out} = $socket;
@@ -3474,9 +3518,9 @@ sub on_accept {
 }
 
 package Socks::Accept;
-# Do the SOCKS bind operation
+# Do the SOCKS bind operation (remote side)
 use vars qw(@ISA);
-@ISA = qw(Socks::Forward);
+@ISA = qw(Socks::Remote);
 
 sub new_suspended {
     my $class = shift;
@@ -3498,17 +3542,17 @@ sub new_suspended {
             $accept->error("Failed UDP probe connect to '$accept->{remote}{display}': $local");
             return undef;
         }
-        # Local contains the local adress as the result of an probe UDP connect
+        # Local contains the local adress as the result of a probe UDP connect
         # The port is meaningless, we want to do a local bind for TCP instead
         $local->{type} = "tcp4";
-        $local->{port} = $accept->{remote}{p};
         $local->{port} = 0;
         # This will not actually look up anything since all addresses and ports
         # are numeric. But it will properly fill in all fields
         ConnUtils->resolve($local, "SOCKS");
     }
 
-    my $listener = eval { Listener::Socks::Accept->new($accept, $local, loops => 1) };
+    # Don't set loops = 1. We may reject some incoming connections
+    my $listener = eval { Listener::Socks::Accept->new($accept, $local) };
     if ($@) {
         # bind/listen failed, errno in $!
         my $err = $@;
@@ -4194,7 +4238,7 @@ sub new_suspended {
     my $listener = $class->SUPER::new($parent, %args);
     $listener->info("Listening on '%s' [%s]",
                     @{$listener->{local}}{qw(user display)}) if
-                        $listener->{local}{p} == 0 || $verbose > 1;
+                        $listener->{local}{user} =~ /:0$/ || $verbose > 1;
     return $listener;
 }
 
@@ -4262,8 +4306,8 @@ sub status {
 
     $control->{out} .= <<"EOF"
 $indent$name
-$indent  Bind $listener->{local}{user} [$listener->{local}{display}]
-$indent  Loops $listener->{loops}
+$indent  Loops: $listener->{loops}
+$indent  Local Listen on '$listener->{local}{user}' [$listener->{local}{display}]
 EOF
         ;
 }
