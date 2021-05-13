@@ -1080,17 +1080,9 @@ sub id_check {
     $ids->SUPER::id_check($id)  unless $id &1;
 }
 
-package ConnUtils;
-# Utilities to set up connections
-# Other package should need less Socket exports this way
-use Socket
-    qw(AF_INET PF_INET SOCK_DGRAM SOCK_STREAM SO_REUSEADDR IPPROTO_TCP
-       TCP_NODELAY SOL_SOCKET SO_KEEPALIVE
-       inet_aton inet_ntoa pack_sockaddr_in unpack_sockaddr_in);
-use Errno qw(EADDRINUSE EPROTONOSUPPORT EACCES ENOPROTOOPT);
+package Address;
+use Socket qw(AF_INET pack_sockaddr_in unpack_sockaddr_in inet_aton inet_ntoa);
 use Carp qw(croak);
-use POSIX qw(ceil);
-
 # IPv6 could use [fe80::240:63ff:fede:3c19]:1234 as notation (like RFC 3986)
 my %parse_regex = (
     tcp4	=> "(?:([^:/]*):|^)([^:/]*)",
@@ -1102,8 +1094,8 @@ my %from_defaults = (
     udp4	=> "0.0.0.0:0",
 );
 
-my $ADDRESS_ANY = __PACKAGE__->parse_address("0.0.0.0:0", "ADDRESS_ANY", from => "tcp4", resolve => 1);
-my $ADDRESS_REMOTE = __PACKAGE__->parse_address("8.8.8.8:53", "ADDRESS_REMOTE", from => "tcp4", resolve => 1);
+my $ADDRESS_ANY = __PACKAGE__->parse("0.0.0.0:0", "ADDRESS_ANY", from => "tcp4", resolve => 1);
+my $ADDRESS_REMOTE = __PACKAGE__->parse("8.8.8.8:53", "ADDRESS_REMOTE", from => "tcp4", resolve => 1);
 
 sub build_parser {
     my ($mode, $types, $matches) = @_;
@@ -1121,7 +1113,7 @@ sub build_parser {
 }
 
 sub resolve {
-    my ($class, $address, $context) = @_;
+    my ($address, $context) = @_;
 
     $address->{type} eq "udp4" || $address->{type} eq "tcp4" || next;
 
@@ -1140,7 +1132,7 @@ sub resolve {
     $address->{packed} = pack_sockaddr_in($address->{port}, $address->{addr});
 }
 
-sub parse_address {
+sub parse {
     my ($class, $str, $context, %options) = @_;
 
     my $resolve = delete $options{resolve};
@@ -1174,15 +1166,15 @@ sub parse_address {
                 # die "Missing $context port" if $mode eq "to";
                 $parts[1] = "0";
             }
-            $matches{$mode} = {
+            $matches{$mode} = bless {
                 type	=> $type,
                 family	=> AF_INET,
                 host	=> $parts[0],
                 port	=> $parts[1],
                 user	=> $matched,
                 display	=> "$parts[0]:$parts[1]",
-            };
-            $class->resolve($matches{$mode}, $context) if $resolve;
+            }, $class;
+            $matches{$mode}->resolve($context) if $resolve;
         } else {
             die "Assertion: Type '$type' not implemented";
         }
@@ -1193,19 +1185,19 @@ sub parse_address {
         my $type = $result[1]{type};
         my $from = $from_defaults{$type} ||
             die "$context: No default from for type '$type'";
-        $result[0] = parse_address($from, $context, from => $type, resolve => $resolve);
+        $result[0] = $class->parse($from, $context, from => $type, resolve => $resolve);
     }
     return @result if wantarray;
     croak "Cannot return multiple results in a scalar" if @result != 1;
     return $result[0];
 }
 
-sub address_from_packed {
+sub from_packed {
     my ($class, $packed, $type) = @_;
 
     my ($port, $addr) = unpack_sockaddr_in($packed);
     my $host = inet_ntoa($addr);
-    return {
+    return bless {
         type	=> $type || croak("Missing type"),
         family	=> AF_INET,
         addr	=> $addr,
@@ -1215,69 +1207,79 @@ sub address_from_packed {
         user	=> "$host:$port",
         # Normalize packed so it has no random bytes in any padding
         packed	=> pack_sockaddr_in($port, $addr),
-    };
+    }, $class;
 }
 
 # The format we use on the LineProtocol wire
-sub address_decode {
-    my ($class, $family, $address, $type) = @_;
+sub decode {
+    my ($class, $string, $type) = @_;
 
+    my ($family, $port, $addr) = unpack("wna4", $string);
     $family == AF_INET || croak "Unimplemented family $family";
     $type eq "stream" || croak "Unimplemented type $type";
-    return $class->address_from_packed(pack_sockaddr_in(unpack("na4", $address)), "tcp4");
+    return $class->from_packed(pack_sockaddr_in($port, $addr), "tcp4");
+}
+
+sub encode {
+    my ($address) = @_;
+
+    return pack("wna4", @$address{qw(family port addr)});
 }
 
 # Return a copy of $value (which is assumed to be resolved) but fill in the
 # old attribute (user) from the new attributes (display) of
 # $template (which is assumed to be unresolved)
-sub address_merge {
-    my ($class, $template, $value) = @_;
+sub copy2 {
+    my ($value, $template) = @_;
 
     $template->{type} eq $value->{type} || croak "Inconsistent type";
-    return {
+    return bless {
         %$value,
         user	=> $template->{display}
-    };
+    }, ref $value;
 }
 
 # Return a copy of $template (which is assumed not to be resolved)
 # Copy host 0.0.0.0 and port 0 from $value (which is assumed to be resolved)
-sub address_resolve {
-    my ($class, $template, $value, $resolve_context) = @_;
+sub copy0_resolve {
+    my ($template, $value, $context) = @_;
 
     $template->{type} eq $value->{type} || croak "Inconsistent type";
-    my %result = %$template;
-    $result{host} = $value->{host} if $result{host} eq "0.0.0.0";
-    $result{port} ||= $value->{port};
-    $class->resolve(\%result);
-    return \%result;
+    my $result = bless {%$template}, ref $template;
+    $result->{host} = $value->{host} if $result->{host} eq "0.0.0.0";
+    $result->{port} ||= $value->{port};
+    $result->resolve($context);
+    return $result;
 }
 
-sub socket_udp_connected {
-    my ($class, $host, $port, $probe) = @_;
+package ConnUtils;
+# Utilities to set up connections
+# Other package should need less Socket exports this way
+use Socket qw(PF_INET SOCK_DGRAM SOCK_STREAM
+               SOL_SOCKET SO_REUSEADDR SO_KEEPALIVE TCP_NODELAY
+               pack_sockaddr_in inet_aton);
+use Errno qw(EADDRINUSE EPROTONOSUPPORT EACCES ENOPROTOOPT);
+use POSIX qw(ceil);
 
-    $port = $port =~ /^0\z|^[1-9][0-9]*\z/ ? int($port) :
-        getservbyname($port, "udp") || die "Unknown UDP service '$port'";
-    my $addr = inet_aton($host) || die "Could not resolve '$host'";
+sub socket_udp_connected {
+    my ($class, $address, $probe) = @_;
+
     socket(my $socket, PF_INET, SOCK_DGRAM, $PROTO_UDP) ||
         die "Could not create UDP socket: $^E";
-    my $remote = pack_sockaddr_in($port, $addr);
     if ($probe) {
-        connect($socket, $remote) || return $!;
+        connect($socket, $address->{packed}) || return $!;
         my $sockaddr = getsockname($socket) ||
             die "Assertion: Could not getsockname: $^E";
-        return ConnUtils->address_from_packed($sockaddr, "udp4");
+        return Address->from_packed($sockaddr, "udp4");
     }
-    connect($socket, $remote) || die "Could not connect socket: $^E";
+    connect($socket, $address->{packed}) || die "Could not UDP connect to '$address->{display}': $^E";
     $socket->blocking(0);
 
     wantarray || return $socket;
 
     my $sockaddr = getpeername($socket) ||
         die "Assertion: Could not getpeername: $^E";
-    my ($p, $address) = unpack_sockaddr_in($sockaddr);
-    my $h = inet_ntoa($address);
-    return $h, $p, $socket;
+    return Address->from_packed($sockaddr), $socket;
 }
 
 sub socket_udp {
@@ -1300,7 +1302,7 @@ sub socket_udp {
 
     my $sockaddr = getsockname($socket) ||
         die "Assertion: Could not getsockname: $^E";
-    return ConnUtils->address_from_packed($sockaddr, "udp4"), $socket;
+    return Address->from_packed($sockaddr, "udp4"), $socket;
 }
 
 sub _socket_tcp {
@@ -1330,7 +1332,7 @@ sub _socket_tcp {
 
     my $sockaddr = getsockname($socket) ||
         die "Assertion: Could not getsockname: $^E";
-    my $local = ConnUtils->address_from_packed($sockaddr, "tcp4");
+    my $local = Address->from_packed($sockaddr, "tcp4");
     $local->{user} = $address->{user} if
         defined $listen && defined $address->{user};
     return $local, $socket;
@@ -1355,9 +1357,7 @@ sub socket_icmp {
 
     my $sockaddr = getsockname($socket) ||
         die "Assertion: Could not getsockname: $^E";
-    my ($i, $address) = unpack_sockaddr_in($sockaddr);
-    my $h = inet_ntoa($address);
-    return $h, $i, $socket;
+    return Address->from_packed($sockaddr), $socket;
 }
 
 my $CAN_KEEPALIVE = 1;
@@ -1365,7 +1365,7 @@ sub _tcp_set {
     my ($settings, $socket) = @_;
 
     $socket->blocking(0);
-    setsockopt($socket, IPPROTO_TCP, TCP_NODELAY, 1) ||
+    setsockopt($socket, $PROTO_TCP, TCP_NODELAY, 1) ||
         die "Couldn't disable Nagle's algorithm: $^E";
     setsockopt($socket, SOL_SOCKET, SO_KEEPALIVE, 1) ||
         die "Couldn't enable keealive: $^E";
@@ -1387,6 +1387,10 @@ sub _tcp_set {
     }
 }
 
+# This is more subtle that it seems. It doesn't just not accept until data,
+# it doesn't send the final ACK of the connect handshake leading to
+# retransmits if the data is late. Still it is may be good fit for protocols
+# that immediately expect data (like SOCKS)
 my $CAN_DEFER_ACCEPT = 10;
 sub defer_accept {
     my ($class, $socket) = @_;
@@ -1745,13 +1749,13 @@ sub client {
 
         my %connections = %$connections;
         for my $tcp (@{delete $connections{tcp_local}}) {
-            my ($from, $to) = ConnUtils->parse_address($tcp, "TCP local", from => "tcp4", to => "tcp4");
-            ConnUtils->resolve($from, "TCP local");
+            my ($from, $to) = Address->parse($tcp, "TCP local", from => "tcp4", to => "tcp4");
+            $from->resolve("TCP local");
             Listener::TCP::Forward->new_suspended($line, $from, remote => $to);
         }
 
         for my $socks (@{delete $connections{socks_local}}) {
-            my $from = ConnUtils->parse_address($socks, "SOCKS local", from => "tcp4", resolve => 1);
+            my $from = Address->parse($socks, "SOCKS local", from => "tcp4", resolve => 1);
             Listener::Socks::Local->new_suspended($line, $from);
         }
 
@@ -1759,8 +1763,8 @@ sub client {
             my ($from, $to) =
                 $udp =~ m{^([^%]+)%([^%]+)\z} or
                 die "Invalid fou_local '$udp'";
-            $from = ConnUtils->parse_address($from, "FOU local", from => "UDP4");
-            $to   = ConnUtils->parse_address($to  , "FOU local", to   => "UDP4", resolve => 1);
+            $from = Address->parse($from, "FOU local", from => "UDP4");
+            $to   = Address->parse($to  , "FOU local", to   => "UDP4", resolve => 1);
             my $fou = Fou::UDP->new($to);
             Receiver::Fou->new_suspended($line, $from->{host}, $from->{port}, $fou);
         }
@@ -1778,7 +1782,7 @@ sub client {
         for my $tcp (@{delete $connections{tcp_remote}}) {
             # From needs to be resolved at the server side
             # To needs to be resolved at activation time
-            my ($from, $to) = ConnUtils->parse_address(
+            my ($from, $to) = Address->parse(
                 $tcp, "TCP remote",
                 from => "TCP4",
                 to   => "TCP4");
@@ -1787,7 +1791,7 @@ sub client {
         }
 
         for my $socks (@{delete $connections{socks_remote}}) {
-            my $from = ConnUtils->parse_address($socks, "SOCKS remote", from => "tcp4");
+            my $from = Address->parse($socks, "SOCKS remote", from => "tcp4");
             # Currently we don't track which id this gets on the remote side
             $line->write($SOCKS_REMOTE, pack("w/a*a*", $from->{type}, $from->{user}));
         }
@@ -1797,8 +1801,8 @@ sub client {
                 $udp =~ m{^([^%]+)%([^%]+)\z} or
                 die "Invalid fou_remote '$udp'";
             # Pure syntax check, resolving will be done remotely
-            ConnUtils->parse_address($from, "FOU remote", from => "UDP4");
-            ConnUtils->parse_address($to  , "FOU remote", to   => "UDP4");
+            Address->parse($from, "FOU remote", from => "UDP4");
+            Address->parse($to  , "FOU remote", to   => "UDP4");
             $line->write($FOU_REMOTE, $udp);
         }
 
@@ -2175,7 +2179,7 @@ sub on_connect {
 
     my $sockaddr = getsockname($connect->{socket_out}) ||
         die "Assertion: Could not getsockname: $^E";
-    $connect->{local} = ConnUtils->address_from_packed($sockaddr, "tcp4");
+    $connect->{local} = Address->from_packed($sockaddr, "tcp4");
     $connect->info("Connected from '$connect->{local}{display}' to '$connect->{peer}{user}' [$connect->{peer}{display}]: $!") if $verbose;
 
     $connect->{socket_in} = $connect->{socket_out};
@@ -2522,7 +2526,7 @@ sub new_suspended {
 
     # Notice this can return nothing if we can't open an UDP icmp socket
     # (either not supported on OS or user not in allowed grooup)
-    my ($host, $icmp_id, $socket) = ConnUtils->socket_icmp("0.0.0.0", 0);
+    my ($local, $socket) = ConnUtils->socket_icmp("0.0.0.0", 0);
     !$msghdr || !$socket || setsockopt($socket, $IPPROTO_IP, $IP_RECVTTL, 1) ||
         die "setsockopt(IPPROTO_IP, IP_RECVTTL): $^E";
     # ICMP_FILTER always gets me ENOPROTOOPT
@@ -2534,13 +2538,13 @@ sub new_suspended {
         $line, $socket, $socket,
         id		=> $id,
         pid		=> $$,
-        local_host	=> $host,
-        icmp_id		=> $icmp_id,
+        local		=> $local,
+        icmp_id		=> $local->{port},
         pending		=> 0);
 
     if ($verbose > 1) {
         if ($socket) {
-            $icmp->info("New ICMP socket '%s:%d'", $host, $icmp_id);
+            $icmp->info("New ICMP socket '%s'", $local->{display});
         } else {
             $icmp->info("Using external ping");
         }
@@ -2871,7 +2875,7 @@ use vars qw(@ISA);
 use Scalar::Util qw(weaken);
 use Socket qw(inet_aton inet_ntoa pack_sockaddr_in);
 
-# Called with a resolved address (see parse_address)
+# Called with a resolved address (see Address->parse)
 { no warnings "once"; *new = \&new_suspended; }
 sub new_suspended {
     my ($class, $address_to) = @_;
@@ -2992,9 +2996,9 @@ sub on_accept {
         remote_id	=> $listener->id,
     );
     $forward->info("Start forwarding from %s to TCP::Remote %d (remote connect may still fail though)", $peer->{display}, $forward->{remote_id}) if $verbose > 1;
-    $line->write($CONNECT_REMOTE, pack("wwwna4",
+    $line->write($CONNECT_REMOTE, pack("wwa*",
                                        @$forward{qw(id remote_id)},
-                                       @$local{qw(family port addr)}));
+                                       $local->encode));
     return $forward;
 }
 
@@ -3100,12 +3104,12 @@ package Listener::Socks::Local;
 use vars qw(@ISA);
 @ISA = qw(Listener);
 
-#sub new_suspended {
-#    my $class = shift;
-#    my $socks = $class->SUPER::new_suspended(@_);
-#    $socks->defer_accept;
-#    return $socks;
-#}
+sub new_suspended {
+    my $class = shift;
+    my $socks = $class->SUPER::new_suspended(@_);
+    $socks->defer_accept;
+    return $socks;
+}
 
 sub on_accept {
     my ($listener, $accepted, $local, $peer) = @_;
@@ -3182,7 +3186,7 @@ sub socks_result {
     } elsif ($remote->{cmd} == 2) {
         return if $seqno == 1;
         $seqno == 2 || $socks->bug("Response packet $seqno");
-        $socks->{remote} = ConnUtils->address_merge($remote, $address);
+        $socks->{remote} = $address->copy2($remote);
     } else {
         $socks->bug("Unimplemented SOCKS command '$remote->{cmd}'");
     }
@@ -3312,14 +3316,14 @@ sub auth5 {
         return;
     }
     $socks->write("\x05\x00");
-    $socks->remote5;
+    $socks->request5;
 }
 
-sub remote5 {
+sub request5 {
     my ($socks) = @_;
 
     if (length $socks->{in} < 4) {
-        $socks->{state} = \&remote5;
+        $socks->{state} = \&request5;
         return;
     }
     my ($version, $cmd, $rsv, $type) = unpack("C4", substr($socks->{in}, 0, 4, ""));
@@ -3532,7 +3536,7 @@ sub new_suspended {
     my $local = $accept->{remote};
     if ($local->{host} ne "0.0.0.0") {
         # Proper client
-        $local = ConnUtils->socket_udp_connected(@{$accept->{remote}}{qw(host port)}, -1);
+        $local = ConnUtils->socket_udp_connected($accept->{remote}, 1);
         if (ref $local eq "") {
             # UDP connect failed, errno in $local
             $line->write($SOCKS_RESULT,
@@ -3542,13 +3546,13 @@ sub new_suspended {
             $accept->error("Failed UDP probe connect to '$accept->{remote}{display}': $local");
             return undef;
         }
-        # Local contains the local adress as the result of a probe UDP connect
+        # Local contains the local address as the result of a probe UDP connect
         # The port is meaningless, we want to do a local bind for TCP instead
         $local->{type} = "tcp4";
         $local->{port} = 0;
         # This will not actually look up anything since all addresses and ports
         # are numeric. But it will properly fill in all fields
-        ConnUtils->resolve($local, "SOCKS");
+        $local->resolve("SOCKS");
     }
 
     # Don't set loops = 1. We may reject some incoming connections
@@ -3874,8 +3878,8 @@ sub process_FOU_REMOTE {
     my ($from, $to) =
         $udp =~ m{^([^%]+)%([^%]+)\z} or
         die "Invalid fou_remote '$udp'";
-    $from = ConnUtils->parse_address($from, "FOU remote", from => "UDP4");
-    $to   = ConnUtils->parse_address($to  , "FOU remote", to   => "UDP4", resolve => 1);
+    $from = Address->parse($from, "FOU remote", from => "UDP4");
+    $to   = Address->parse($to  , "FOU remote", to   => "UDP4", resolve => 1);
 
     my $fou = Fou::UDP->new($to);
     my $listener = Receiver::Fou->new($line, $from->{host}, $from->{port}, $fou);
@@ -4108,7 +4112,7 @@ sub process_LISTEN_REMOTE {
     my $line = shift;
 
     my ($id, $type, $from) = unpack("ww/a*a*", shift);
-    $from = ConnUtils->parse_address($from, "TCP remote", from => $type, resolve => 1);
+    $from = Address->parse($from, "TCP remote", from => $type, resolve => 1);
     Listener::TCP::Remote->new_suspended($line, $from, id => $id);
 }
 
@@ -4117,19 +4121,19 @@ sub process_CONNECT {
 
     my ($id, $type, $target) = unpack("ww/a*a*", shift);
 
-    my $to = ConnUtils->parse_address($target, "TCP connect",
-                                      to => $type, resolve => 1);
+    my $to = Address->parse($target, "TCP connect",
+                            to => $type, resolve => 1);
     TCP::Forward->new($line, undef, $to, id => $id);
 }
 
 sub process_CONNECT_REMOTE {
     my $line = shift;
 
-    my ($id, $remote_id, $family, $address) = unpack("wwwa*", shift);
-    $address = ConnUtils->address_decode($family, $address, "stream");
+    my ($id, $remote_id, $address) = unpack("wwa*", shift);
+    $address = Address->decode($address, "stream");
     my $tcp_remote = $line->child("TCP::Remote", $remote_id) ||
         $line->bug("Unknown TCP::Remote[$remote_id]");
-    my $to = ConnUtils->address_resolve($tcp_remote->{remote}, $address);
+    my $to = $tcp_remote->{remote}->copy0_resolve($address);
     TCP::Forward->new($line, undef, $to, id => $id);
 }
 
@@ -4166,17 +4170,13 @@ sub process_SOCKS {
 
     my ($id, $cmd, $type, $target) = unpack("www/a*a*", shift);
     if ($cmd == 1) {
-        my $to = ConnUtils->parse_address($target, "SOCKS connect",
-                                          to => $type, resolve => 1);
+        my $to = Address->parse($target, "SOCKS connect",
+                                to => $type, resolve => 1);
 
         Socks::Connect->new($line, undef, $to, id => $id);
     } elsif ($cmd == 2) {
-        my $to = ConnUtils->parse_address($target, "SOCKS bind",
-                                            to => $type, resolve => 1);
-        # Some (all ?) socksify programs seem to leave host as "0.0.0.0"
-        # On linux wih the UDP connect probe this will become 127.0.0.1
-        # Instead try to connect to 8.8.8.8 which hopefully gets us the
-        # interface of the default port
+        my $to = Address->parse($target, "SOCKS bind",
+                                          to => $type, resolve => 1);
         Socks::Accept->new($line, undef, undef, id => $id, remote => $to);
     } else {
         $line->bug("Unknown socks command '$cmd'");
@@ -4189,7 +4189,7 @@ sub process_SOCKS_RESULT {
     my ($id, $seqno, $status, $error, $type, $address) = unpack("wwww/a*w/a*a*", shift);
     my $socks_local = $line->child("TCP::Forward", $id) ||
         $line->bug("Could not find Socks::Local[$id]");
-    $address = ConnUtils->parse_address($address, "SOCKS local", from => $type, resolve => 1);
+    $address = Address->parse($address, "SOCKS local", from => $type, resolve => 1);
     $socks_local->socks_result($seqno, $status, $error, $type, $address);
 }
 
@@ -4197,7 +4197,7 @@ sub process_SOCKS_REMOTE {
     my $line = shift;
 
     my ($type, $from) = unpack("w/a*a*", shift);
-    $from = ConnUtils->parse_address($from, "SOCKS local", from => $type, resolve => 1);
+    $from = Address->parse($from, "SOCKS local", from => $type, resolve => 1);
     Listener::Socks::Local->new_suspended($line, $from);
 }
 
@@ -4219,7 +4219,6 @@ use vars qw(@ISA);
 @ISA = qw(Object);
 
 use Errno qw(EINTR EAGAIN EWOULDBLOCK ECONNABORTED);
-use Socket qw(IPPROTO_TCP TCP_NODELAY AF_INET unpack_sockaddr_in inet_ntoa);
 
 sub new_suspended {
     my $class = shift;
@@ -4272,10 +4271,9 @@ sub acceptable {
     $listener->delete("Maximum connections") if --$listener->{loops} == 0;
     my $packed = getsockname($accepted) ||
         die "Assertion: Could not getsockname(): $^E";
-    my $local = ConnUtils->address_merge(
-        $listener->{local},
-        ConnUtils->address_from_packed($packed, "tcp4"));
-    $peer = ConnUtils->address_from_packed($peer, "tcp4");
+    my $local =
+        Address->from_packed($packed, "tcp4")->copy2($listener->{local});
+    $peer = Address->from_packed($peer, "tcp4");
     $listener->info("Accepted connection from '%s:%d' to '%s' [%s]",
                     @$peer{qw(host port)}, @$local{qw(user display)}) if $verbose;
     $listener->tcp_set($accepted);
@@ -4656,7 +4654,7 @@ sub cleanup_all {
 sub add_control {
     my ($parent) = @_;
 
-    my $address = ConnUtils->parse_address("127.0.0.1:0", "Control", from => "TCP4", resolve => 1);
+    my $address = Address->parse("127.0.0.1:0", "Control", from => "TCP4", resolve => 1);
     Listener::Control->new($parent, $address);
 }
 
@@ -4771,7 +4769,7 @@ if ($role eq "server") {
             Control->new($root);
             $| = 1;
         }
-        my $address = ConnUtils->parse_address($server, "Server", from => "TCP4", resolve => 1);
+        my $address = Address->parse($server, "Server", from => "TCP4", resolve => 1);
 
         $loops = -1 if !defined $loops;
         Listener::LineProtocol->new($root, $address, loops => $loops) if $loops;
@@ -4806,7 +4804,7 @@ if ($role eq "server") {
         die "Cannot have arguments in client mode" if @ARGV;
         die "Cannot have stuff in client mode" if $stuff;
 
-        my $to = ConnUtils->parse_address($client, "Client", to => "tcp4", resolve => 1);
+        my $to = Address->parse_address($client, "Client", to => "tcp4", resolve => 1);
         my $socket = $root->socket_tcp($to);
         $root->client($socket, $socket, \%connections, 1);
     } else {
@@ -4920,7 +4918,7 @@ $root->timeout($global_timeout) if defined $global_timeout;
 
 eval {
     for my $control (@{$connections{control_local}}) {
-        my $address = ConnUtils->parse_address($control, "Control", from => "TCP4", resolve => 1);
+        my $address = Address->parse($control, "Control", from => "TCP4", resolve => 1);
         Listener::Control->new_suspended($root, $address);
     }
 
