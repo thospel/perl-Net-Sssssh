@@ -1635,8 +1635,13 @@ sub caller_info {
 }
 
 sub immediate {
-    my ($object, $code) = @_;
-    $object->{timeout} = Timer::immediate($object, $code);
+    my $object = shift;
+    $object->{timeout} = Timer::immediate($object, shift);
+}
+
+sub timer {
+    my $object = shift;
+    $object->{timeout} = Timer::timer(shift, $object, shift);
 }
 
 sub count_children {
@@ -1925,6 +1930,8 @@ sub _end_on_flushed {
     }
 }
 
+# Flush pending output, then calls method "write_end" which triggers something.
+# By default it deletes the object which closes the connection
 sub end_on_flushed {
     my $connection = shift;
 
@@ -2141,10 +2148,10 @@ sub new_suspended {
         } elsif ($! == EINPROGRESS || $! == EWOULDBLOCK) {
             $connect->info("Connecting to '$peer->{user}' [$peer->{display}]") if $verbose > 1;
             $connect->{writer} = Events::add_write0($connect->{socket_out}, $connect, \&connected);
-            $connect->{timeout} = Timer::timer($connect->{parent}{settings}{TIMEOUT_CONNECT}, $connect, \&connect_timeout);
+            $connect->{timeout} = $connect->timer($connect->{parent}{settings}{TIMEOUT_CONNECT}, \&connect_timeout);
         } else {
             my $err = $!;
-            $connect->{timeout} = Timer::immediate($connect, sub { shift->on_connect($err)});
+            $connect->{timeout} = $connect->immediate(sub { shift->on_connect($err)});
         }
     }
     return $connect;
@@ -3160,44 +3167,6 @@ use vars qw(@ISA);
 
 use Socket qw(inet_ntoa);
 
-sub socks_result {
-    my ($socks, $seqno, $status, $error, $type, $address) = @_;
-
-    my $remote = $socks->{remote};
-    $seqno == ++$remote->{seqno} ||
-        $socks->bug("Got result packet $seqno, expected $remote->{seqno}");
-
-    if ($remote->{version} == 5) {
-        $socks->write(pack("CCxCa4n", 5, $status, 1, @$address{qw(addr port)}));
-    } elsif ($remote->{version} == 4) {
-        $socks->write(
-            pack("xCna4", $status ? 0x5B : 0x5A, @$address{qw(port addr)}));
-    } else {
-        $socks->bug("Unknown socks version $remote->{version}");
-    }
-
-    if ($status) {
-        $socks->end_on_flushed("$remote->{command} to '$remote->{display}' [$address->{display}] failed: $error [status $status]");
-        return;
-    }
-
-    if ($remote->{cmd} == 1) {
-        $seqno == 1 || $socks->bug("Response packet $seqno");
-    } elsif ($remote->{cmd} == 2) {
-        return if $seqno == 1;
-        $seqno == 2 || $socks->bug("Response packet $seqno");
-        $socks->{remote} = $address->copy2($remote);
-    } else {
-        $socks->bug("Unimplemented SOCKS command '$remote->{cmd}'");
-    }
-    $socks->info("Become TCP::Forward[%s] after %s to '%s' [%s] succeeded",
-                 $socks->id_full, $remote->{command},
-                 $remote->{display}, $address->{display}) if $verbose > 1;
-    bless $socks, "TCP::Forward";
-    $socks->resume_read;
-    $socks->on_read(length $socks->{in}) if $socks->{in} ne "";
-}
-
 sub finish_remote {
     my $socks = shift;
 
@@ -3405,7 +3374,13 @@ sub port5 {
 sub execute {
     my ($socks) = @_;
 
-    $socks->{state} = \&state_bug;
+    if ($socks->{in} ne "") {
+        $socks->{state} = \&state_bug;
+        $socks->finish_local("Spurious input");
+        return;
+    }
+    $socks->{state} = \&execute;
+
     my $request = delete $socks->{request};
     $request->{user} = $request->{display} = "$request->{host}:$request->{port}";
     if ($request->{cmd} == 1) {
@@ -3418,9 +3393,11 @@ sub execute {
     } else {
         $socks->bug("Unknown command '$request->{cmd}'");
     }
-    $socks->info("User %srequests %s to %s",
+
+    $socks->info("User %srequests %s to %s using SOCKS%d%s",
                  defined $request->{username} ? "'$request->{username}' " : "",
-                 $request->{command}, $request->{user}) if $verbose;
+                 $request->{command}, $request->{user}, $request->{version},
+                 $request->{version} == 4 && $request->{addr} =~ /^\0\0\0[^\0]/ ? "a" : $request->{version} == 4 && !$request->{addr} ? "h" : "") if $verbose;
 
     if ($request->{port} == 0 && $request->{cmd} == 1) {
         $socks->end_on_flushed(
@@ -3431,11 +3408,48 @@ sub execute {
         return;
     }
 
-    $socks->suspend_read;
     $socks->{parent}->write(
         $SOCKS, pack("www/a*a*", $socks->{id}, @$request{qw(cmd type display)}));
     $socks->{finished_remote} = undef;
     $socks->{remote} = $request;
+}
+
+sub socks_result {
+    my ($socks, $seqno, $status, $type, $address) = @_;
+
+    my $remote = $socks->{remote};
+    $seqno == ++$remote->{seqno} ||
+        $socks->bug("Got result packet $seqno, expected $remote->{seqno}");
+
+    if ($remote->{version} == 5) {
+        $socks->write(pack("CCxCa4n", 5, $status, 1, @$address{qw(addr port)}));
+    } elsif ($remote->{version} == 4) {
+        $socks->write(
+            pack("xCna4", $status ? 0x5B : 0x5A, @$address{qw(port addr)}));
+    } else {
+        $socks->bug("Unknown socks version $remote->{version}");
+    }
+
+    # No need for cleanup, the remote side has already sent us a TCP_FIN command
+    # (which also includes the error reason)
+    return if $status;
+
+    if ($remote->{cmd} == 1) {
+        $seqno == 1 || $socks->bug("Response packet $seqno");
+    } elsif ($remote->{cmd} == 2) {
+        return if $seqno == 1;
+        $seqno == 2 || $socks->bug("Response packet $seqno");
+        $socks->{remote} = $address->copy2($remote);
+    } else {
+        $socks->bug("Unimplemented SOCKS command '$remote->{cmd}'");
+    }
+    $socks->info("Become TCP::Forward[%s] after %s to '%s' [%s] succeeded",
+                 $socks->id_full, $remote->{command},
+                 $remote->{display}, $address->{display}) if $verbose > 1;
+    $socks->suspend_read;
+    bless $socks, "TCP::Forward";
+    # Replace the reader by the one from TCP::Forward
+    $socks->resume_read;
 }
 
 sub state_bug {
@@ -3469,17 +3483,17 @@ sub on_connect {
         # Send peer as address. We don't HAVE a local and it can be interesting
         # to know what we actually tried to connect to
         $line->write($SOCKS_RESULT,
-                     pack("wwww/a*w/a*a*", $connect->{id}, 1,
-                          $SOCKS_STATUS{$err+0} || 1, "$err",
+                     pack("wwww/a*a*", $connect->{id}, 1,
+                          $SOCKS_STATUS{$err+0} || 1,
                           @{$connect->{peer}}{qw(type display)}));
         # This will call error() and cause a finish which must come AFTER write
         $connect->SUPER::on_connect($err);
     } else {
         # This will succeed and must come BEFORE write so we get "local"
-        $connect->SUPER::on_connect($err);
+        $connect->SUPER::on_connect(0);
         # Send "local" as address (as the RFC tells us we must)
         $line->write($SOCKS_RESULT,
-                     pack("wwxxw/a*a*", $connect->{id}, 1,
+                     pack("wwxw/a*a*", $connect->{id}, 1,
                           @{$connect->{local}}{qw(type display)}));
         $connect->info("Become TCP::Forward[%s] now that connect succeeded",
                       $connect->id_full) if $verbose > 1;
@@ -3504,6 +3518,10 @@ sub on_accept {
         # Only accept connections from the same host that the request mentioned
         # as the destination
         # The SOCKS5 RFC doesn't mention this, but it seems like a good idea
+        # A SOCKS4 description describes sending an error back to the client for
+        # this case, but I don't want to shut the client down because somebody
+        # else connected to the port (on the other hand maybe something is
+        # genuinely asymetric and now the user will never know)
         $accept->info("Reject incoming connection from '$peer->{display}', does not match the expected host from '$accept->{remote}{user}' [$accept->{remote}{display}]") if $verbose;
         return;
     }
@@ -3513,7 +3531,7 @@ sub on_accept {
     $accept->{socket_in} = $accept->{socket_out} = $socket;
     # Send "peer" as address in the second result (as the RFC tells us we must)
     $line->write($SOCKS_RESULT,
-                 pack("wwxxw/a*a*", $accept->{id}, 2,
+                 pack("wwxw/a*a*", $accept->{id}, 2,
                       @$peer{qw(type display)}));
     $accept->info("Become TCP::Forward[%s] now that accept succeeded",
                   $accept->id_full) if $verbose > 1;
@@ -3540,8 +3558,8 @@ sub new_suspended {
         if (ref $local eq "") {
             # UDP connect failed, errno in $local
             $line->write($SOCKS_RESULT,
-                         pack("wwww/a*w/a*a*", $accept->{id}, 1,
-                              $SOCKS_STATUS{$local+0} || 1, "UDP connect: $local",
+                         pack("wwww/a*a*", $accept->{id}, 1,
+                              $SOCKS_STATUS{$local+0} || 1,
                               @{$accept->{remote}}{qw(type display)}));
             $accept->error("Failed UDP probe connect to '$accept->{remote}{display}': $local");
             return undef;
@@ -3562,8 +3580,8 @@ sub new_suspended {
         my $err = $@;
         $err =~ s/\sat\s.*//s;
         $line->write($SOCKS_RESULT,
-                     pack("wwww/a*w/a*a*", $accept->{id}, 1,
-                          $SOCKS_STATUS{$!+0} || 1, $err,
+                     pack("wwww/a*a*", $accept->{id}, 1,
+                          $SOCKS_STATUS{$!+0} || 1,
                           @{$accept->{remote}}{qw(type display)}));
         $accept->error($err);
         return undef;
@@ -3571,9 +3589,23 @@ sub new_suspended {
     # Listener did a bind, so at least the port is filled in now
     $accept->{local} = $listener->{local};
     $line->write($SOCKS_RESULT,
-                 pack("wwxxw/a*a*", $accept->{id}, 1,
+                 pack("wwxw/a*a*", $accept->{id}, 1,
                       @{$listener->{local}}{qw(type display)}));
+    # We expect Response -> client, client -> application server (through SOCKS)
+    # and application server -> our socket. Let's give it ... two connect times
+    $accept->timer($line->{settings}{TIMEOUT_CONNECT} * 2, \&accept_timeout);
     return $accept;
+}
+
+sub accept_timeout {
+    my ($accept) = @_;
+
+    # 6 = TTL expired which is typically interpreted as "timeout" by the client
+    # We have nothing sane to put in the address, so just punt with remote
+    $accept->{parent}->write($SOCKS_RESULT,
+                             pack("wwww/a*a*", $accept->{id}, 2,
+                                  6, @{$accept->{remote}}{qw(type display)}));
+    $accept->error("Accept timed out");
 }
 
 package LineProtocol;
@@ -3729,8 +3761,8 @@ sub writer {
         $line->{out_sent} += $rc;
         if (length $line->{out} == $line->{out_sent}) {
             $line->{writer} = undef;
-            $line->{keepalive} = Timer::timer($line->{settings}{KEEPALIVE},
-                                              $line, \&keepalive);
+            $line->{keepalive} =
+                $line->timer($line->{settings}{KEEPALIVE}, \&keepalive);
             return;
         }
     }
@@ -4177,7 +4209,8 @@ sub process_SOCKS {
     } elsif ($cmd == 2) {
         my $to = Address->parse($target, "SOCKS bind",
                                           to => $type, resolve => 1);
-        Socks::Accept->new($line, undef, undef, id => $id, remote => $to);
+        # Just new would also suspend since we pass no peer, so no connect()
+        Socks::Accept->new_suspended($line, undef, undef, id => $id, remote => $to);
     } else {
         $line->bug("Unknown socks command '$cmd'");
     }
@@ -4186,11 +4219,11 @@ sub process_SOCKS {
 sub process_SOCKS_RESULT {
     my $line = shift;
 
-    my ($id, $seqno, $status, $error, $type, $address) = unpack("wwww/a*w/a*a*", shift);
+    my ($id, $seqno, $status, $type, $address) = unpack("wwww/a*a*", shift);
     my $socks_local = $line->child("TCP::Forward", $id) ||
         $line->bug("Could not find Socks::Local[$id]");
     $address = Address->parse($address, "SOCKS local", from => $type, resolve => 1);
-    $socks_local->socks_result($seqno, $status, $error, $type, $address);
+    $socks_local->socks_result($seqno, $status, $type, $address);
 }
 
 sub process_SOCKS_REMOTE {
@@ -4347,6 +4380,7 @@ use vars qw(@ISA);
 @ISA = qw(Stream0);
 
 my %commands = (
+    "?"		=> \&command_help,
     help	=> \&command_help,
     status	=> \&command_status,
     set		=> \&command_set,
@@ -4430,7 +4464,7 @@ exit               Close connection
 dump               Dump internal datastructure
 events             Dump internal Events
 finish             End the program
-help               Show this help
+help, ?            Show this help
 pid                Show program pid
 set {var=value}    Set variables
 status             Show connections status
