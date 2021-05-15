@@ -169,24 +169,34 @@ my $SECRET = pack("NNNN", $$ ^ rand 2**32, $^T ^ rand 2**32, rand 2**32, rand 2*
 my $STUFFED = "GoNow";
 
 my $PROTOCOL	= 1;
-# Line protocol commands
-my $START	= "1";
-my $SET		= "=";	# sets a server variable
-my $FOU_REMOTE	= "r";
-my $PING	= "P";
-my $RESPONSE_PING= "p";
-my $RESPONSE_UDP= "u";
-my $UDP_DATA	= "U";
-my $TCP_DATA	= "T";	# Local to Remote DATA
-my $TCP_EOF	= "E";	# Local to Remote EOF
-my $TCP_FIN	= "F";	# Local to Remote FINISH (will never more about this id)
-my $KEEP	= "K";	# Keepalive/ACK packet
-my $CONNECT	= "C";
-my $CONNECT_REMOTE	= "c";
-my $LISTEN_REMOTE	= "L";
-my $SOCKS		= "S",
+
+# Lineprotocol commands
+my $START		= "1";
+my $SET			= "=";	# sets a server variable
+my $KEEP		= "K";	# Keepalive/ACK packet
+
+# Implicit about LineProtocol
+my $CONNECT		= "C";	# Create a server side connecting TCP::Forward
+my $CONNECT_REMOTE	= "c";	# Create a client side connecting TCP::Forward
+my $LISTEN_REMOTE	= "L";	# Create a server side Listener::TCP::Remote
+my $SOCKS		= "S",	# Create a remote Socks::Connect/Socks::Accept
+my $SOCKS_REMOTE	= "d",	# Create a server side Listener::Socks::Local
+my $FOU_REMOTE		= "r";	# Create a server side Receiver::Fou (and Fou::UDP if needed)
+my $PING		= "P";	# Create a remote Sender::ICMP (if not exists)
+my $RESPONSE_PING	= "p";	# Use a remote Fou::UDP to send ICMP ECHO REPLY
+my $RESPONSE_UDP	= "u";	# DATA to remote (initiator)
+
+# Implicit about TCP::Forward
+my $TCP_DATA		= "T";	# DATA to remote
+my $TCP_EOF		= "E";	# EOF  to remote
+my $TCP_FIN		= "F";	# FINISH to remote (will never send more about this id)
+
+# Implicit about Sender::UDP
+# (UDP is handled assymetric, there is the idea of an initiator and a responder)
+my $UDP_DATA		= "U";	# DATA to remote (UDP responder), create Sender::UDP if needed
+
+# Implcit about Socks::Local (about to become TCP::Forward)
 my $SOCKS_RESULT	= "s",
-my $SOCKS_REMOTE	= "d",
 
 my $ETIMEDOUT = $! = ETIMEDOUT;
 
@@ -1917,21 +1927,28 @@ sub write_end {
     $connection->delete($connection->{reason} || "Unknown reason");
 }
 
+sub delayed_write_end {
+    my $connection = shift;
+    $connection->{timeout} = undef;
+    $connection->{on_written}->($connection);
+}
+
 sub _end_on_flushed {
     my $connection = shift;
     $connection->{reason} = shift || $connection->bug("No end reason");
     $connection->write(@_) if @_;
+    $connection->{on_written} = $connection->can("write_end") ||
+        $connection->bug("Cannot write_end");
 
-    if ($connection->{out} eq "") {
-        $connection->write_end;
-    } else {
-        $connection->{on_written} = $connection->can("write_end") ||
-            $connection->bug("Cannot write_end");
-    }
+    # It's fine if a later write() overrides this timeout, we DO want to
+    # process the extra bytes, the on_written ramains active
+    $connection->{timeout} = $connection->immediate(\&delayed_write_end);
 }
 
 # Flush pending output, then calls method "write_end" which triggers something.
 # By default it deletes the object which closes the connection
+# If you do more complex stuff and still need $connection->{in} you might want
+# to call _end_on_flushed() or override end_on_flushed (and eof) instead
 sub end_on_flushed {
     my $connection = shift;
 
@@ -1943,11 +1960,15 @@ sub end_on_flushed {
 }
 
 sub suspend_read {
-    my $listener = shift;
+    my $connection = shift;
 
-    $listener->info("suspend_read") if $verbose > 1;
-    $listener->{reader} || $listener->die("Read already suspended");
-    $listener->{reader} = undef;
+    $connection->info("suspend_read") if $verbose > 1;
+    $connection->{reader} || $connection->die("Read already suspended");
+    $connection->{reader} = undef;
+}
+
+sub black_hole {
+    shift->{in} = "";
 }
 
 # Remote tells us it is finished
@@ -3077,6 +3098,7 @@ sub finish_local {
     $forward->{reason} = "@_";
     $forward->{reader} = undef if delete $forward->{socket_in};
 
+    # $forward->{local} implies we are connected
     if ($forward->{out} eq "" || !$forward->{local}) {
         $forward->local_end;
     } else {
@@ -3171,6 +3193,13 @@ sub finish_remote {
     my $socks = shift;
 
     $socks->SUPER::finish_remote(@_) if $socks->{remote};
+}
+
+sub end_on_flushed {
+    my $socks = shift;
+
+    $socks->{state} = \&Connection::black_hole;
+    $socks->SUPER::end_on_flushed(@_);
 }
 
 sub eof {
@@ -3321,7 +3350,6 @@ sub request5 {
         $err = 8; # address type not supported
     }
     # Error
-    $socks->{state} = \&state_bug;
     $socks->end_on_flushed("SOCKS5 request error: $msg",
                            pack("CCxCx6", 5, $err, 1));
 }
@@ -3374,13 +3402,6 @@ sub port5 {
 sub execute {
     my ($socks) = @_;
 
-    if ($socks->{in} ne "") {
-        $socks->{state} = \&state_bug;
-        $socks->finish_local("Spurious input");
-        return;
-    }
-    $socks->{state} = \&execute;
-
     my $request = delete $socks->{request};
     $request->{user} = $request->{display} = "$request->{host}:$request->{port}";
     if ($request->{cmd} == 1) {
@@ -3412,6 +3433,19 @@ sub execute {
         $SOCKS, pack("www/a*a*", $socks->{id}, @$request{qw(cmd type display)}));
     $socks->{finished_remote} = undef;
     $socks->{remote} = $request;
+    # To implement TCP::Forward::on_read pipelining we need to add
+    # support for queueing EOF. Instead of setting state we could also check
+    # for $socks->{remote} in on_read then call SUPER::on_read, bypassing state
+    # $socks->{state} = \&TCP::Forward::on_read;
+    $socks->{state} = \&no_input;
+    $socks->{state}->($socks, length $socks->{in}) if $socks->{in} ne "";
+}
+
+sub no_input {
+    my ($socks) = @_;
+
+    $socks->{state} = \&state_bug;
+    $socks->finish_local("Spurious input");
 }
 
 sub socks_result {
@@ -4185,7 +4219,7 @@ sub process_TCP_EOF {
     my $id = unpack("w", shift);
     my $forward = $line->child("TCP::Forward", $id) ||
         $line->bug("Could not find TCP::Forward[$id]");
-    $forward->end_on_flushed("Remote EOF") unless $forward->{finished};
+    $forward->_end_on_flushed("Remote EOF") unless $forward->{finished};
 }
 
 sub process_TCP_FIN {
