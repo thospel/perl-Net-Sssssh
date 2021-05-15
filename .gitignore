@@ -31,5 +31,6 @@ test.*
 *.s
 *.bs
 *.o
+*.old
 *.~*~
 bl?b

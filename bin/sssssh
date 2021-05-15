@@ -1036,7 +1036,7 @@ sub id_alloc {
 sub id_free {
     my ($ids, $id) = @_;
 
-    push @{$ids->{free_ids}}, $id;
+    push @{$ids->{free_ids}}, int $id;
     # Decrease free_ids some if we are lucky
     while (@{$ids->{free_ids}}) {
         if ($ids->{free_ids}[-1] == $ids->{free_id}) {
@@ -1087,12 +1087,18 @@ sub id_free {
 sub id_check {
     my $ids = shift;
     my $id = $ids->{offset} + shift;
-    $ids->SUPER::id_check($id)  unless $id &1;
+    $ids->SUPER::id_check($id) unless $id &1;
 }
 
 package Address;
 use Socket qw(AF_INET pack_sockaddr_in unpack_sockaddr_in inet_aton inet_ntoa);
 use Carp qw(croak);
+
+sub new {
+    my ($class, %options) = @_;
+    return bless \%options, $class;
+}
+
 # IPv6 could use [fe80::240:63ff:fede:3c19]:1234 as notation (like RFC 3986)
 my %parse_regex = (
     tcp4	=> "(?:([^:/]*):|^)([^:/]*)",
@@ -1420,6 +1426,14 @@ package Object;
 use Scalar::Util qw(weaken);
 use Carp qw(croak);
 
+use constant {
+    UNFINISHED	=> 0,
+    FINISHING	=> 1,
+    FINISHED	=> 2,
+    DELETING	=> 3,
+    UNDELETED	=> 4,	# Special state for partnered. on_finish incomplete
+    DELETED	=> 5,
+};
 # sub DESTROY { shift->caller_info("DESTROY") if $verbose > 2; }
 
 sub new {
@@ -1431,90 +1445,99 @@ sub new {
     $parent->bug("Attempt to add '$class' child to cleaned Object") if $parent->{finished};
     my $object= bless {
         @_,
-        deleted	=> 0,
-        cleaned	=> 0,
-        parent	=> $parent,
+        finished	=> UNFINISHED,
+        parent		=> $parent,
     }, $class;
     weaken($object->{parent});
     if (defined $object->{id}) {
         # Caller managed IDs
         $parent->{ids}{$class}->id_check($object->{id}) if $parent->{ids}{$class};
         $parent->bug("Child " . $object->name() . " already exists") if
-            $parent->{children}{$class}[$object->{id}];
+            $parent->{children}{$class}{$object->{id}};
     } else {
-        # Local managed IDs
+        # Locally managed IDs
         $object->{id} = ($parent->{ids}{$class} ||= Ids->new)->id_alloc;
     }
-    $object->{id_full} = $parent->{id_full} ? "$parent->{id_full}:$object->{id}": "$object->{id}";
-    $parent->{children}{$class}[$object->{id}] = $object;
+    $parent->{children}{$class}{$object->{id}} = $object;
 
     $object->info("CREATE") if $verbose > 2;
 
     return $object;
 }
 
-# Remove the obect from the Object tree. This usually will lead to
-# the Object being destroyed but it can linger if anyone has a reference
-# So you can't depend on this call doing an implicit finish()
-sub delete : method {
-    my $object = shift;
-
-    if ($object->{deleted}) {
-        $object->bug("Double delete on '@_'") if $object->{deleted} > 0;
-        $object->bug("Recursive delete on '@_'");
-    }
-    $object->{deleted} = -1;
-    $object->info("DELETING") if $verbose > 2;
-    $object->finish(@_) unless $object->{finished};
-    $object->_delete(@_);
-    $object->info("DELETED") if $verbose > 2;
-    $object->{deleted} = 1;
-}
-
-sub _delete {
-    my $object = shift;
-
-    my $ids = $object->{parent}{ids}{ref $object};
-    $ids->id_free($object->{id}) if $ids;
-    delete $object->{parent}{children}{ref $object}[$object->{id}] ||
-        $object->isa("Root") ||
-        $object->die("Detached from Object tree");
-}
-
 # Neuter the obect. From here on it shouldn't do anything anymore
 # It will however remain in the object tree. This is typically used
 # to wait for remote finish of its mutual partner which in turn is
 # important to make sure the id isn't reused until all messages stop
+# Normally don't override this (override _finish instead)
 sub finish {
     my $object = shift;
 
     if ($object->{finished}) {
-        $object->bug("Double finish on '@_'") if $object->{finished} > 0;
-        $object->bug("Recursive finish on '@_'");
+        $object->bug("Recursive finish on '@_'") if
+            $object->{finished} == FINISHING;
+        return if $object->{finished} == UNDELETED;
+        $object->bug("Double finish (state $object->{finished}) on '@_'");
     }
-    $object->{finished} = -1;
-    if (my $children = $object->{children}) {
-        for my $class (sort keys %$children) {
-            $_ && $_->delete(@_) for @{$children->{$class}};
+    $object->{finished} = FINISHING;
+    $object->info("Finish: @_") if $verbose;
+    if (my $classes = $object->{children}) {
+        # The sorts shouldn't matter, but make bugs more repeatable and portable
+        for my $class (sort keys %$classes) {
+            my $children = $classes->{$class};
+            # $children->{$_}->finish(@_) for sort { $a <=> $b } keys %$children;
+            $children->{$_}->finish("Parent finish") for sort { $a <=> $b } keys %$children;
         }
-        %$children = ();
     }
     $object->_finish(@_);
-    $object->{finished} = 1;
+    $object->{finished} = FINISHED;
+    $object->on_finish(@_);
 }
 
+# Subclasses override finish using this method to add their specific cleanups
 sub _finish {
     delete shift->{timeout};
 }
 
-sub die : method {
-    my ($object, $msg) = @_;
+# Don't override this (see _on_finish instead)
+sub on_finish {
+    my $object = shift;
 
-    $object->info("DIE: $msg") if $verbose > 1;
-    # Class call instead of obbject call
-    die sprintf("%s: %s [%s]\n", $object, $msg, ::callers()) if ref $object eq "";
-    $object->delete($msg) unless $object->{deleted};
-    die sprintf("%s: %s [%s]\n", $object->name, $msg, ::callers());
+    $object->bug("on_finish while finished=$object->{finished} != FINISHED") if
+        $object->{finished} != FINISHED;
+    $object->{finished} = DELETING;
+    $object->_on_finish(@_);
+    if ($object->{finished} == DELETING) {
+        $object->{finished} = UNDELETED;
+    } elsif ($object->{finished} != DELETED) {
+        $object->bug("Bad finished state $object->{finished}");
+    }
+}
+
+# Subclasses override on_finish using this method
+# The default is to remove the obect from the Object tree. This usually will
+# lead to the Object being destroyed but it can linger if anyone has a reference
+sub _on_finish {
+    my $object = shift;
+
+    $object->bug("on_finish while finished=$object->{finished}") if
+        $object->{finished} != DELETING && $object->{finished} != UNDELETED;
+    # We could recursively delete children first here, but we don't...
+    # we assume that after the parent detach the current object soon won't be
+    # referenced anymore and it and all its children will get recursively
+    # destroyed. All children should be finished because finish() recursed down
+    # to them. But the children could still hold ids (e.g. in an Ids object) or
+    # have partners that now won't be cleaned. We however assume such ids are
+    # managed by something on the same level as the current object so nothing
+    # leaks and we even save time. Or for child partners that deleting the
+    # current object will close the coonnection causing the partners to be
+    # cleaned up anyways. If such is not the case and you didn't work around
+    # that, then too bad...
+    my $ids = $object->{parent}{ids}{ref $object};
+    $ids->id_free($object->{id}) if $ids;
+    delete $object->{parent}{children}{ref $object}{$object->{id}} ||
+        $object->die("Already detached from Object tree");
+    $object->{finished} = DELETED;
 }
 
 sub dump : method {
@@ -1523,14 +1546,32 @@ sub dump : method {
     print STDERR ::Dumper($object);
 }
 
-sub bug {
-    my ($object, $msg) = @_;
+sub die : method {
+    my $object = shift;
+    # Join all arguments like builtin "die"
+    my $msg = join("", @_);
+    # Only add traceback if it doesn't end on \n somewhat like builtin "die"
+    $msg .= " [" . ::callers() . "]" unless $msg =~ s/\n\z//;
 
-    $object->die("Assertion: $msg");
+    $object->info("DIE: $msg") if $verbose;
+    # Class call instead of object call
+    die sprintf("%s: %s\n", $object, $msg) if ref $object eq "";
+    $object->finish($msg) unless $object->{finished};
+    die sprintf("%s: %s\n", $object->name, $msg);
+}
+
+sub bug {
+    my $object = shift;
+
+    # Forward to the die method using the same call frame (for better traceback)
+    unshift @_, $object, "Assertion: ";
+    my $die = $object->can("die") || die "Assertion: no die method for die(@_)";
+    goto $die;
 }
 
 sub error {
     my $object = shift;
+
     $object->die(@_);
 }
 
@@ -1538,24 +1579,34 @@ sub id {
     return shift->{id};
 }
 
+sub _id_full {
+    my ($object) = @_;
+
+    return $object->{parent}->_id_full . ":" . $object->id;
+}
+
 sub id_full {
-    return shift->{id_full};
+    my $id = shift->_id_full;
+    $id =~ s/^://;
+    return $id;
 }
 
 sub name {
     my ($object) = @_;
 
-    return sprintf("%s[%s]", ref $object, $object->{id_full});
+    return sprintf("%s[%s]", ref $object, $object->id_full);
 }
 
 sub child {
     my ($object, $class, $id) = @_;
-    return $object->{children}{$class}[$id];
+    return $object->{children}{$class}{$id};
 }
 
+# Move a child to a different class set
 sub reclasify {
     my ($object, $class_to) = @_;
 
+    # Be very paranoid since this is a risky move and we want too catch bugs
     my $parent = $object->{parent} ||
         $object->bug("Cannot rebless without a parent");
     my $class_from = ref $object;
@@ -1568,14 +1619,14 @@ sub reclasify {
     $ids_from == $ids_to ||
         $object->bug("Cannot rebless from '$class_from' to '$class_to' without equal Ids");
     $object->bug("Already have a '$class_to' child with id $object->{id}") if
-        defined $parent->{children}{$class_to}[$object->{id}];
-    my $o = delete $parent->{children}{$class_from}[$object->{id}] ||
+        defined $parent->{children}{$class_to}{$object->{id}};
+    my $o = delete $parent->{children}{$class_from}{$object->{id}} ||
         $object->bug("No '$class_from' child with id $object->{id}");
     if ($object != $o) {
-        $parent->{children}{$class_from}[$object->{id}] = $o;
+        $parent->{children}{$class_from}{$object->{id}} = $o;
         $object->bug("Inconsistent '$class_from' child with id $object->{id}");
     }
-    $parent->{children}{$class_to}[$object->{id}] = $o;
+    $parent->{children}{$class_to}{$object->{id}} = $o;
     return;
 }
 
@@ -1598,6 +1649,7 @@ sub ids_get {
 
 sub id_alloc {
     my ($object, $class) = @_;
+
     return $object->{ids}{$class}->id_alloc;
 }
 
@@ -1637,24 +1689,27 @@ sub caller_info {
     my $object = shift;
     my $format = shift;
     if (@_) {
-        @_ = ("%s: $format [%s]", $object->name, @_, ::callers());
+        @_ = ("%s: $format", $object->name, @_);
     } else {
-        @_ = ("%s: %s [%s]", $object->name, $format, ::callers());
+        @_ = ("%s: %s", $object->name, $format);
     }
-    goto &::info;
+    goto &::caller_info;
 }
 
 sub immediate {
     my $object = shift;
+
     $object->{timeout} = Timer::immediate($object, shift);
 }
 
 sub timer {
     my $object = shift;
+
     $object->{timeout} = Timer::timer(shift, $object, shift);
 }
 
-sub count_children {
+# Use ids
+sub _count_children {
     my ($object, $class) = @_;
 
     my $ids = $object->{ids}{$class} ||
@@ -1662,16 +1717,25 @@ sub count_children {
     return $ids->count;
 }
 
+# Use objects
+sub count_children {
+    my ($object, $class) = @_;
+
+    return scalar keys %{$object->{children}{$class} || return 0};
+}
+
 sub status_all {
     my ($object, $control, $indent) = @_;
 
     $object->status($control, $indent);
     $indent .= "  ";
-    for my $class (sort keys %{$object->{children} || {}}) {
-        my @objects = grep defined, @{$object->{children}{$class}};
-        $control->{out} .= sprintf("%s%s: %s\n",
-                                   $indent, $class, scalar @objects) if $class->can("status") == \&status || @objects == 0;
-        $_->status_all($control, $indent) for @objects;
+    for my $class (sort keys %{$object->{children} || return }) {
+        my $children = $object->{children}{$class};
+
+        $control->{collect} .= sprintf("%s%s: %s\n",
+                                   $indent, $class, scalar keys %$children)
+            if $class->can("status") == \&status || !%$children;
+        $children->{$_}->status_all($control, $indent) for sort { $a <=> $b } keys %$children;
     }
 }
 
@@ -1705,8 +1769,11 @@ sub new {
         ping_queued	=> [],
     }, $class;
     $root->info("CREATE") if $verbose > 2;
-    $root->ids_set("Pinger");
     return $root;
+}
+
+sub _id_full {
+    return "";
 }
 
 sub status {
@@ -1716,7 +1783,7 @@ sub status {
     my $settings = ::string_from_value($root->{settings});
     $settings =~ s/\n/\n$indent  /g;
 
-    $control->{out} .= <<"EOF"
+    $control->{collect} .= <<"EOF"
 $indent$name
 $indent  Settings: $settings
 EOF
@@ -1728,6 +1795,10 @@ sub _finish {
 
     delete $root->{signals};
     $root->SUPER::_finish(@_);
+}
+
+# There is no parent to remove the root object from
+sub _on_finish {
 }
 
 sub signal_add0 {
@@ -1780,7 +1851,7 @@ sub client {
                 die "Invalid fou_local '$udp'";
             $from = Address->parse($from, "FOU local", from => "UDP4");
             $to   = Address->parse($to  , "FOU local", to   => "UDP4", resolve => 1);
-            my $fou = Fou::UDP->new($to);
+            my $fou = Fou::UDP->new($root, $to);
             Receiver::Fou->new_suspended($line, $from->{host}, $from->{port}, $fou);
         }
 
@@ -1802,7 +1873,7 @@ sub client {
                 from => "TCP4",
                 to   => "TCP4");
             my $id = TCP::Remote->new($line, remote => $to)->id;
-            $line->write($LISTEN_REMOTE, pack("ww/a*a*", $id, $from->{type}, $from->{user}));
+            $line->write($LISTEN_REMOTE , pack("ww/a*a*", $id, $from->{type}, $from->{user}));
         }
 
         for my $socks (@{delete $connections{socks_remote}}) {
@@ -1874,12 +1945,11 @@ sub ping_finished {
 
 package Connection;
 # A class below Stream and Packet connections for shared methods
+# Connection->new($parent, $socket_in, $socket_out, %options)
 use vars qw(@ISA);
 @ISA = qw(Object);
 
-# We could put a "new" method here setting finished_local and finished_remote
-# to undef, but not all Streams are actually associated with another object
-# at the other end of a LineProtocol (e.g. Pinger and Control aren't)
+use Errno qw(ENOTCONN ENOTSOCK);
 
 # If socket_in and socket_out are genuinly different it is the
 # responsibity of the caller to shutdown() the write and read sides
@@ -1903,60 +1973,159 @@ sub new {
     my $class = shift;
 
     my $connection = $class->new_suspended(@_);
-    $connection->resume_read if $connection->{socket_in};
+    $connection->resume_read("quiet") if $connection->{socket_in};
     return $connection;
-}
-
-sub _delete {
-    my $connection = shift;
-    $connection->SUPER::_delete(@_);
-    ::cleanup_all() if $connection->{exit};
 }
 
 sub _finish {
     my $connection = shift;
 
-    delete @$connection{qw(in out reader writer socket_in socket_out)};
+    delete @$connection{qw(in out reader writer socket_in black_hole socket_out unwritable)};
     $connection->SUPER::_finish(@_);
+    ::cleanup_all() if $connection->{exit};
 }
 
-sub write_end {
+# {partner}: We are free to send stuff to the remote partner
+# {partner_unfinish}: We expect stuff to receive stuff from the remote partner
+sub _on_finish {
     my $connection = shift;
 
-    $connection->info("Finished writing. Will now delete($connection->{reason})") if $verbose > 1;
-    $connection->delete($connection->{reason} || "Unknown reason");
+    $connection->finish_to_partner(@_) if delete $connection->{partner};
+    if ($connection->{partner_unfinished}) {
+        $connection->info("Suspend finish (waiting for remote)") if $verbose;
+        return;
+    }
+    $connection->SUPER::_on_finish(@_);
 }
 
-sub delayed_write_end {
+# Tell remote to finish. This probably involves sending a message to the remote,
+# which will be different for each type of Connection, so no implementation here
+sub finish_to_partner {
+    shift->bug("finish_to_partner not implemented (yet)");
+}
+
+# Remote tells us it is finished
+sub finish_from_partner {
+    my ($connection, $reason) = @_;
+
+    # Do *NOT* delete {partner} here. That must remain until we send it a finish
+    $reason || $connection->bug("finish_from_partner without reason");
+    delete $connection->{partner_unfinished} ||
+        $connection->bug("Double finish from partner");
+    $reason = "Remote: $reason";
+    if ($connection->{finished}) {
+        $connection->info("Resume finish: $reason") if $verbose;
+        $connection->SUPER::_on_finish($reason);
+    } else {
+        $connection->info("Remote finished: $_[1]") if $verbose;
+        $connection->finished_remote($reason);
+    }
+}
+
+# Tells local that partner finished. This probably means stop taking input
+# and doing a complete finish if there is no more output.
+# Being called implies finished=0, partner_unfinished has just been unset and
+# partner can be anything
+sub finished_remote {
+    my ($connection, $reason) = @_;
+
+    $connection->_end_read if
+        $connection->{socket_in} && !$connection->{black_hole};
+    # if end_read() causes a finish() we assume that will unset socket_out
+    $connection->final_write($reason) if
+        $connection->{socket_out} || $connection->{unwritable};
+}
+
+sub out_is_empty {
+    my ($line) = @_;
+
+    return shift->{out} eq "";
+}
+
+# Immediately stop writing. Never call this directly
+# Override this if you have other events that lead to writing
+# (e.g. LineProtocol needs to stop keepalives)
+sub _end_write {
     my $connection = shift;
+
     $connection->{timeout} = undef;
-    $connection->{on_written}->($connection);
+    my $reason = $connection->{end_write} ||
+        $connection->bug("No reason for _end_write");
+    $connection->bug("_end_write() while unwritable") if
+        $connection->{unwritable};
+    if ($connection->{socket_in} && !$connection->{black_hole}) {
+        # We are still interested in reading
+        $connection->info("Keep reading, shutdown write: $reason") if $verbose;
+        $connection->{writer} = undef;
+        # e.g. STDOUT is probably not a socket, so you can't shut it down
+        return if shutdown(delete $connection->{socket_out}, 1) || $! == ENOTSOCK;
+        $! == ENOTCONN || $connection->die("Could not shutdown write: $^E");
+        $connection->info("Oops, lost the connection, so no more reading either") if $verbose > 1;
+    } elsif ($verbose > 1) {
+        $connection->info("I'm done. There is no reading and I finished writing: $reason");
+    }
+    $connection->finish($reason);
 }
 
-sub _end_on_flushed {
+# Immediately stop reading. Never call this directly
+sub _end_read {
     my $connection = shift;
-    $connection->{reason} = shift || $connection->bug("No end reason");
+
+    if ($connection->{socket_out} || $connection->{unwritable}) {
+        # We are still interested in writing/connecting/accepting
+        $connection->info("Keep writing, shutdown read: @_") if $verbose;
+        $connection->{reader} = undef;
+        $connection->{black_hole} = undef;
+        # e.g. STDIN is probably not a socket, so you can't shut it down
+        if (shutdown(delete $connection->{socket_in}, 0) || $! == ENOTSOCK) {
+            # Supposedly "in" is empty, so no need to truncate it
+            $connection->eof_to_partner(@_) if $connection->{partner};
+            return;
+        }
+        $! == ENOTCONN || $connection->die("Could not shutdown read: $^E");
+        $connection->info("Oops, lost the connection, so no more writing either") if $verbose > 1;
+        # finish() below will delete $connection->{socket_out}
+    } elsif ($verbose > 1) {
+        $connection->info("I'm done. There is no writing and I finished reading: @_");
+    }
+    $connection->finish(@_);
+}
+
+sub eof_to_partner {
+    shift->bug("eof_to_partner not implemented (yet)");
+}
+
+# Stop writing. But a connect can still be going on and there can still be stuff
+# in the output buffer so only _end_write() once all pending activity is done
+# It is perfectly fine to call this with socket_unwritable and/or no socket_out
+sub final_write {
+    my $connection = shift;
+
+    # $connection->bug("Writing already finalized") if $connection->{end_write};
+    $connection->{end_write} = shift ||
+        $connection->bug("No write end reason");
     $connection->write(@_) if @_;
-    $connection->{on_written} = $connection->can("write_end") ||
-        $connection->bug("Cannot write_end");
-
-    # It's fine if a later write() overrides this timeout, we DO want to
-    # process the extra bytes, the on_written ramains active
-    $connection->{timeout} = $connection->immediate(\&delayed_write_end);
+    # It's not a problem if a later write() overrides this timeout. On the
+    # contrary, we WANT to process any extra bytes, the "end_write" will
+    # remain active (do we really ? or does that indicate a bug ?)
+    if (!$connection->{unwritable} && $connection->out_is_empty) {
+        my $code = $connection->can("_end_write") ||
+            $connection->bug("No _end_write method");
+        $connection->{timeout} = $connection->immediate($code);
+    }
 }
 
-# Flush pending output, then calls method "write_end" which triggers something.
-# By default it deletes the object which closes the connection
-# If you do more complex stuff and still need $connection->{in} you might want
-# to call _end_on_flushed() or override end_on_flushed (and eof) instead
-sub end_on_flushed {
-    my $connection = shift;
+# Stop reading
+# By default we assume this means we finish once all pending activity is done
+sub final_read {
+    my ($connection, $reason) = @_;
 
-    delete @$connection{qw(socket_in reader)};
-    # In case we are called during a naive loop on $connection->{in} we want
-    # to automatically drop out
-    $connection->{in} = "" if defined $connection->{in};
-    $connection->_end_on_flushed(@_);
+    $connection->bug("final_read while finished") if $connection->{finished};
+    $connection->_end_read($reason);
+    # socket_out implies not finished
+    $connection->final_write($reason) if
+        ($connection->{socket_out} || $connection->{unwritable}) &&
+        !$connection->{partner_unfinished};
 }
 
 sub suspend_read {
@@ -1967,53 +2136,44 @@ sub suspend_read {
     $connection->{reader} = undef;
 }
 
+# Keep socket_in open but completely ignore whatever is sent to it
+# You usually want to combine thi with a final_write()
 sub black_hole {
-    shift->{in} = "";
+    my $connection = shift;
+
+    $connection->{socket_in} || $connection->bug("No socket to black_hole");
+    $connection->bug("Already a black hole") if $connection->{black_hole};
+    $connection->info("Start completely ignoring input") if $verbose > 1;
+    $connection->{black_hole} = 1;
+    $connection->{in} = "";
 }
 
-# Remote tells us it is finished
-sub finished_remote {
-    my ($connection, $reason) = @_;
+sub timeout {
+    shift->error("Write timeout");
+}
 
-    $connection->die("Already finished remote") if $connection->{finished_remote};
-    $reason ||= "Unknown reason";
-    $connection->{finished_remote} = $reason = "Remote: $reason";
-    $connection->info("Finished \l$reason") if $verbose > 1;
-    if ($connection->{finished}) {
-        $connection->delete($reason);
-    } else {
-        $connection->finish_local($reason);
+# Think of the unwritable flag as
+# "We may not have socket_out_now or aren't yet writing to it, but we plan to"
+# (and {out} can already be used to accumate bytes)
+# So call writable() once you have socket_out and are ready to write to it
+sub writable {
+    my ($connection) = @_;
+
+    $connection->{socket_out} || $connection->bug("writable without socket");
+    delete $connection->{unwritable} ||
+        $connection->bug("Call writable() while state not unwritable");
+    if (!$connection->out_is_empty) {
+        $connection->writing;
+    } elsif ($connection->{end_write}) {
+        my $code = $connection->can("_end_write") ||
+            $connection->bug("No _end_write method");
+        $connection->{timeout} = $connection->immediate($code);
     }
-}
-
-# Tell remote to finish. This probably involves sending a message to the remote,
-# which will be different for each type of Object, so no implementation here
-sub finish_remote {
-    shift->bug("finish_remote not implemented (yet)");
-}
-
-# Start cleaning up locally
-sub finished_local {
-    my ($connection, $reason) = @_;
-
-    $connection->info("Finished local: $reason") if $verbose;
-    $connection->die("Already finished local") if $connection->{finished};
-    $connection->finish_remote($reason);
-    if ($connection->{finished_remote}) {
-        $connection->delete($reason);
-    } else {
-        $connection->finish($reason);
-    }
-}
-
-# Tell local to finish. This probably involves flushing the output queue,
-# which will be different for each type of Object, so no implementation here
-sub finish_local {
-    shift->bug("finish_local not implemented (yet)");
 }
 
 package _Stream;
 # Stream connections
+# _Stream->new($parent, $socket_in, $socket_out, %options)
 use vars qw(@ISA);
 @ISA = qw(Connection);
 
@@ -2030,8 +2190,7 @@ sub conn_reset {
 sub eof : method {
     my $stream = shift;
 
-    $stream->info("@_") if $verbose > 1;
-    $stream->delete(@_);
+    $stream->final_read(shift);
 }
 
 sub reader {
@@ -2052,12 +2211,9 @@ sub reader {
         return;
     }
     $stream->info("Received: %s", ::display($buffer)) if $verbose > 1;
+    return if $stream->{black_hole};
     $stream->{in} .= $buffer;
     $stream->on_read($rc);
-}
-
-sub timeout {
-    shift->error("Write timeout");
 }
 
 sub write : method {
@@ -2086,9 +2242,9 @@ sub writer {
 
     substr($stream->{out}, 0, $rc, "");
     if ($stream->{out} eq "") {
+        $stream->_end_write, return if $stream->{end_write};
         $stream->{writer}  = undef;
         $stream->{timeout} = undef;
-        $stream->{on_written}->($stream, $stream->{reason}) if $stream->{on_written};
         return;
     }
     $stream->writing();
@@ -2096,6 +2252,7 @@ sub writer {
 
 package Stream;
 # Stream connections that keep the program alive
+# Stream->new($parent, $socket_in, $socket_out, %options)
 use vars qw(@ISA);
 @ISA = qw(_Stream);
 
@@ -2105,19 +2262,20 @@ sub writing {
     return if $stream->{unwritable};
     # This assumes parent == LineProtocol (or Root). Doesn't generalize
     $stream->{writer} ||= Events::add_write($stream->{socket_out}, $stream, \&_Stream::writer);
-    $stream->{timeout} = Timer::timer($stream->{parent}{settings}{TIMEOUT}, $stream, \&_Stream::timeout);
+    $stream->{timeout} = Timer::timer($stream->{parent}{settings}{TIMEOUT}, $stream, \&Connection::timeout);
 }
 
 sub resume_read {
     my $stream = shift;
 
-    $stream->info("resume_read") if $verbose > 1;
+    $stream->info("resume_read") if $verbose > 1 && !shift;
     $stream->{reader} && $stream->die("Read not suspended");
     $stream->{reader} = Events::add_read($stream->{socket_in}, $stream, \&_Stream::reader);
 }
 
 package Stream0;
 # Stream connections that don't keep the program alive
+# Stream0->new($parent, $socket_in, $socket_out, %options)
 use vars qw(@ISA);
 @ISA = qw(_Stream);
 
@@ -2127,19 +2285,20 @@ sub writing {
     return if $stream->{unwritable};
     # This assumes parent == LineProtocol (or Root). Doesn't generalize
     $stream->{writer} ||= Events::add_write0($stream->{socket_out}, $stream, \&_Stream::writer);
-    $stream->{timeout} = Timer::timer($stream->{parent}{settings}{TIMEOUT}, $stream, \&_Stream::timeout);
+    $stream->{timeout} = Timer::timer($stream->{parent}{settings}{TIMEOUT}, $stream, \&Connection::timeout);
 }
 
 sub resume_read {
     my $stream = shift;
 
-    $stream->info("resume_read") if $verbose > 1;
+    $stream->info("resume_read") if $verbose > 1 && !shift;
     $stream->{reader} && $stream->die("Read not suspended");
     $stream->{reader} = Events::add_read0($stream->{socket_in}, $stream, \&_Stream::reader);
 }
 
 package Connect;
 # Make a connection, then behave like a Stream
+# Connect->new($parent, $local, $peer, %options)
 use vars qw(@ISA);
 @ISA = qw(Stream);
 
@@ -2211,13 +2370,13 @@ sub on_connect {
     $connect->info("Connected from '$connect->{local}{display}' to '$connect->{peer}{user}' [$connect->{peer}{display}]: $!") if $verbose;
 
     $connect->{socket_in} = $connect->{socket_out};
-    $connect->resume_read;
-    delete $connect->{unwritable};
-    $connect->writing if $connect->{out} ne "";
+    $connect->resume_read("quiet");
+    $connect->writable;
 }
 
 package _UDP;
 # Base class for UDP connections (maybe add a Packet parent later)
+# _UDP->new($parent, $socket_in, $socket_out, %options)
 use vars qw(@ISA);
 @ISA = qw(Connection);
 
@@ -2278,11 +2437,18 @@ sub reader {
     $udp->info("Received from %s:%d%s: %s",
                inet_ntoa($addr), $port, $msghdr ? " (TTL $ttl)" : "",
                ::display($$bufref)) if $verbose > 1;
+    return if $udp->{black_hole};
     $udp->on_read($addr, $port, $ttl, $bufref);
 }
 
 sub timeout {
     shift->error("Send timeout");
+}
+
+sub out_is_empty {
+    my ($line) = @_;
+
+    return @{shift->{out}} == 0;
 }
 
 sub writing {
@@ -2371,6 +2537,7 @@ sub writer {
 
 package UDP;
 # UDP connections that keep the program alive
+# UDP->new($parent, $socket_in, $socket_out, %options)
 use vars qw(@ISA);
 @ISA = qw(_UDP);
 
@@ -2389,13 +2556,14 @@ sub new_suspended {
 sub resume_read {
     my $udp = shift;
 
-    $udp->info("resume_read") if $verbose > 1;
+    $udp->info("resume_read") if $verbose > 1 && !shift;
     $udp->{reader} && $udp->die("Read not suspended");
     $udp->{reader} = Events::add_read($udp->{socket_in}, $udp, \&_UDP::reader);
 }
 
 package Pinger;
 # Manage runs of the OS ping program
+# Pinger->new($root, $client)
 use vars qw(@ISA);
 # We maybe should introduce a StreamReader for only the read part of Stream
 @ISA = qw(Stream0);
@@ -2503,7 +2671,7 @@ sub eof : method {
         }
         $client->ping_result($pinger->{data}) if $client;
     }
-    $pinger->delete("Ping result");
+    $pinger->finish("Ping result");
 }
 
 sub _finish {
@@ -2512,14 +2680,8 @@ sub _finish {
     delete $pinger->{data};
     $pinger->wait if $pinger->{waitable};
     $pinger->SUPER::_finish(@_);
-}
-
-# This code belongs in _finish really
-# But that would allow new Pingers to be started while the finished one is
-# not freed yet, so the ids would go above ping_max which looks super confusing
-sub _delete {
-    my $pinger = shift;
-    $pinger->SUPER::_delete(@_);
+    # ping_finished AFTER SUPER_finish so the id is freed and we won;t
+    # start using ids above ping_max which looks super confusing
     $pinger->{parent}->ping_finished;
 }
 
@@ -2533,7 +2695,7 @@ sub status {
 
     my $name = $pinger->name;
 
-    $control->{out} .= <<"EOF"
+    $control->{collect} .= <<"EOF"
 $indent$name
 $indent  Host: $pinger->{host}
 $indent  Pid:  $pinger->{pid}
@@ -2544,6 +2706,7 @@ EOF
 package Sender::ICMP;
 # Send and receive ICMP (echo) messages
 # Falls back to using the OS ping program if not permitted
+# Sender::ICMP->new($line, $id)
 use vars qw(@ISA);
 @ISA = qw(UDP);
 
@@ -2661,6 +2824,7 @@ sub ping_finished {
 
 package Sender::UDP;
 # Send out packets at the remote side (and wait for replies)
+# Sender::UDP->new($line, $id)
 use vars qw(@ISA);
 @ISA = qw(UDP);
 
@@ -2686,6 +2850,7 @@ sub on_read {
 
 package Receiver::Fou;
 # Wait for packets at the local (client) side
+# Sender::UDP->new($line, $host, $port, $fou)
 use vars qw(@ISA);
 @ISA = qw(UDP);
 
@@ -2896,7 +3061,8 @@ sub on_read {
 }
 
 package Fou::UDP;
-# Send out proxied packets at the local (client) side usinga FOU tunnel
+# Send out proxied packets at the local (client) side using a FOU tunnel
+# Fou::UDP->new($root, $address_to)
 use vars qw(@ISA);
 @ISA = qw(_UDP);
 
@@ -2906,37 +3072,35 @@ use Socket qw(inet_aton inet_ntoa pack_sockaddr_in);
 # Called with a resolved address (see Address->parse)
 { no warnings "once"; *new = \&new_suspended; }
 sub new_suspended {
-    my ($class, $address_to) = @_;
+    my ($class, $root, $address_to) = @_;
 
-    my $lookup_id = "$address_to->{host}:$address_to->{port}";
-    my $fou = $root->{lookups}{$class}{$lookup_id};
+    my $fou = $root->{lookups}{$class}{$address_to->{display}};
     return $fou if $fou;
 
-    # For now listen on any with a random port. Make this an option
+    # For now listen on any with a random port. Maybe make this an option
     my ($local, $socket) = ConnUtils->socket_udp("0.0.0.0", 0);
 
     $fou = $class->SUPER::new_suspended(
         $root, undef, $socket,
-        lookup_id	=> $lookup_id,
         local		=> $local,
-        # Maybe just store $address_to
         to		=> $address_to->{packed},
-        host		=> $address_to->{host},
-        port		=> $address_to->{port});
-    weaken($root->{lookups}{$class}{$lookup_id} = $fou);
+        peer		=> $address_to);
+    weaken($root->{lookups}{$class}{$fou->{peer}{display}} = $fou);
     return $fou;
 }
 
 sub _finish {
     my $fou = shift;
 
-    delete $fou->{parent}{lookups}{ref $fou}{$fou->{lookup_id}};
+    delete $fou->{parent}{lookups}{ref $fou}{$fou->{peer}{display}} ||
+        $fou->bug("Cannot find '$fou->{peer}{display}' in ", ref $fou, " lookup");
     $fou->SUPER::_finish(@_);
 }
 
 package TCP::Remote;
 # Partner on the client side to a remote Listener::TCP::Forward at the server
 # Does nothing except remembering the forwarding argument
+# TCP::Remote->new($line, %options)
 use vars qw(@ISA);
 @ISA = qw(Object);
 
@@ -2954,7 +3118,7 @@ sub status {
     my ($remote, $control, $indent) = @_;
 
     my $name = $remote->name;
-    $control->{out} .= <<"EOF"
+    $control->{collect} .= <<"EOF"
 $indent$name
 $indent  Local Connect to '$remote->{remote}{display}'
 EOF
@@ -2963,6 +3127,7 @@ EOF
 
 package Listener::TCP::Forward;
 # Listen for incoming connections that need forwarding on the client side
+# Listener::TCP::Forward->new($line, $address, %options)
 use vars qw(@ISA);
 @ISA = qw(Listener);
 
@@ -2998,7 +3163,7 @@ sub status {
 
     $listener->SUPER::status($control, $indent);
 
-    $control->{out} .= "$indent  Remote Connect to '$listener->{remote}{user}'\n";
+    $control->{collect} .= "$indent  Remote Connect to '$listener->{remote}{user}'\n";
 }
 
 package Listener::TCP::Remote;
@@ -3032,10 +3197,26 @@ sub on_accept {
 
 package TCP::Forward;
 # Generic TCP forwarder. Just copies data to the other side
+# TCP::Forward->new($line, $local, $peer, %options)
+# Important options: partner, partner_unfinished, socket_in, socket_out, id
+
 use vars qw(@ISA);
 @ISA = qw(Connect);
 
-use Errno qw(ENOTCONN);
+# By default we assume as partner. Override if this is not (immediately) so
+# e.g. Socks::Local has no partner until a SOCKS command is given
+sub new_suspended {
+    my $class	= shift;
+    my $line	= shift;
+    my $local	= shift;
+    my $peer	= shift;
+
+    return $class->SUPER::new_suspended(
+        $line, $local, $peer,
+        partner			=> 1,
+        partner_unfinished	=> 1,
+        @_);
+}
 
 sub on_read {
     my ($forward) = @_;
@@ -3045,91 +3226,43 @@ sub on_read {
     $forward->{in} = "";
 }
 
-sub eof : method {
+sub eof_to_partner {
     my $forward = shift;
 
-    if ($forward->{socket_out}) {
-        $forward->info("@_: Shutdown read, stop writing to remote") if $verbose > 1;
-        if (shutdown(delete $forward->{socket_in}, 0)) {
-            # Tell the other side that we won't send any more data
-            $forward->{parent}->write($TCP_EOF, pack("w", $forward->{id}));
-            # Keep writing
-            return
-        }
-        $! == ENOTCONN || $forward->die("Could not shutdown read: $^E");
-        # Get error status of socket here ?
-        @_ = "Lost connection";
-    }
-    # We already stopped writing. We are now completely useless
-    $forward->info("@_") if $verbose > 1;
-    $forward->finished_local(@_);
-}
-
-sub write_end {
-    my ($forward) = @_;
-
-    if ($forward->{socket_in}) {
-        # this implies we are connected and did not yet get EOF
-        $forward->info("Shutdown write, keep reading") if $verbose > 1;
-        shutdown($forward->{socket_out}, 1) ||
-            $forward->die("Could not shutdown write: $^E");
-        delete $forward->{socket_out};
-        # Keep reading
-    } else {
-        # !$forward->{local} implies we are connecting. Abort connect
-        delete @$forward{qw(socket_out timeout writer)} if !$forward->{local};
-        # We already stopped reading. We are now completely useless
-        $forward->finished_local($forward->{reason});
-    }
+    $forward->info("Tell remote no more data: @_") if $verbose > 1;
+    $forward->{parent}->write($TCP_EOF, pack("wa*", $forward->{id}), @_);
 }
 
 # Tell remote to finish
-sub finish_remote {
+sub finish_to_partner {
     my ($forward, $reason) = @_;
 
-    $forward->info("Tell remote to finish after local $reason") if $verbose > 1;
-    $forward->{parent}->write($TCP_FIN, pack("w", $forward->{id}), $reason);
-}
-
-# Tell local to finish
-sub finish_local {
-    my $forward = shift;
-
-    $forward->{reason} = "@_";
-    $forward->{reader} = undef if delete $forward->{socket_in};
-
-    # $forward->{local} implies we are connected
-    if ($forward->{out} eq "" || !$forward->{local}) {
-        $forward->local_end;
-    } else {
-        $forward->{on_written} = \&local_end;
-    }
-}
-
-sub local_end {
-    my ($forward) = @_;
-    $forward->finished_local($forward->{reason});
+    $forward->info("Tell remote local finished: $reason") if $verbose > 1;
+    $forward->{parent}->write($TCP_FIN, pack("wa*", $forward->{id}, $reason));
 }
 
 sub error {
     my $forward = shift;
 
     $forward->info("Error: @_") if $verbose;
-    $forward->finished_local(@_);
+    $forward->finish(@_);
 }
 
 sub status {
     my ($forward, $control, $indent) = @_;
 
     my $name = $forward->name;
-    $control->{out} .= "$indent$name\n";
-    $control->{out} .= "$indent  peer:   '$forward->{peer}{user}' [$forward->{peer}{display}]\n" if $forward->{peer};
-    $control->{out} .= "$indent  local:  '$forward->{local}{user}' [$forward->{local}{display}]\n" if $forward->{local};
-    $control->{out} .= "$indent  remote: '$forward->{remote}{user}' [$forward->{remote}{display}]\n" if $forward->{remote};
+    $control->{collect} .= "$indent$name\n";
+    $control->{collect} .= "$indent  peer:   '$forward->{peer}{user}' [$forward->{peer}{display}]\n" if $forward->{peer};
+    $control->{collect} .= "$indent  local:  '$forward->{local}{user}' [$forward->{local}{display}]\n" if $forward->{local};
+    $control->{collect} .= "$indent  remote: '$forward->{remote}{user}' [$forward->{remote}{display}]\n" if $forward->{remote};
+    $control->{collect} .= "$indent  partner: $forward->{partner}\n" if defined $forward->{partner};
+    $control->{collect} .= "$indent  partner_unfinished: $forward->{partner_unfinished}\n" if defined $forward->{partner_unfinished};
 }
 
 package Listener::Socks::Local;
 # Listen for incoming socks connections
+# Listener::Socks::Local->new($line, $address, %options)
 use vars qw(@ISA);
 @ISA = qw(Listener);
 
@@ -3153,12 +3286,6 @@ sub on_accept {
         socket_in	=> $accepted,
         socket_out	=> $accepted,
         local		=> $local,
-        state		=> \&Socks::Local::version,
-        request		=> {
-            seqno	=> 0,
-            type	=> "tcp4",
-        },
-        finished_remote	=> "No remote (yet)",
     );
     $socks->info("Socks connect from %s", $peer->{display}) if $verbose > 1;
     return $socks;
@@ -3166,6 +3293,8 @@ sub on_accept {
 
 package Socks::Forward;
 # Process socks request (local side)
+# Socks::Forward->new($line, $local, $peer, %options)
+# Important options: partner, partner_unfinished, socket_in, socket_out, id
 use vars qw(@ISA);
 @ISA = qw(TCP::Forward);
 
@@ -3176,42 +3305,80 @@ sub new_suspended {
     return $forward;
 }
 
-sub _delete {
+# Make sure the object is a TCP::Forward otherwise the parent delete will
+# be done through the wrong class leading to a fatal "Already detached" error
+sub _on_finish {
     my $forward = shift;
     bless $forward, "TCP::Forward";
-    $forward->SUPER::_delete(@_);
+    $forward->SUPER::_on_finish(@_);
 }
 
 package Socks::Local;
 # Process socks request (local side)
+# Socks::Local->new($line, $local, $peer, %options)
+# Important options: partner, partner_unfinished, socket_in, socket_out
 use vars qw(@ISA);
 @ISA = qw(Socks::Forward);
 
 use Socket qw(inet_ntoa);
 
-sub finish_remote {
-    my $socks = shift;
+sub new_suspended {
+    my $class	= shift;
+    my $line	= shift;
+    my $local	= shift;
+    my $peer	= shift;
 
-    $socks->SUPER::finish_remote(@_) if $socks->{remote};
+    return $class->SUPER::new_suspended(
+        $line, $local, $peer,
+        partner			=> 0,
+        partner_unfinished	=> 0,
+        state			=> \&Socks::Local::version,
+        request			=> Address->new(
+            seqno	=> 0,
+            type	=> "tcp4",
+        ),
+        @_);
 }
 
-sub end_on_flushed {
+sub error_response {
     my $socks = shift;
 
-    $socks->{state} = \&Connection::black_hole;
-    $socks->SUPER::end_on_flushed(@_);
+    $socks->black_hole;
+    # Strictly speaking we should use a short timeout here (RFC says 10 seconds)
+    # In practice this is the first packet we send and the OS should buffer it
+    # for us, so we will never have to really wait for the write even if the
+    # client doesn't read anything
+    $socks->final_write(@_);
 }
 
 sub eof {
     my ($socks) = @_;
 
-    $socks->finish_local("Unexpected EOF");
+    $socks->error("Unexpected EOF");
 }
 
 sub on_read {
     my ($socks) = @_;
 
     $socks->{state}->($socks);
+}
+
+sub no_input {
+    my ($socks) = @_;
+
+    $socks->{state} = \&bug_input;
+    $socks->finish("Spurious input");
+}
+
+sub impossible_input {
+    shift->bug("Input from finished object");
+}
+
+sub finish {
+    my $socks = shift;
+
+    $socks->{state} = \&impossible_input;
+    $socks->SUPER::finish(@_);
 }
 
 sub version {
@@ -3224,8 +3391,7 @@ sub version {
     } elsif ($socks->{request}{version} == 5) {
         $socks->greeting5;
     } else {
-        $socks->{state} = \&state_bug;
-        $socks->finish_local("Unknown SOCKS version $socks->{request}{version}");
+        $socks->finish("Unknown SOCKS version $socks->{request}{version}");
         return;
     }
 }
@@ -3241,8 +3407,7 @@ sub cmd4 {
     }
     $socks->{request}{cmd} = ord substr($socks->{in}, 0, 1, "");
     if ($socks->{request}{cmd} < 1 || $socks->{request}{cmd} > 2) {
-        $socks->{state} = \&state_bug;
-        $socks->finish_local("Unknown SOCKS4 command $socks->{request}{cmd}");
+        $socks->finish("Unknown SOCKS4 command $socks->{request}{cmd}");
         return;
     }
     $socks->greeting4;
@@ -3309,7 +3474,7 @@ sub auth5 {
     $socks->{request}{auth} = substr($socks->{in}, 0, $socks->{request}{nauth}, "");
 
     if ($socks->{request}{auth} !~ /\0/) {
-        $socks->end_on_flushed("User does not support 'No authentication'",
+        $socks->error_response("User does not support 'No authentication'",
                                "\x05\xff");
         return;
     }
@@ -3328,8 +3493,7 @@ sub request5 {
     $socks->{request}{cmd} = $cmd;
 
     if ($version != 5) {
-        $socks->{state} = \&state_bug;
-        $socks->finish_local("Invalid version $version in client connection request");
+        $socks->finish("Invalid version $version in client connection request");
         return;
     }
     my ($err, $msg);
@@ -3350,7 +3514,7 @@ sub request5 {
         $err = 8; # address type not supported
     }
     # Error
-    $socks->end_on_flushed("SOCKS5 request error: $msg",
+    $socks->error_response("SOCKS5 request error: $msg",
                            pack("CCxCx6", 5, $err, 1));
 }
 
@@ -3412,7 +3576,8 @@ sub execute {
         $request->{command} = "UDP relay";
         $request->{type} = "udp4";
     } else {
-        $socks->bug("Unknown command '$request->{cmd}'");
+        # We already checked the command during request parsing
+        $socks->bug("Impossible accepted command '$request->{cmd}'");
     }
 
     $socks->info("User %srequests %s to %s using SOCKS%d%s",
@@ -3421,7 +3586,7 @@ sub execute {
                  $request->{version} == 4 && $request->{addr} =~ /^\0\0\0[^\0]/ ? "a" : $request->{version} == 4 && !$request->{addr} ? "h" : "") if $verbose;
 
     if ($request->{port} == 0 && $request->{cmd} == 1) {
-        $socks->end_on_flushed(
+        $socks->error_response(
             "Cannot connect to port 0",
             $request->{version} == 4 ? pack("xCx6", 0x5B) :
             $request->{version} == 5 ? pack("CCxCx6", 5, 2, 1) :
@@ -3431,72 +3596,65 @@ sub execute {
 
     $socks->{parent}->write(
         $SOCKS, pack("www/a*a*", $socks->{id}, @$request{qw(cmd type display)}));
-    $socks->{finished_remote} = undef;
+    $socks->{partner} = 1;
+    $socks->{partner_unfinished} = 1;
+
     $socks->{remote} = $request;
-    # To implement TCP::Forward::on_read pipelining we need to add
-    # support for queueing EOF. Instead of setting state we could also check
-    # for $socks->{remote} in on_read then call SUPER::on_read, bypassing state
     # $socks->{state} = \&TCP::Forward::on_read;
     $socks->{state} = \&no_input;
     $socks->{state}->($socks, length $socks->{in}) if $socks->{in} ne "";
 }
 
-sub no_input {
-    my ($socks) = @_;
-
-    $socks->{state} = \&state_bug;
-    $socks->finish_local("Spurious input");
-}
-
 sub socks_result {
     my ($socks, $seqno, $status, $type, $address) = @_;
 
-    my $remote = $socks->{remote};
-    $seqno == ++$remote->{seqno} ||
-        $socks->bug("Got result packet $seqno, expected $remote->{seqno}");
+    my $request = $socks->{remote} || $socks->bug("Result without request");
+    $seqno == ++$request->{seqno} ||
+        $socks->bug("Got result packet $seqno, expected $request->{seqno}");
 
-    if ($remote->{version} == 5) {
+    if ($request->{version} == 5) {
         $socks->write(pack("CCxCa4n", 5, $status, 1, @$address{qw(addr port)}));
-    } elsif ($remote->{version} == 4) {
+    } elsif ($request->{version} == 4) {
         $socks->write(
             pack("xCna4", $status ? 0x5B : 0x5A, @$address{qw(port addr)}));
     } else {
-        $socks->bug("Unknown socks version $remote->{version}");
+        $socks->bug("Unknown socks version $request->{version}");
     }
 
     # No need for cleanup, the remote side has already sent us a TCP_FIN command
     # (which also includes the error reason)
     return if $status;
 
-    if ($remote->{cmd} == 1) {
+    if ($request->{cmd} == 1) {
         $seqno == 1 || $socks->bug("Response packet $seqno");
-    } elsif ($remote->{cmd} == 2) {
+    } elsif ($request->{cmd} == 2) {
         return if $seqno == 1;
         $seqno == 2 || $socks->bug("Response packet $seqno");
-        $socks->{remote} = $address->copy2($remote);
+        $socks->{request} = $address->copy2($request);
     } else {
-        $socks->bug("Unimplemented SOCKS command '$remote->{cmd}'");
+        # We already checked that we support cmd
+        $socks->bug("Impossible SOCKS command '$request->{cmd}'");
     }
     $socks->info("Become TCP::Forward[%s] after %s to '%s' [%s] succeeded",
-                 $socks->id_full, $remote->{command},
-                 $remote->{display}, $address->{display}) if $verbose > 1;
+                 $socks->id_full, $request->{command},
+                 $request->{display}, $address->{display}) if $verbose > 1;
     $socks->suspend_read;
     bless $socks, "TCP::Forward";
     # Replace the reader by the one from TCP::Forward
     $socks->resume_read;
 }
 
-sub state_bug {
-    shift->bug("Invalid socks state");
-}
-
 package Socks::Remote;
 # Process socks request (remote side)
+# Socks::Remote->new($line, $local, $peer, %options)
+# Important options: partner, partner_unfinished, socket_in, socket_out, id
 use vars qw(@ISA);
 @ISA = qw(Socks::Forward);
 
 package Socks::Connect;
 # Process socks connect request (remote side)
+# Socks::Connect->new($line, $local, $peer, %options)
+# Important options: partner, partner_unfinished, id
 use vars qw(@ISA);
 @ISA = qw(Socks::Remote);
 
@@ -3537,6 +3695,7 @@ sub on_connect {
 
 package Listener::Socks::Accept;
 # Wait for a single incoming connection
+# Listener::Socks::Accept->new($accept, $address, %options)
 use vars qw(@ISA);
 @ISA = qw(Listener);
 
@@ -3559,7 +3718,8 @@ sub on_accept {
         $accept->info("Reject incoming connection from '$peer->{display}', does not match the expected host from '$accept->{remote}{user}' [$accept->{remote}{display}]") if $verbose;
         return;
     }
-    $listener->delete("Acceptable connection");
+    $listener->finish("Acceptable connection");
+    $accept->{timeout} = undef;
     $accept->{local} = $local;
     $accept->{peer}  = $peer;
     $accept->{socket_in} = $accept->{socket_out} = $socket;
@@ -3570,24 +3730,34 @@ sub on_accept {
     $accept->info("Become TCP::Forward[%s] now that accept succeeded",
                   $accept->id_full) if $verbose > 1;
     bless $accept, "TCP::Forward";
-    $accept->resume_read;
+    $accept->resume_read("quiet");
+    $accept->writable;
 }
 
 package Socks::Accept;
 # Do the SOCKS bind operation (remote side)
+# Socks::Accept->new($line, $remote, %options)
+# Important options: id, remote
 use vars qw(@ISA);
 @ISA = qw(Socks::Remote);
 
 sub new_suspended {
-    my $class = shift;
-    my $line  = shift;
-    my $accept = $class->SUPER::new_suspended($line, @_);
+    my $class	= shift;
+    my $line	= shift;
+    my $remote	= shift;
+
+    $remote->resolve;
+    my $accept = $class->SUPER::new_suspended(
+        $line, undef, undef,
+        remote		=> $remote,
+        unwritable	=> 1,
+        @_);
 
     # Many (all ?) socks clients don't properly fill the host they want as peer.
     # Instead they just pass where they want to bind. In that case use that
     my $local = $accept->{remote};
     if ($local->{host} ne "0.0.0.0") {
-        # Proper client
+        # Proper client has been reading the RFC
         $local = ConnUtils->socket_udp_connected($accept->{remote}, 1);
         if (ref $local eq "") {
             # UDP connect failed, errno in $local
@@ -3627,6 +3797,7 @@ sub new_suspended {
                       @{$listener->{local}}{qw(type display)}));
     # We expect Response -> client, client -> application server (through SOCKS)
     # and application server -> our socket. Let's give it ... two connect times
+    # (maybe it's cleaner to add timer support to _Listen instead)
     $accept->timer($line->{settings}{TIMEOUT_CONNECT} * 2, \&accept_timeout);
     return $accept;
 }
@@ -3644,6 +3815,7 @@ sub accept_timeout {
 
 package LineProtocol;
 # Handle traffic between client and server
+# LineProtocol->new($root, $socket_in, $socket_out, %options)
 use vars qw(@ISA);
 @ISA = qw(Stream);
 
@@ -3717,7 +3889,7 @@ sub error {
     my $line = shift;
 
     $line->info("Error: @_") if $verbose;
-    $line->delete(@_);
+    $line->finish(@_);
 }
 
 sub on_read {
@@ -3746,7 +3918,7 @@ sub writing {
     return if $line->{unwritable};
     $line->{writer} ||= Events::add_write($line->{socket_out}, $line, \&writer);
     $line->{timeout} = Timer::timer($line->{settings}{TIMEOUT},
-                                    $line, \&_Stream::timeout);
+                                    $line, \&Conection::timeout);
 }
 
 sub write : method {
@@ -3780,7 +3952,7 @@ sub writer {
             $line->die("Zero write. Is this even possible ?") if defined $rc;
             if ($! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK) {
                 $line->{timeout} ||= Timer::timer($line->{settings}{TIMEOUT},
-                                                  $line, \&timeout);
+                                                  $line, \&Connection::timeout);
             } else {
                 $line->error("Could not write to $role_peer: $^E");
             }
@@ -3794,12 +3966,26 @@ sub writer {
         $line->{timeout} = undef;
         $line->{out_sent} += $rc;
         if (length $line->{out} == $line->{out_sent}) {
+            $line->_end_write, return if $line->{end_write};
             $line->{writer} = undef;
             $line->{keepalive} =
                 $line->timer($line->{settings}{KEEPALIVE}, \&keepalive);
             return;
         }
     }
+}
+
+sub _end_write {
+    my ($line) = @_;
+
+    $line->{keepalive} = undef;
+    $line->SUPER::_end_write;
+}
+
+sub out_is_empty {
+    my ($line) = @_;
+
+    return length $line->{out} == $line->{out_sent};
 }
 
 sub ready {
@@ -3821,10 +4007,11 @@ sub ready {
 sub activate_read {
     my $line = shift;
 
-    my $children = $line->{children} || return;
-    for my $class (sort keys %$children) {
+    my $classes = $line->{children} || return;
+    for my $class (sort keys %$classes) {
+        my $children = $classes->{$class};
         $class->isa("_Listener") || $class->isa("_UDP") || next;
-        $_ && $_->resume_read for @{$children->{$class}};
+        $children->{$_}->resume_read("quiet") for sort { $a <=> $b } keys %$children;
     }
 }
 
@@ -3882,7 +4069,7 @@ sub status {
     my $settings = ::string_from_value($line->{settings});
     $settings =~ s/\n/\n$indent  /g;
 
-    $control->{out} .= <<"EOF"
+    $control->{collect} .= <<"EOF"
 $indent$name
 $indent  Settings: $settings
 EOF
@@ -3947,7 +4134,7 @@ sub process_FOU_REMOTE {
     $from = Address->parse($from, "FOU remote", from => "UDP4");
     $to   = Address->parse($to  , "FOU remote", to   => "UDP4", resolve => 1);
 
-    my $fou = Fou::UDP->new($to);
+    my $fou = Fou::UDP->new($line->{parent}, $to);
     my $listener = Receiver::Fou->new($line, $from->{host}, $from->{port}, $fou);
 }
 
@@ -4216,10 +4403,12 @@ sub process_TCP_DATA {
 sub process_TCP_EOF {
     my $line = shift;
 
-    my $id = unpack("w", shift);
+    my ($id, $reason) = unpack("wa*", shift);
     my $forward = $line->child("TCP::Forward", $id) ||
         $line->bug("Could not find TCP::Forward[$id]");
-    $forward->_end_on_flushed("Remote EOF") unless $forward->{finished};
+    # We could introduce an eof_from_partner() if we ever feel the need to
+    # do anything else than final_write()
+    $forward->final_write("Remote $reason") unless $forward->{finished};
 }
 
 sub process_TCP_FIN {
@@ -4228,7 +4417,7 @@ sub process_TCP_FIN {
     my ($id, $msg) = unpack("wa*", shift);
     my $forward = $line->child("TCP::Forward", $id) ||
         $line->bug("Could not find TCP::Forward[$id]");
-    $forward->finished_remote($msg);
+    $forward->finish_from_partner($msg);
 }
 
 sub process_SOCKS {
@@ -4242,9 +4431,9 @@ sub process_SOCKS {
         Socks::Connect->new($line, undef, $to, id => $id);
     } elsif ($cmd == 2) {
         my $to = Address->parse($target, "SOCKS bind",
-                                          to => $type, resolve => 1);
-        # Just new would also suspend since we pass no peer, so no connect()
-        Socks::Accept->new_suspended($line, undef, undef, id => $id, remote => $to);
+                                          to => $type);
+        # Just new would also suspend since we will pass no peer, so no connect
+        Socks::Accept->new_suspended($line, $to, id => $id);
     } else {
         $line->bug("Unknown socks command '$cmd'");
     }
@@ -4282,6 +4471,7 @@ sub set_peer {
 
 package _Listener;
 # Listen for incoming connections and start new Connections for them
+# _Listener->new($parent, $address, %options)
 use vars qw(@ISA);
 @ISA = qw(Object);
 
@@ -4312,7 +4502,7 @@ sub new {
     my $class = shift;
 
     my $listener = $class->new_suspended(@_);
-    $listener->resume_read;
+    $listener->resume_read("quiet");
     return $listener;
 }
 
@@ -4335,7 +4525,7 @@ sub acceptable {
         return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK || ECONNABORTED;
         die "Accept failed: $^E";
     }
-    $listener->delete("Maximum connections") if --$listener->{loops} == 0;
+    $listener->finish("Maximum connections") if --$listener->{loops} == 0;
     my $packed = getsockname($accepted) ||
         die "Assertion: Could not getsockname(): $^E";
     my $local =
@@ -4369,7 +4559,7 @@ sub status {
 
     my $name = $listener->name;
 
-    $control->{out} .= <<"EOF"
+    $control->{collect} .= <<"EOF"
 $indent$name
 $indent  Loops: $listener->{loops}
 $indent  Local Listen on '$listener->{local}{user}' [$listener->{local}{display}]
@@ -4379,37 +4569,41 @@ EOF
 
 package Listener;
 # Listeners that keep the program alive
+# Listener->new($parent, $address, %options)
 use vars qw(@ISA);
 @ISA = qw(_Listener);
 
 sub resume_read {
     my $listener = shift;
 
-    $listener->info("resume_read") if $verbose > 1;
+    $listener->info("resume_read") if $verbose > 1 && !shift;
     $listener->{reader} && $listener->die("Read not suspended");
     $listener->{reader} = Events::add_read($listener->{socket}, $listener, \&_Listener::acceptable);
 }
 
 package Listener0;
 # Listeners that don't keep the program alive
+# Listener0->new($parent, $address, %options)
 use vars qw(@ISA);
 @ISA = qw(_Listener);
 
 sub resume_read {
     my $listener = shift;
 
-    $listener->info("resume_read") if $verbose > 1;
+    $listener->info("resume_read") if $verbose > 1 && !shift;
     $listener->{reader} && $listener->die("Read not suspended");
     $listener->{reader} = Events::add_read0($listener->{socket}, $listener, \&_Listener::acceptable);
 }
 
 package Listener::Control;
 # Wait for incoming Control connections
+# Listener::Control->new($line, %options)
 use vars qw(@ISA);
 @ISA = qw(Listener0);
 
 package Control;
 # Communicate with a Controller
+# Control->new($line, $term_in, $term_out, $listener, $local, $peer)
 use vars qw(@ISA);
 @ISA = qw(Stream0);
 
@@ -4444,27 +4638,22 @@ sub new_suspended {
         $line, $term_in, $term_out,
         local	=> $local,
         peer	=> $peer,
+        human	=> 1,
         exit	=> fileno($term_in ) == fileno(STDIN));
 }
 
-sub _delete {
+sub _on_finish {
     my $control = shift;
 
-    $control->SUPER::_delete(@_);
+    $control->SUPER::_on_finish(@_);
     ::cleanup_all() if $control->{exit};
 }
 
 sub error {
     my $control = shift;
+
     $control->info("Error: @_") if $verbose;
-    $control->delete(@_);
-}
-
-sub eof : method {
-    my ($control, $msg) = @_;
-
-    $control->info($msg) if $verbose > 1;
-    $control->end_on_flushed($msg);
+    $control->finish(@_);
 }
 
 sub on_read {
@@ -4477,22 +4666,43 @@ sub on_read {
         next if $command =~ m{^#|^//|^--};
         my $fun = $commands{lc $command};
         if (!$fun) {
-            $control->{out} .= "Unknown command '$command'\n";
-            $control->flush;
+            $control->flush("Unknown command '$command'");
             next;
         }
         $fun->($control, $command, @args);
     }
-    $control->writing if $control->{out} ne "" && !$control->{writer};
 }
 
 sub flush {
+    my $control = shift;
+
+    $control->{collect} .= $_ for @_;
+    $control->{collect} .= "\n" unless
+        $control->{collect} eq "" || $control->{collect} =~ /\n\z/;
+    if (!$control->{human}) {
+        $control->{collect} =~ s/^\./../mg;
+        $control->{collect} .= ".\n";
+    }
+    $control->write($control->{collect});
+    $control->{collect} = "";
+}
+
+sub status {
+    my ($control0, $control, $indent) = @_;
+
+    my $name = $control0->name;
+    my $self = $control0 == $control ? " (this session)" : "";
+    $control->{collect} .= <<"EOF"
+$indent$name$self
+$indent  human=$control0->{human}
+EOF
+        ;
 }
 
 sub command_help {
     my ($control) = @_;
 
-    $control->{out} .= <<"EOF"
+    $control->flush(<<"EOF")
 quit               Close connection
 exit               Close connection
 dump               Dump internal datastructure
@@ -4504,7 +4714,6 @@ set {var=value}    Set variables
 status             Show connections status
 EOF
         ;
-    $control->flush;
 }
 
 sub command_status {
@@ -4513,7 +4722,7 @@ sub command_status {
     my $msghdr = $msghdr_error || Socket::MsgHdr->VERSION;
 
     my $rlwrap = $ENV{sssssh_rlwrap} || 0;
-    $control->{out} .= <<"EOF"
+    $control->{collect} .= <<"EOF"
 Local:
   Script $::Script (pid $$)
   VERSION $VERSION
@@ -4526,7 +4735,7 @@ Local:
 EOF
         ;
     $root->status_all($control, "  ");
-    $control->flush();
+    $control->flush;
 }
 
 sub command_set {
@@ -4535,56 +4744,51 @@ sub command_set {
 
     if (@_) {
         for my $arg (@_) {
-            if ($arg =~ /^verbose=((?:0|[1-9]\d*))\z/ia) {
+            if ($arg =~ /^verbose\s*=\s*((?:0|[1-9]\d*))\s*\z/ia) {
                 $verbose = int $1;
+            } elsif ($arg =~ /^human\s*=\s*([01])\s*\z/ia) {
+                $control->{human} = int $1;
             } else {
-                $control->{out} .= "Invalid $arg\n";
+                $control->{collect} .= "Invalid $arg\n";
             }
         }
     } else {
-        $control->{out} .= "Missing arguments";
+        $control->{collect} .= "Missing arguments";
     }
-    $control->flush();
+    $control->flush;
 }
 
 sub command_exit {
     my ($control, $command) = @_;
 
-    $control->{out} .= "OK\n";
-    $control->flush();
-    $control->end_on_flushed("Command '$command'");
+    # Also emties $control->{in} which terminates the on_read() input loop
+    $control->black_hole;
+    $control->flush("OK");
+    $control->final_write("Command '$command'");
 }
 
 sub command_finish {
-    my $control = shift;
-
     ::cleanup_all();
-    $control->command_exit(@_);
+    shift->command_exit(@_);
 }
 
 sub command_dump {
-    my ($control) = @_;
-
-    $control->{out} .= ::Dumper($root);
-    $control->flush();
+    shift->flush(::Dumper($root));
 }
 
 sub command_events {
-    my ($control) = @_;
-
-    $control->{out} .= Events::events();
-    $control->flush();
+    shift->flush(Events::events());
 }
 
 sub command_pid {
     my ($control) = @_;
 
-    $control->{out} .= "$$\n";
-    $control->flush();
+    $control->flush("$$");
 }
 
 package Listener::LineProtocol;
 # Wait for incoming LineProtocol connections
+# Listener::Control->new($root, %options)
 use vars qw(@ISA);
 @ISA = qw(Listener);
 
@@ -4702,7 +4906,7 @@ sub string_from_value {
 
 # Try an immediate exit. No references should exist in the call chain
 sub _cleanup_all {
-    $root->delete("Cleanup all") if $root && !$root->{deleted};
+    $root->finish("Cleanup all") if $root && !$root->{deleted};
     $root &&= 0;
     Signals->_cleanup_all;
     if ($nr_events && defined $root) {
@@ -4872,7 +5076,7 @@ if ($role eq "server") {
         die "Cannot have arguments in client mode" if @ARGV;
         die "Cannot have stuff in client mode" if $stuff;
 
-        my $to = Address->parse_address($client, "Client", to => "tcp4", resolve => 1);
+        my $to = Address->parse($client, "Client", to => "tcp4", resolve => 1);
         my $socket = $root->socket_tcp($to);
         $root->client($socket, $socket, \%connections, 1);
     } else {
