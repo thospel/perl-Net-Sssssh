@@ -129,6 +129,7 @@ my $timeout_connect = 10;
 my $keepalive = 300;
 my $udp_max = 10;
 my $ping_max = 10;
+my $socks_streamline = 1;
 my $default_bind  = "127.0.0.1";
 my $exit = 0;
 
@@ -3120,7 +3121,7 @@ sub status {
     my $name = $remote->name;
     $control->{collect} .= <<"EOF"
 $indent$name
-$indent  Local Connect to '$remote->{remote}{display}'
+$indent  Local:  Connect to '$remote->{remote}{display}'
 EOF
         ;
 }
@@ -3163,7 +3164,7 @@ sub status {
 
     $listener->SUPER::status($control, $indent);
 
-    $control->{collect} .= "$indent  Remote Connect to '$listener->{remote}{user}'\n";
+    $control->{collect} .= "$indent  Remote: Connect to '$listener->{remote}{user}'\n";
 }
 
 package Listener::TCP::Remote;
@@ -3352,9 +3353,13 @@ sub error_response {
 }
 
 sub eof {
-    my ($socks) = @_;
+    my $socks = shift;
 
-    $socks->error("Unexpected EOF");
+    if ($socks_streamline && $socks->{remote}) {
+        $socks->final_read(shift);
+    } else {
+        $socks->error("Unexpected @_");
+    }
 }
 
 sub on_read {
@@ -3600,9 +3605,11 @@ sub execute {
     $socks->{partner_unfinished} = 1;
 
     $socks->{remote} = $request;
-    # $socks->{state} = \&TCP::Forward::on_read;
-    $socks->{state} = \&no_input;
-    $socks->{state}->($socks, length $socks->{in}) if $socks->{in} ne "";
+    $socks->{state} = $socks_streamline ? \&TCP::Forward::on_read : \&no_input;
+    if ($socks->{in} ne "") {
+        $socks->{state}->($socks, length $socks->{in});
+        $socks->{in} = "";
+    }
 }
 
 sub socks_result {
@@ -3638,10 +3645,11 @@ sub socks_result {
     $socks->info("Become TCP::Forward[%s] after %s to '%s' [%s] succeeded",
                  $socks->id_full, $request->{command},
                  $request->{display}, $address->{display}) if $verbose > 1;
-    $socks->suspend_read;
+    # Socket can already be shutdown by EOF in case of pipelining
+    $socks->suspend_read if $socks->{socket_in};
     bless $socks, "TCP::Forward";
     # Replace the reader by the one from TCP::Forward
-    $socks->resume_read;
+    $socks->resume_read  if $socks->{socket_in};
 }
 
 package Socks::Remote;
@@ -4562,7 +4570,7 @@ sub status {
     $control->{collect} .= <<"EOF"
 $indent$name
 $indent  Loops: $listener->{loops}
-$indent  Local Listen on '$listener->{local}{user}' [$listener->{local}{display}]
+$indent  Local:  Listen  on '$listener->{local}{user}' [$listener->{local}{display}]
 EOF
         ;
 }
