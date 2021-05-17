@@ -4,6 +4,7 @@ MANIFEST.SKIP
 Makefile.PL
 README
 bin/sssssh
+bin/sssssh_control
 bin/udp_nat
 bin/udp_recv
 bin/udp_send
@@ -15,3 +16,5 @@ t/01_syntax.t
 t/02_fou_encode_decode.t
 t/03_udp_send.t
 t/04_udp_recv.t
+t/lib_extract
+version_check

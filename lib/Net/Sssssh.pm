@@ -53,7 +53,61 @@ use Exporter::Tidy
                      IP_PKTINFO IP_RECVDSTADDR IP_RECVTTL IP_TTL IPPROTO_IP
                      ICMP_ECHO_REPLY ICMP_ECHO_REQUEST TTL TTL_LOW)],
     other => [qw(parse_address string_from_value fou_encode_udp fou_encode_icmp
-                 fou_decode)];
+                 fou_decode get_home)];
+
+# Determine HOME directory
+our $me;
+if ($^O eq "MSWin32") {
+    require Win32;
+    $me = Win32::LoginName();
+} else {
+    if (my $user = $ENV{LOGNAME}) {
+        if (defined(my $uid = getpwnam($user))) {
+            $me = $user if $> == $uid;
+        }
+    }
+    $me ||= getpwuid $>;
+}
+die "Can't determine who I am" if !$me;
+# We can basically trust $me since it came from a real system request
+# Still, let's filter some weird characters
+die "Unacceptable userid '$me'" if $me eq "." || $me eq "..";
+$me =~ /^([0-9A-Za-z_.-]+)\z/ || die "Weird characters in userid '$me'";
+# Seems ok. Untaint
+$me = $1;	## no critic (UselessNoCritic CaptureWithoutTest)
+
+sub get_home() {
+    my $home = $ENV{HOME};
+    if (!$home) {
+        if ($^O eq "MSWin32") {
+            croak "Cannot determine the home directory since user '$me' has neither the 'HOME' nor the 'UserProfile' environment variable" if !$ENV{UserProfile};
+            $home = $ENV{UserProfile};
+        } else {
+            my @user_props = getpwuid($>) or
+                croak "Could not get userinfo for '$>'";
+            $home = $user_props[7] || croak "User $> has no home";
+        }
+    }
+    $home =~ tr{\\}{/} if $^O eq "MSWin32";
+    $home =~ s{/+\z}{};
+    $home = "/" if $home eq "";
+
+    # Due to the way the previous tests are done we know $home is not empty
+    # Check and untaint
+    ## no critic (UselessNoCritic CaptureWithoutTest)
+    $home =~ m{^([\x20-\x7f]+)\z} || do {
+        $home =~ m{([^\x20-\x7f])};
+        croak sprintf("HOME variable '%s' contains unacceptable character '%s' (\\x%02x)", $home, $1, ord($1));
+    };
+    $home = $1;
+    File::Spec->file_name_is_absolute($home) ||
+        croak "Home directory '$home' is not absolute";
+    # Downgrade failure should be impossible
+    utf8::downgrade($home);
+    $ENV{HOME} = $home;
+    # utf8::decode($home);
+    return $home;
+}
 
 # IPv6 could use [fe80::240:63ff:fede:3c19]:1234 as notation (like RFC 3986)
 my %parse_regex = (

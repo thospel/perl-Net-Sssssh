@@ -130,7 +130,6 @@ my $keepalive = 300;
 my $udp_max = 10;
 my $ping_max = 10;
 my $socks_pipeline = 1;
-my $default_bind  = "127.0.0.1";
 my $exit = 0;
 
 # How long a server UDP socket lingers without traffic
@@ -301,13 +300,21 @@ $| = 1;
 print "' . $STUFFED . '";
 ');
 
-my $nr_events = 0;
 {
     package Events;
     # A small event core
+    # for lib_extract
+    # use Timer;
     use Carp;
     use Errno qw(EINTR);
     use Scalar::Util qw(weaken);
+
+    use vars qw($nr_events);
+    $nr_events = 0;
+
+    sub nr_events {
+        return $nr_events;
+    }
 
     my $read_mask  = "";
     my $write_mask = "";
@@ -505,6 +512,7 @@ my $nr_events = 0;
     }
 
     my $unloop;
+    # Exportable
     sub _unloop {
         return if $unloop;
         $unloop = bless {};
@@ -539,10 +547,13 @@ my $nr_events = 0;
         Timer::events_timer(\@events);
         return \@events;
     }
+
+    # Exportable
     sub events {
         return join("", map "$_\n", @{_events()});
     }
 
+    # Exportable
     sub mainloop {
         # ::info("WARNING (can safely be ignored): $msghdr_error") if
         #    $msghdr_error && $verbose;
@@ -551,6 +562,7 @@ my $nr_events = 0;
         ::info("Exiting mainloop $$ (nr_events=$nr_events)") if $verbose;
     }
 
+    # Exportable
     sub _mainloop {
         my ($r, $w, $e);
         # my $name;
@@ -580,6 +592,7 @@ my $nr_events = 0;
         }
     }
 
+    # for lib_extract
     #no warnings "once";
     #*IO::Handle::add_read	= \&add_read;
     #*IO::Handle::add_read0	= \&add_read0;
@@ -739,16 +752,28 @@ sub add0 {
     return $handler;
 }
 
-my $CLOCK_TYPE_NAME;
 {
     package Timer;
     # A small timer core
+    # for lib_extract
+    # use Events;
     use Scalar::Util qw(weaken refaddr);
     use Carp;
     use Time::HiRes qw(clock_gettime CLOCK_REALTIME CLOCK_MONOTONIC);
 
+    my ($CLOCK_TYPE, $CLOCK_TYPE_NAME);
+    BEGIN {
+        $CLOCK_TYPE_NAME =
+            eval { $CLOCK_TYPE = CLOCK_MONOTONIC; "MONOTONIC" } ||
+            eval { $CLOCK_TYPE = CLOCK_REALTIME;  "REAL" } ||
+            die "Time::HiRes doesn't even have CLOCK_REALTIME";
+    }
+
     # Timer indices
     use constant {
+        CLOCK_TYPE_NAME	=> $CLOCK_TYPE_NAME,
+        CLOCK_TYPE	=> $CLOCK_TYPE,
+
         INDEX	=> 0,
         TIME	=> 1,
         OBJ	=> 2,	# Must come after TIME
@@ -764,21 +789,18 @@ my $CLOCK_TYPE_NAME;
     # even bother to put in @timers
     my @immediate;
 
-    my $CLOCK_TYPE;
-    $CLOCK_TYPE_NAME =
-        eval { $CLOCK_TYPE = CLOCK_MONOTONIC; "MONOTONIC" } ||
-    eval { $CLOCK_TYPE = CLOCK_REALTIME;  "REAL" } ||
-    die "Time::HiRes doesn't even have CLOCK_REALTIME";
-
+    # Exportable
     sub realtime {
         return clock_gettime(CLOCK_REALTIME);
     }
 
+    # Exportable
     sub clocktime : method {
-        return clock_gettime($CLOCK_TYPE);
+        return clock_gettime(CLOCK_TYPE);
     }
 
     # Timers are kept in a simple binary heap @timers
+    # Exportable
     sub timer {
         if ($verbose > 1) {
             my $v = $verbose;
@@ -800,10 +822,11 @@ my $CLOCK_TYPE_NAME;
         my $timer = bless [$i, $time, shift, shift, 0];
         weaken($timer->[OBJ]);
         weaken($timers[$i] = $timer);
-        ++$nr_events;
+        ++$Events::nr_events;
         return $timer;
     }
 
+    # Exportable
     sub timer0 {
         if ($verbose > 1) {
             my $v = $verbose;
@@ -828,6 +851,7 @@ my $CLOCK_TYPE_NAME;
         return $timer;
     }
 
+    # Exportable
     sub immediate {
         # If we ever expose the TIME element we should put clocktime() there
         my $timer = bless [0, 0, shift, shift, 0];
@@ -839,7 +863,7 @@ my $CLOCK_TYPE_NAME;
             ::info("add Immediate Timer(%s) %08x [%s]",
                    ::object_name($timer->[OBJ]), refaddr($timer), $callers);
         }
-        ++$nr_events;
+        ++$Events::nr_events;
         return $timer;
     }
 
@@ -863,12 +887,12 @@ my $CLOCK_TYPE_NAME;
             # Could be a timer sitting on the expired queue in run_now
             # This slicing will only be useful if not called by perl internals
             if (@$timer > TIME) {
-                --$nr_events unless $timer->[KEEPDEAD];
+                --$Events::nr_events unless $timer->[KEEPDEAD];
                 $#$timer = TIME;
             }
             return;
         }
-        --$nr_events unless $timer->[KEEPDEAD];
+        --$Events::nr_events unless $timer->[KEEPDEAD];
         $timer->[INDEX] = 0;
         # Last element or beyond...
         if ($i >= $#timers) {
@@ -981,7 +1005,7 @@ my $CLOCK_TYPE_NAME;
 
         # Using while instead of for in case a callback dies
         ($timer = shift @expired and
-         $timer->[KEEPDEAD]++ || $nr_events-- and
+         $timer->[KEEPDEAD]++ || $Events::nr_events-- and
          $timer->[OBJ] and
          $timer->[CODE]->($timer->[OBJ])) while @expired;
     }
@@ -1093,248 +1117,257 @@ sub id_check {
     $ids->SUPER::id_check($id) unless $id &1;
 }
 
-package Address;
-use Socket qw(AF_INET pack_sockaddr_in unpack_sockaddr_in inet_aton inet_ntoa);
-use Carp qw(croak);
+{
+    package Address;
+    use Socket qw(AF_INET pack_sockaddr_in unpack_sockaddr_in inet_aton inet_ntoa);
+    use Carp qw(croak);
 
-sub new {
-    my ($class, %options) = @_;
+    sub new {
+        my ($class, %options) = @_;
 
-    # Make a (modified) copy if an object is passed
-    return bless { %$class, %options }, ref $class if ref $class ne "";
-    return bless \%options, $class;
-}
-
-# IPv6 could use [fe80::240:63ff:fede:3c19]:1234 as notation (like RFC 3986)
-my %parse_regex = (
-    tcp4	=> "(?:([^:/]*):|^)([^:/]*)",
-    udp4	=> "(?:([^:/]*):|^)([^:/]*)",
-);
-
-my %from_defaults = (
-    tcp4	=> "0.0.0.0:0",
-    udp4	=> "0.0.0.0:0",
-);
-
-my @ADDRESS_TYPES = ("", qw(tcp_name udp_name tcp4 udp4 tcp6 udp6));
-my %ADDRESS_TYPES = map {$ADDRESS_TYPES[$_], $_} 0..$#ADDRESS_TYPES;
-my $ADDRESS_TYPE_UDP4	  = $ADDRESS_TYPES{"udp4"}	|| die "No udp4";
-my $ADDRESS_TYPE_UDP_NAME = $ADDRESS_TYPES{"udp_name"}	|| die "No udp_name";
-my %ADDRESS_DECODERS = (
-    udp_name	=> \&decode_name,
-    tcp_name	=> \&decode_name,
-    tcp4	=> \&decode_ipv4,
-    udp4	=> \&decode_ipv4,
-);
-my @ADDRESS_DECODERS;
-@ADDRESS_DECODERS[@ADDRESS_TYPES{keys %ADDRESS_DECODERS}] = values %ADDRESS_DECODERS;
-my %ADDRESS_MODES = (
-    tcp_name	=> "stream",
-    udp_name	=> "packet",
-    tcp4	=> "stream",
-    udp4	=> "packet",
-);
-my @ADDRESS_MODES;
-@ADDRESS_MODES[@ADDRESS_TYPES{keys %ADDRESS_MODES}] = values %ADDRESS_MODES;
-
-my $TCP4_ANY = __PACKAGE__->parse("0.0.0.0:0", "ADDRESS_ANY", from => "tcp4", resolve => 1);
-my $UDP4_ANY = __PACKAGE__->parse("0.0.0.0:0", "ADDRESS_ANY", from => "udp4", resolve => 1);
-
-sub build_parser {
-    my ($mode, $types, $matches) = @_;
-
-    my @regex;
-    $types = "TCP4" if !defined $types || $types eq "";
-    for my $type (split /\|/, $types) {
-        my $regex = $parse_regex{lc $type} || croak "Unknown $mode type '$type'";
-        $regex =~ s/\((?!\?)/(?:/g;
-        push @regex, "($regex)";
-        push @$matches, [$mode, lc $type];
-    }
-    # print STDERR "REGEX: <@regex>\n";
-    return join("|", @regex);
-}
-
-sub resolve {
-    my ($address, $context) = @_;
-
-    if ($address->{type} eq "udp_name") {
-        $address->{type} = "udp4";
-    } elsif ($address->{type} eq "tcp_name") {
-        $address->{type} = "tcp4";
-    } elsif ($address->{type} ne "udp4" && $address->{type} ne "tcp4") {
-        die "Assertion: Unknown address type '$address->{type}'";
+        # Make a (modified) copy if an object is passed
+        return bless { %$class, %options }, ref $class if ref $class ne "";
+        return bless \%options, $class;
     }
 
-    $address->{family} = AF_INET;
-    $address->{addr} = inet_aton($address->{host}) ||
-        die "Could not resolve $context '$address->{host}'\n";
-    $address->{port} = $address->{port} =~
-        # There is no port 0 in /etc/services so we can use ||
-        /^0\z|^[1-9][0-9]*\z/ ? int($address->{port}) :
-        $address->{type} =~ /^udp/ ? getservbyname($address->{port}, "udp") ||
-        die("$context: Unknown UDP service '$address->{port}'\n") :
-        $address->{type} =~ /^tcp/ ? getservbyname($address->{port}, "tcp") ||
-        die("$context: Unknown TCP service '$address->{port}'\n") :
-        die("Assertion: $context: Unknown type '$address->{type}'");
-    $address->{host} = inet_ntoa($address->{addr});
-    $address->{display} = "$address->{host}:$address->{port}";
-    $address->{packed} = pack_sockaddr_in($address->{port}, $address->{addr});
-}
+    my @ADDRESS_TYPES = ("", qw(tcp_name udp_name tcp4 udp4 tcp6 udp6));
+    my %ADDRESS_TYPES = map {$ADDRESS_TYPES[$_], $_} 0..$#ADDRESS_TYPES;
+    my %ADDRESS_DECODERS = (
+        udp_name	=> \&decode_name,
+        tcp_name	=> \&decode_name,
+        tcp4		=> \&decode_ipv4,
+        udp4		=> \&decode_ipv4,
+    );
+    my @ADDRESS_DECODERS;
+    @ADDRESS_DECODERS[@ADDRESS_TYPES{keys %ADDRESS_DECODERS}] = values %ADDRESS_DECODERS;
+    my %ADDRESS_MODES = (
+        tcp_name	=> "stream",
+        udp_name	=> "packet",
+        tcp4	=> "stream",
+        udp4	=> "packet",
+    );
+    my @ADDRESS_MODES;
+    @ADDRESS_MODES[@ADDRESS_TYPES{keys %ADDRESS_MODES}] = values %ADDRESS_MODES;
 
-sub parse {
-    my ($class, $str, $context, %options) = @_;
+    my $default_bind  = "127.0.0.1";
 
-    my $resolve = delete $options{resolve};
-    my (@matches, @modes);
-    my $regex = "";
-    for my $mode (qw(from to)) {
-        defined(my $types = delete $options{$mode}) || next;
-        my $r = build_parser($mode, $types, \@matches);
-        $regex = $regex eq "" ? $r : "(?:$regex:)?$r";
-        push @modes, $mode;
+    sub number_from_type {
+        my $type = ref $_[0] eq "" ? $_[1] : $_[0]->{type};
+        return $ADDRESS_TYPES{$type} || die "Unknown type '$type'";
     }
-    die "Unknown option " . join(", ", map "'$_'", sort keys %options) if %options;
-    my @matched = $str =~ /^$regex\z/ or
-        die "Could not parse $context '$str'\n";
-    my %matches;
-    for my $i (0..$#matched) {
-        defined(my $matched = $matched[$i]) || next;
-        my ($mode, $type) =
-            @{$matches[$i] || die "Assertion: Impossible match"};
-        my @parts = $matched =~ $parse_regex{$type};
-        if ($type eq "udp4" || $type eq "tcp4") {
-            if (!defined $parts[0]) {
-                $parts[0] = $default_bind;
-            } elsif ($parts[0] eq "") {
-                $parts[0] = $mode eq "from" ? "0.0.0.0" : "127.0.0.1";
-            } elsif ($parts[0] eq "*") {
-                # die "Cannot connect to the $context '*'" if $mode eq "to";
-                $parts[0] = "0.0.0.0";
-            }
-            if (!defined $parts[1] || $parts[1] eq "") {
-                # die "Missing $context port" if $mode eq "to";
-                $parts[1] = "0";
-            }
-            $matches{$mode} = bless {
-                type	=> $type,
-                host	=> $parts[0],
-                port	=> $parts[1],
-                user	=> $matched,
-                display	=> "$parts[0]:$parts[1]",
-            }, $class;
-            $matches{$mode}->resolve($context) if $resolve;
-        } else {
-            die "Assertion: Type '$type' not implemented";
+
+    # IPv6 could use [fe80::240:63ff:fede:3c19]:1234 as notation (like RFC 3986)
+    my %parse_regex = (
+        tcp4	=> "(?:([^:/]*):|^)([^:/]*)",
+        udp4	=> "(?:([^:/]*):|^)([^:/]*)",
+    );
+
+    my %from_defaults = (
+        tcp4	=> "0.0.0.0:0",
+        udp4	=> "0.0.0.0:0",
+    );
+
+    sub build_parser {
+        my ($mode, $types, $matches) = @_;
+
+        my @regex;
+        $types = "TCP4" if !defined $types || $types eq "";
+        for my $type (split /\|/, $types) {
+            my $regex = $parse_regex{lc $type} || croak "Unknown $mode type '$type'";
+            $regex =~ s/\((?!\?)/(?:/g;
+            push @regex, "($regex)";
+            push @$matches, [$mode, lc $type];
         }
+        # print STDERR "REGEX: <@regex>\n";
+        return join("|", @regex);
     }
-    my @result = @matches{@modes} or die "Assertion: No modes";
-    if (@result == 2 && !defined $result[0]) {
-        # Both from and to but no from part given
-        my $type = $result[1]{type};
-        my $from = $from_defaults{$type} ||
-            die "$context: No default from for type '$type'";
-        $result[0] = $class->parse($from, $context, from => $type, resolve => $resolve);
+
+    sub resolve {
+        my ($address, $context) = @_;
+
+        if ($address->{type} eq "udp_name") {
+            $address->{type} = "udp4";
+        } elsif ($address->{type} eq "tcp_name") {
+            $address->{type} = "tcp4";
+        } elsif ($address->{type} ne "udp4" && $address->{type} ne "tcp4") {
+            die "Assertion: Unknown address type '$address->{type}'";
+        }
+
+        $address->{family} = AF_INET;
+        $address->{addr} = inet_aton($address->{host}) ||
+            die "Could not resolve $context '$address->{host}'\n";
+        $address->{port} = $address->{port} =~
+            # There is no port 0 in /etc/services so we can use ||
+            /^0\z|^[1-9][0-9]*\z/ ? int($address->{port}) :
+            $address->{type} =~ /^udp/ ? getservbyname($address->{port}, "udp") ||
+            die("$context: Unknown UDP service '$address->{port}'\n") :
+            $address->{type} =~ /^tcp/ ? getservbyname($address->{port}, "tcp") ||
+            die("$context: Unknown TCP service '$address->{port}'\n") :
+            die("Assertion: $context: Unknown type '$address->{type}'");
+        $address->{host} = inet_ntoa($address->{addr});
+        $address->{display} = "$address->{host}:$address->{port}";
+        $address->{packed} = pack_sockaddr_in($address->{port}, $address->{addr});
     }
-    return @result if wantarray;
-    croak "Cannot return multiple results in a scalar" if @result != 1;
-    return $result[0];
+
+    sub parse {
+        my ($class, $str, $context, %options) = @_;
+
+        my $resolve = delete $options{resolve};
+        my (@matches, @modes);
+        my $regex = "";
+        for my $mode (qw(from to)) {
+            defined(my $types = delete $options{$mode}) || next;
+            my $r = build_parser($mode, $types, \@matches);
+            $regex = $regex eq "" ? $r : "(?:$regex:)?$r";
+            push @modes, $mode;
+        }
+        die "Unknown option " . join(", ", map "'$_'", sort keys %options) if %options;
+        my @matched = $str =~ /^$regex\z/ or
+            die "Could not parse $context '$str'\n";
+        my %matches;
+        for my $i (0..$#matched) {
+            defined(my $matched = $matched[$i]) || next;
+            my ($mode, $type) =
+                @{$matches[$i] || die "Assertion: Impossible match"};
+            my @parts = $matched =~ $parse_regex{$type};
+            if ($type eq "udp4" || $type eq "tcp4") {
+                if (!defined $parts[0]) {
+                    $parts[0] = $default_bind;
+                } elsif ($parts[0] eq "") {
+                    $parts[0] = $mode eq "from" ? "0.0.0.0" : "127.0.0.1";
+                } elsif ($parts[0] eq "*") {
+                    # die "Cannot connect to the $context '*'" if $mode eq "to";
+                    $parts[0] = "0.0.0.0";
+                }
+                if (!defined $parts[1] || $parts[1] eq "") {
+                    # die "Missing $context port" if $mode eq "to";
+                    $parts[1] = "0";
+                }
+                $matches{$mode} = bless {
+                    type	=> $type,
+                    host	=> $parts[0],
+                    port	=> $parts[1],
+                    user	=> $matched,
+                    display	=> "$parts[0]:$parts[1]",
+                }, $class;
+                $matches{$mode}->resolve($context) if $resolve;
+            } else {
+                die "Assertion: Type '$type' not implemented";
+            }
+        }
+        my @result = @matches{@modes} or die "Assertion: No modes";
+        if (@result == 2 && !defined $result[0]) {
+            # Both from and to but no from part given
+            my $type = $result[1]{type};
+            my $from = $from_defaults{$type} ||
+                die "$context: No default from for type '$type'";
+            $result[0] = $class->parse($from, $context, from => $type, resolve => $resolve);
+        }
+        return @result if wantarray;
+        croak "Cannot return multiple results in a scalar" if @result != 1;
+        return $result[0];
+    }
+
+    sub from_packed {
+        my ($class, $packed, $type) = @_;
+
+        my ($port, $addr) = unpack_sockaddr_in($packed);
+        my $host = inet_ntoa($addr);
+        return bless {
+            type	=> $type || croak("Missing type"),
+            addr	=> $addr,
+            host	=> $host,
+            port	=> $port,
+            display	=> "$host:$port",
+            user	=> "$host:$port",
+            # Normalize packed so it has no random bytes in any padding
+            packed	=> pack_sockaddr_in($port, $addr),
+        }, $class;
+    }
+
+    # The format we use on the LineProtocol wire
+    sub decode {
+        my ($class, $string, $mode, $resolve) = @_;
+
+        my $type_num = unpack("C", substr($string, 0, 1, ""));
+        my $decoder = $ADDRESS_DECODERS[$type_num] ||
+            croak "No decoder for type number '$type_num'";
+        my $type = $ADDRESS_TYPES[$type_num] ||
+            croak "No type for type number '$type_num'";
+        my $m = $ADDRESS_MODES[$type_num] ||
+            croak "No mode for type number '$type_num'";
+        $m eq $mode || croak "Type '$type' is for $m, not $mode";
+        return $decoder->($class, $string, $type, $resolve);
+    }
+
+    sub decode_name {
+        # @_ = ($class, $string, $type, $resolve)
+        my $class = shift;
+
+        my ($port, $host) = unpack("na*", shift);
+        my $address = $class->new(
+            type	=> shift,
+            host	=> $host,
+            port	=> $port,
+            display	=> "$host:$port",
+        );
+        $address->resolve if shift;
+        return $address;
+    }
+
+    sub decode_ipv4 {
+        # @_ = ($class, $string, $type, $resolve)
+        my $class = shift;
+
+        my ($port, $addr) = unpack("na4", shift);
+        my $host = inet_ntoa($addr);
+        my $address = $class->new(
+            type	=> shift,
+            host	=> $host,
+            port	=> $port,
+            display	=> "$host:$port",
+        );
+        $address->resolve if shift;
+        return $address;
+    }
+
+    sub encode {
+        my ($address) = @_;
+
+        return pack("Cna4",
+                    $ADDRESS_TYPES{$address->{type}} ||
+                    die("Unknown address type $address->{type}"),
+                    @$address{qw(port addr)});
+    }
+
+    # Return a copy of $value (which is assumed to be resolved) but fill in the
+    # old attribute (user) from the new attributes (display) of
+    # $template (which is assumed to be unresolved)
+    sub copy2 {
+        my ($value, $template) = @_;
+
+        $template->{type} eq $value->{type} || croak "Inconsistent type";
+        return $value->new(user => $template->{display});
+    }
+
+    # Return a copy of $template (which is assumed not to be resolved)
+    # Copy host 0.0.0.0 and port 0 from $value (which is assumed to be resolved)
+    sub copy0_resolve {
+        my ($template, $value, $context) = @_;
+
+        $template->{type} eq $value->{type} || croak "Inconsistent type";
+        my $result = bless {%$template}, ref $template;
+        $result->{host} = $value->{host} if $result->{host} eq "0.0.0.0";
+        $result->{port} ||= $value->{port};
+        $result->resolve($context);
+        return $result;
+    }
 }
 
-sub from_packed {
-    my ($class, $packed, $type) = @_;
-
-    my ($port, $addr) = unpack_sockaddr_in($packed);
-    my $host = inet_ntoa($addr);
-    return bless {
-        type	=> $type || croak("Missing type"),
-        addr	=> $addr,
-        host	=> $host,
-        port	=> $port,
-        display	=> "$host:$port",
-        user	=> "$host:$port",
-        # Normalize packed so it has no random bytes in any padding
-        packed	=> pack_sockaddr_in($port, $addr),
-    }, $class;
-}
-
-# The format we use on the LineProtocol wire
-sub decode {
-    my ($class, $string, $mode, $resolve) = @_;
-
-    my $type_num = unpack("C", substr($string, 0, 1, ""));
-    my $decoder = $ADDRESS_DECODERS[$type_num] ||
-        croak "No decoder for type number '$type_num'";
-    my $type = $ADDRESS_TYPES[$type_num] ||
-        croak "No type for type number '$type_num'";
-    my $m = $ADDRESS_MODES[$type_num] ||
-        croak "No mode for type number '$type_num'";
-    $m eq $mode || croak "Type '$type' is for $m, not $mode";
-    return $decoder->($class, $string, $type, $resolve);
-}
-
-sub decode_name {
-    # @_ = ($class, $string, $type, $resolve)
-    my $class = shift;
-
-    my ($port, $host) = unpack("na*", shift);
-    my $address = $class->new(
-        type	=> shift,
-        host	=> $host,
-        port	=> $port,
-        display	=> "$host:$port",
-    );
-    $address->resolve if shift;
-    return $address;
-}
-
-sub decode_ipv4 {
-    # @_ = ($class, $string, $type, $resolve)
-    my $class = shift;
-
-    my ($port, $addr) = unpack("na4", shift);
-    my $host = inet_ntoa($addr);
-    my $address = $class->new(
-        type	=> shift,
-        host	=> $host,
-        port	=> $port,
-        display	=> "$host:$port",
-    );
-    $address->resolve if shift;
-    return $address;
-}
-
-sub encode {
-    my ($address) = @_;
-
-    return pack("Cna4",
-                $ADDRESS_TYPES{$address->{type}} ||
-                die("Unknown address type $address->{type}"),
-                @$address{qw(port addr)});
-}
-
-# Return a copy of $value (which is assumed to be resolved) but fill in the
-# old attribute (user) from the new attributes (display) of
-# $template (which is assumed to be unresolved)
-sub copy2 {
-    my ($value, $template) = @_;
-
-    $template->{type} eq $value->{type} || croak "Inconsistent type";
-    return $value->new(user => $template->{display});
-}
-
-# Return a copy of $template (which is assumed not to be resolved)
-# Copy host 0.0.0.0 and port 0 from $value (which is assumed to be resolved)
-sub copy0_resolve {
-    my ($template, $value, $context) = @_;
-
-    $template->{type} eq $value->{type} || croak "Inconsistent type";
-    my $result = bless {%$template}, ref $template;
-    $result->{host} = $value->{host} if $result->{host} eq "0.0.0.0";
-    $result->{port} ||= $value->{port};
-    $result->resolve($context);
-    return $result;
-}
+my $TCP4_ANY = Address->parse("0.0.0.0:0", "ADDRESS_ANY", from => "tcp4", resolve => 1);
+my $UDP4_ANY = Address->parse("0.0.0.0:0", "ADDRESS_ANY", from => "udp4", resolve => 1);
+my $ADDRESS_TYPE_UDP4     = Address->number_from_type("udp4");
+my $ADDRESS_TYPE_UDP_NAME = Address->number_from_type("udp_name");
 
 package ConnUtils;
 # Utilities to set up connections
@@ -4312,8 +4345,8 @@ sub activate_read {
 
     my $classes = $line->{children} || return;
     for my $class (sort keys %$classes) {
-        my $children = $classes->{$class};
         $class->isa("_Listener") || $class->isa("_UDP") || next;
+        my $children = $classes->{$class};
         $children->{$_}->resume_read("quiet") for sort { $a <=> $b } keys %$children;
     }
 }
@@ -4396,7 +4429,8 @@ sub process_START {
 
     $line->{started} = 1;
 
-    my $msg = "$Script $role $me\@$hostname ready (clock $CLOCK_TYPE_NAME, pid $$)";
+    my $clock_name = Timer::CLOCK_TYPE_NAME;
+    my $msg = "$Script $role $me\@$hostname ready (clock $clock_name, pid $$)";
 
     $line->write($START, $msg) if $role eq "server";
     $line->ready($msg, shift);
@@ -4958,6 +4992,7 @@ sub new_suspended {
         local	=> $local,
         peer	=> $peer,
         human	=> 1,
+        collect	=> "",
         exit	=> fileno($term_in ) == fileno(STDIN));
 }
 
@@ -5227,11 +5262,9 @@ sub _cleanup_all {
     $root->finish("Cleanup all") if $root && !$root->{deleted};
     $root &&= 0;
     Signals->_cleanup_all;
-    if ($nr_events && defined $root) {
-        $root = undef;
-        print STDERR "Pid=$$\n" . Events::events();
-        die "Assertion: Still have $nr_events events";
-    }
+    my $nr_events = Events->nr_events;
+    die "Assertion: Pid $$ Still has $nr_events events" if
+        $nr_events && defined $root;
 }
 
 # Clean up all events and wait until the next loop in mainloop to exit
@@ -5252,7 +5285,7 @@ my @ARGV_OLD = @ARGV;
 
 sub rlwrap {
     if (!$ENV{sssssh_rlwrap}) {
-        die "Assertion: Already queued events" if $nr_events;
+        die "Assertion: Already queued events" if Events->nr_events;
         local $ENV{sssssh_rlwrap} = "1";
         no warnings "exec";
         { exec("rlwrap", "-w", 100, "-S", "$Script>", "$Bin/$Script", @ARGV_OLD) }
@@ -5333,6 +5366,8 @@ $no_control ||= 0;
 $verbose ||= 0;
 $client_verbose = $verbose if !defined $client_verbose;
 $server_verbose = $verbose if !defined $server_verbose;
+# control_local is special. It is always allowed (as both server and client)
+my $control_local = delete $connections{control_local};
 
 $role = "server" if defined $server;
 $role_peer = $role eq "server" ? "client" : "server";
@@ -5507,9 +5542,10 @@ if ($role eq "server") {
 $root->timeout($global_timeout) if defined $global_timeout;
 
 eval {
-    for my $control (@{$connections{control_local}}) {
+    for my $control (@$control_local) {
         my $address = Address->parse($control, "Control", from => "TCP4", resolve => 1);
-        Listener::Control->new_suspended($root, $address);
+        # Imediately active. Is not related to any LineProtocol ready
+        Listener::Control->new($root, $address);
     }
 
     Events->mainloop();

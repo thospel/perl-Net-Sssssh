@@ -1,0 +1,215 @@
+#!/usr/bin/perl -w
+# Very simple program to manually talk to an ADB server
+# Useful to better understand the protocol
+use strict;
+use warnings;
+
+our $VERSION = "1.000";
+
+use FindBin qw($Script);
+our $Bin;
+
+# If the program runs as /foobar/bin/program, find libraries in /foobar/lib
+BEGIN {
+    # Even on windows FindBin uses / in the reported path
+    $Bin = $FindBin::Bin;
+    $Bin =~ s{/+\z}{};
+    $Bin =~
+        ($^O eq "MSWin32" ?
+         qr{^((?:[A-Z]:)?(?:/[a-zA-Z0-9_:.~ -]+)*)/[a-zA-Z0-9_.-]+/*\z} :
+         qr{^((?:/[a-zA-Z0-9_:.-]+)*)/[a-zA-Z0-9_.-]+/*\z}) ||
+         die "Could not parse bin directory '$Bin'";
+    # Use untainted version of lib
+    require lib;
+    # Support a simple --blib option for pre-install testing
+    "lib"->import(@ARGV && $ARGV[0] eq "--blib" ? shift && "$1/blib/lib" : "$1/lib");
+}
+
+use Term::ReadLine;
+use Net::Sssssh qw(get_home);
+use Net::Sssssh::Address;
+use Net::Sssssh::Events qw(mainloop _unloop);
+use Net::Sssssh::Timer qw(realtime);
+
+use Errno qw(EAGAIN EINTR EWOULDBLOCK);
+use Time::Local qw(timegm);
+use IO::Socket::INET qw();
+
+use Data::Dumper;
+$Data::Dumper::Indent   = 1;
+$Data::Dumper::Sortkeys = 1;
+$Data::Dumper::Useqq	= 1;
+
+# Net::Sssssh::Events->verbose(2);
+
+sub object_name {
+    my ($object) = @_;
+
+    return ref $object;
+}
+
+sub info {
+    local ($!, $^E);
+    if (!@_) {
+        my (undef, $filename, $line) = caller(0);
+        @_ = ("$filename $line");
+    }
+    my $format = shift;
+    $format =~ s/\n?\z/\n/;
+    if (!@_) {
+        @_ = ($format);
+        $format = "%s";
+    }
+    my $time = realtime;
+    my $itime = int($time);
+    my ($sec, $min, $hour, $day, $mon, $year) = localtime($itime);
+    # This code didn't exist before 2000, so $year >= 100
+    my $gtime = timegm($sec, $min, $hour, $day, $mon, $year);
+    my $offset = ($gtime - $itime) / 60;
+    my $sign = "+";
+    if ($offset < 0) {
+        $sign = "-";
+        $offset = -$offset;
+    }
+    my $hoffset = $offset / 60;
+    my $moffset = $offset % 60;
+    printf(STDERR "%04d-%02d-%02d %02d:%02d:%06.3f %s%02d%02d: $format",
+           $year+1900, $mon+1, $day, $hour, $min, $time-$itime+$sec,
+           $sign, $hoffset, $moffset,
+           @_);
+}
+
+sub callers {
+    my (@lines, $file, $line, $i);
+    # Skip the entry for callers itself, so start $i at 1
+    $file =~ s{.*/}{}s, push @lines, "$file:$line" while (undef, $file, $line) = caller(++$i);
+    return join(" ", @lines);
+}
+
+sub caller_info {
+    my $format = shift;
+    if (@_) {
+        info("$format [%s]", @_, callers());
+    } else {
+        my $callers = callers();
+        $callers =~ s{%}{%%}g;
+        info("$format [$callers]");
+    }
+}
+
+sub command_process {
+    my ($state) = @_;
+
+    $state->{command_in} =~ /\n/ || return;
+    $state->{reader_IN} = undef;
+    while ($state->{command_in} =~ s/\s*(.*?)\s*\n//) {
+        my $line = $1;
+        if ($line eq "") {
+            print {$state->{OUT}} "\n";
+            next;
+        }
+        utf8::downgrade($line);
+        my $len = length $line;
+        die "Line too long" if $len >= 2**16;
+        $state->{writer} = $state->{socket}->add_write($state, \&control_writer) if $state->{out} eq "";
+        # print {$state->{OUT}} "$line\n";
+        $state->{out} .= "$line\n";
+        # second level mainloop
+        mainloop();
+    }
+    $state->{reader_IN} = $state->{IN}->add_read( $state,  \&command_reader);
+}
+
+sub command_reader {
+    _unloop();
+}
+
+sub control_writer {
+    my ($state) = @_;
+
+    my $rc = syswrite($state->{socket}, $state->{out}, int(2**16));
+    if ($rc) {
+        substr($state->{out}, 0, $rc, "");
+        $state->{writer} = undef if $state->{out} eq "";
+        return;
+    }
+    die "Length 0 write" if defined $rc;
+    return if $! == EAGAIN || $! == EINTR || $! == EWOULDBLOCK;
+    die "Error writing to socket: $^E";
+}
+
+sub control_reader {
+    my ($state) = @_;
+
+    my $rc = sysread($state->{socket}, my $buffer, int(2**16));
+    if ($rc) {
+        $state->{in} .= $buffer;
+        if ($state->{in} =~ s/(.*?)^\.\n//sm) {
+            my $result = $1;
+            $result =~ s/^\.//mg;
+            print {$state->{OUT}} $result if $result ne "";
+            _unloop();
+        }
+        return;
+    }
+    if (defined $rc) {
+        print {$state->{OUT}} "<- control: EOF\n";
+        $state->{reader} = undef;
+        $state->{writer} = undef;
+        exit;
+        # We could try to reconnect here
+    }
+    return if $! == EAGAIN || $! == EINTR || $! == EWOULDBLOCK;
+    die "Error reading from socket: $^E";
+}
+
+@ARGV = "$ARGV[0]:$ARGV[1]" if @ARGV == 2;
+if (@ARGV != 1) {
+    die "Too many arguments\n" if @ARGV > 1;
+    die "Missing address to connect to\n";
+}
+my $target = Net::Sssssh::Address->parse(shift, "Target", to => "tcp4", resolve => 1);
+
+my $prompt = ">";
+my $home = get_home();
+my $history_file = "$home/.history_$Script";
+
+my $term = Term::ReadLine->new($Script);
+$term->event_loop(\&mainloop);
+$term->read_history($history_file);
+# $term->stuff_char(10);
+
+my $control = IO::Socket::INET->new(
+    PeerHost	=> $target->{host},
+    PeerPort	=> $target->{port},
+    blocking	=> 0) ||
+    die "Could not connect to $target->{display}: $@";
+
+my $state = {
+    command_in	=> "",
+    IN		=> $term->IN  || die("No IN"),
+    OUT		=> $term->OUT || die("No OUT"),
+    socket	=> $control,
+    in		=> "",
+    out		=> "set human=0\n",
+};
+
+print {$state->{OUT}} "Connected to $target->{display}\n";
+
+$state->{IN}->blocking(0);
+$state->{reader_IN} = $state->{IN}->add_read( $state,  \&command_reader);
+$state->{reader} = $state->{socket}->add_read ($state, \&control_reader);
+$state->{writer} = $state->{socket}->add_write($state, \&control_writer);
+
+# mainloop();
+while (1) {
+    my $line = $term->readline($prompt) // last;
+    $state->{command_in} .= "$line\n";
+    command_process($state);
+}
+$term->write_history($history_file);
+
+END {
+    local $?;
+    $term->rl_deprep_terminal() if $term;
+}

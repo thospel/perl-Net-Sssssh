@@ -6,8 +6,8 @@ use strict;
 use warnings;
 use vars qw($VERSION $SUB_VERSION $release_time %history);
 $VERSION = "1.000";
-$SUB_VERSION = "065";
-$release_time = 1621258107;	## no critic (UselessNoCritic MagicNumbers)
+$SUB_VERSION = "066";
+$release_time = 1621276300;	## no critic (UselessNoCritic MagicNumbers)
 %history = (
   'Changes' => {
     '1.000' => '1.000'
@@ -25,6 +25,9 @@ $release_time = 1621258107;	## no critic (UselessNoCritic MagicNumbers)
     '1.000' => '1.000'
   },
   'bin/sssssh' => {
+    '1.000' => '1.000'
+  },
+  'bin/sssssh_control' => {
     '1.000' => '1.000'
   },
   'bin/udp_nat' => {
@@ -58,6 +61,12 @@ $release_time = 1621258107;	## no critic (UselessNoCritic MagicNumbers)
     '1.000' => '1.000'
   },
   't/04_udp_recv.t' => {
+    '1.000' => '1.000'
+  },
+  't/lib_extract' => {
+    '1.000' => '1.000'
+  },
+  'version_check' => {
     '1.000' => '1.000'
   }
 );
