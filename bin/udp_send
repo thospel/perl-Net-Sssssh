@@ -47,6 +47,7 @@ die "Could not parse your command line. Try $0 -h\n" unless
                "n|nonl!"	=> \my $no_nl,
                "v|verbose!"	=> \my $verbose,
                "version!"	=> \my $version,
+               "msghdr!"	=> \my $msghdr,
                "U|unsafe!"	=> \my $unsafe,
                "h|help!"	=> \my $help);
 
@@ -81,7 +82,7 @@ if ($local) {
     $local = inet_ntoa($laddr);
 }
 
-my $msghdr = Socket::MsgHdr->new();
+$msghdr = !defined $msghdr || $msghdr ? Socket::MsgHdr->new() : undef;
 my ($buffer, $msg_src, $msg_dst, $ttl, $sender);
 
 if ($fou) {
@@ -231,11 +232,17 @@ if ($fou) {
 }
 
 # Show answer
-$msg_src // die "Assertion: No local addr";
-$ttl     // die "Assertion: No TTL";
-
 my ($peer_port, $peer) = unpack_sockaddr_in($sender);
 $peer = inet_ntoa($peer);
-print "Answer: From $peer:$peer_port, To $msg_src [$msg_dst]\n";
-print "Received: TTL $ttl, ", length($buffer), " bytes ",
-    string_from_value($buffer), "\n";
+if ($msg_src && $ttl) {
+    print "Answer: From $peer:$peer_port, To $msg_src [$msg_dst]\n";
+    print "Received: TTL $ttl, ", length($buffer), " bytes ",
+        string_from_value($buffer), "\n";
+} else {
+    # This can happen if we run onder socksify
+    $msg_src // print STDERR "No local addr. Using SOCKS ?\n";
+    $ttl     // print STDERR "No TTL. Using SOCKS ?\n";
+    print "Answer: From $peer:$peer_port, To ???\n";
+    print "Received: TTL ???, ", length($buffer), " bytes ",
+        string_from_value($buffer), "\n";
+}
