@@ -41,6 +41,7 @@ $Data::Dumper::Sortkeys = 1;
 $Data::Dumper::Useqq	= 1;
 
 # Net::Sssssh::Events->verbose(2);
+my $root;
 
 sub object_name {
     my ($object) = @_;
@@ -153,10 +154,12 @@ sub control_reader {
         return;
     }
     if (defined $rc) {
-        print {$state->{OUT}} "<- control: EOF\n";
         $state->{reader} = undef;
         $state->{writer} = undef;
+        $state->{command_in} = "";
         exit;
+        # $root = undef;
+        # return;
         # We could try to reconnect here
     }
     return if $! == EAGAIN || $! == EINTR || $! == EWOULDBLOCK;
@@ -185,7 +188,7 @@ my $control = IO::Socket::INET->new(
     blocking	=> 0) ||
     die "Could not connect to $target->{display}: $@";
 
-my $state = {
+$root = {
     command_in	=> "",
     IN		=> $term->IN  || die("No IN"),
     OUT		=> $term->OUT || die("No OUT"),
@@ -194,22 +197,22 @@ my $state = {
     out		=> "set human=0\n",
 };
 
-print {$state->{OUT}} "Connected to $target->{display}\n";
+print {$root->{OUT}} "Connected to $target->{display}\n";
 
-$state->{IN}->blocking(0);
-$state->{reader_IN} = $state->{IN}->add_read( $state,  \&command_reader);
-$state->{reader} = $state->{socket}->add_read ($state, \&control_reader);
-$state->{writer} = $state->{socket}->add_write($state, \&control_writer);
+$root->{IN}->blocking(0);
+$root->{reader_IN} = $root->{IN}->add_read( $root,  \&command_reader);
+$root->{reader} = $root->{socket}->add_read ($root, \&control_reader);
+$root->{writer} = $root->{socket}->add_write($root, \&control_writer);
 
 # mainloop();
 while (1) {
     my $line = $term->readline($prompt) // last;
-    $state->{command_in} .= "$line\n";
-    command_process($state);
+    $root->{command_in} .= "$line\n";
+    command_process($root);
 }
-$term->write_history($history_file);
 
 END {
     local $?;
+    $term->write_history($history_file);
     $term->rl_deprep_terminal() if $term;
 }
