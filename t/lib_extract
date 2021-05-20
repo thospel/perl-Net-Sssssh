@@ -69,6 +69,11 @@ sub get_body {
     return $code, \@exports;
 }
 
+my @modules = qw(Events Timer Address);
+if (!@ARGV) {
+    print "@modules\n";
+    exit;
+}
 @ARGV == 2 || die "Invalid number of arguments";
 my ($target, $from) = @ARGV;
 ($pre, $lib) = $target =~ m{^lib/((?:[^/]+/)*)(.*)\.pm\z} or
@@ -111,7 +116,8 @@ $code_old
 1;
 EOF
     ;
-$code_new =~ s/\b(Events|Timer|Address)\b/$pre$1/g;
+my $match_modules = join("|", map quotemeta, @modules);
+$code_new =~ s/\b($match_modules)\b/$pre$1/g;
 open(my $fh, ">", $target) || die "Could not create '$target': $^E";
 print $fh $code_new;
 print "Created $target\n";

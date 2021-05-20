@@ -23,7 +23,7 @@
 \bMakeMaker-\d
 \bpm_to_blib\.ts$
 \bpm_to_blib$
-\bblibdirs\.ts$         # 6.18 through 6.25 generated this
+\bblibdirs\.ts$		# 6.18 through 6.25 generated this
 ^[\w-]+-\d+\.\d+\.tar\.gz$
 ^[\w-]+-\d+\.\d+\.ppm$
 ^[\w-]+\.ppd$
@@ -49,14 +49,20 @@
 ^nytprof\.out\.\d+$
 ^MYMETA\.yml$
 ^MYMETA\.json$
-^MYMETA\.json\.lock$
 /\.access\^$
 ^\.access\^$
-^core$
 
-^bl.b\d*$
+^MYMETA\.json\.lock$
 ^bin/test\.pl$
 ^t/bench_timer\.pl$
 \.apk$
-^test_
 ^test\.
+^resolv.*\.conf$
+
+# Ignore more stuff
+^bl.b$
+^test_
+^test\.pl$
+^core$
+^core\.
+^debian/

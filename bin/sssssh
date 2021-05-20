@@ -457,6 +457,11 @@ print "' . $STUFFED . '";
 
     sub add_info {
         my ($name, $fd, $args) = @_;
+
+        # Extremely important!
+        # Without this we would change values through @_ in the add_xxxx caller
+        $#$args = CODE;
+
         ::info("%s(%d, %s) [%s]",
                $name,
                $args->[FD] = $fd,
@@ -471,7 +476,8 @@ print "' . $STUFFED . '";
         add_info("add_read", $fd, \@_) if $verbose > 1;
         croak "Descriptor $fd already selected for read" if $read_refs{$fd};
         vec($read_mask, $fd, 1) = 1;
-        weaken(($read_refs{$fd} = \@_)->[OBJ]);
+        # Cannot use \@_ here. That would weaken OBJ where stored in caller
+        weaken(($read_refs{$fd} = [@_])->[OBJ]);
         ++$nr_events;
         return bless \$fd, "Events::Read";
     }
@@ -481,7 +487,8 @@ print "' . $STUFFED . '";
         add_info("add_read0", $fd, \@_) if $verbose > 1;
         croak "Descriptor $fd already selected for read" if $read_refs{$fd};
         vec($read_mask, $fd, 1) = 1;
-        weaken(($read_refs{$fd} = \@_)->[OBJ]);
+        # Cannot use \@_ here. That would weaken OBJ where stored in caller
+        weaken(($read_refs{$fd} = [@_])->[OBJ]);
         return bless \$fd, "Events::Read0";
     }
 
@@ -490,7 +497,8 @@ print "' . $STUFFED . '";
         add_info("add_write", $fd, \@_) if $verbose > 1;
         croak "Descriptor $fd already selected for write" if $write_refs{$fd};
         vec($write_mask, $fd, 1) = 1;
-        weaken(($write_refs{$fd} = \@_)->[OBJ]);
+        # Cannot use \@_ here. That would weaken OBJ where stored in caller
+        weaken(($write_refs{$fd} = [@_])->[OBJ]);
         ++$nr_events;
         return bless \$fd, "Events::Write";
     }
@@ -500,7 +508,8 @@ print "' . $STUFFED . '";
         add_info("add_write0", $fd, \@_) if $verbose > 1;
         croak "Descriptor $fd already selected for write" if $write_refs{$fd};
         vec($write_mask, $fd, 1) = 1;
-        weaken(($write_refs{$fd} = \@_)->[OBJ]);
+        # Cannot use \@_ here. That would weaken OBJ where stored in caller
+        weaken(($write_refs{$fd} = [@_])->[OBJ]);
         return bless \$fd, "Events::Write0";
     }
 
@@ -509,7 +518,8 @@ print "' . $STUFFED . '";
         add_info("add_error", $fd, \@_) if $verbose > 1;
         croak "Descriptor $fd already selected for error" if $error_refs{$fd};
         vec($error_mask, $fd, 1) = 1;
-        weaken(($error_refs{$fd} = \@_)->[OBJ]);
+        # Cannot use \@_ here. That would weaken OBJ where stored in caller
+        weaken(($error_refs{$fd} = [@_])->[OBJ]);
         ++$nr_events;
         return bless \$fd, "Events::Error";
     }
@@ -519,7 +529,8 @@ print "' . $STUFFED . '";
         add_info("add_error0", $fd, \@_) if $verbose > 1;
         croak "Descriptor $fd already selected for error" if $error_refs{$fd};
         vec($error_mask, $fd, 1) = 1;
-        weaken(($error_refs{$fd} = \@_)->[OBJ]);
+        # Cannot use \@_ here. That would weaken OBJ where stored in caller
+        weaken(($error_refs{$fd} = [@_])->[OBJ]);
         return bless \$fd, "Events::Error0";
     }
 
@@ -791,6 +802,7 @@ sub add0 {
     use constant {
         CLOCK_TYPE_NAME	=> $CLOCK_TYPE_NAME,
         CLOCK_TYPE	=> $CLOCK_TYPE,
+        INFINITY	=> 9**9**9,
 
         INDEX	=> 0,
         TIME	=> 1,
@@ -799,13 +811,6 @@ sub add0 {
         KEEPDEAD=> 4,
         CALLERS	=> 5,
     };
-
-    my @timers = (undef);
-    # @expired must be persistent so no timers get lost if a callback dies
-    my @expired;
-    # Simular for @expired. @immediate contains timeout 0 timers that we don't
-    # even bother to put in @timers
-    my @immediate;
 
     # Exportable
     sub realtime {
@@ -816,6 +821,27 @@ sub add0 {
     sub clocktime : method {
         return clock_gettime(CLOCK_TYPE);
     }
+    BEGIN {
+        # If clocktime() uses realtime, still enforce time never goes backward
+        if ($CLOCK_TYPE_NAME ne "MONOTONIC") {
+            no warnings "redefine";
+            my $last = 1e-9;
+            my $offset = $last-clocktime();
+            *clocktime = sub {
+                my $now = clock_gettime(CLOCK_TYPE) + $offset;
+                return $last = $now if $now >= $last;
+                $offset += $last - $now;
+                return $last;
+            };
+        }
+    }
+
+    my @timers = (undef);
+    # We put timers that go off in @expired. Timers created with immediate()
+    # we don't even bother to put in @expires, they go into @immediate.
+    # Both of these must be persistent in case a callback dies
+    # (in case we catch mainloop() exceptions, otherwise the program just exits)
+    my (@expired, @immediate);
 
     # Timers are kept in a simple binary heap @timers
     # Exportable
@@ -1420,6 +1446,7 @@ use Socket qw(PF_INET SOCK_DGRAM SOCK_STREAM
 use Errno qw(EADDRINUSE EPROTONOSUPPORT EACCES ENOPROTOOPT);
 use POSIX qw(ceil);
 
+# Should probably move this into Address
 sub socket_udp_connected {
     my ($class, $address, $probe) = @_;
 
@@ -1467,7 +1494,6 @@ sub _socket_tcp {
 
     socket(my $socket, PF_INET, SOCK_STREAM, $PROTO_TCP) ||
         die "Could not create TCP socket: $^E";
-    $address ||= $TCP4_ANY;
     if ($listen) {
         setsockopt($socket, SOL_SOCKET, SO_REUSEADDR, 1) ||
             die "Assertion: Could not setsockopt(SOL_SOCKET, SO_REUSEADDR): $^E";
@@ -1564,7 +1590,7 @@ sub defer_accept {
 package Object;
 # Base class of elements in out Object Tree
 # This should make it easy to clean up subtrees by simply deleting the root
-use Scalar::Util qw(weaken);
+use Scalar::Util qw(weaken isweak);
 use Carp qw(croak);
 
 use constant {
@@ -1681,10 +1707,45 @@ sub _on_finish {
     $object->{finished} = DELETED;
 }
 
+use vars qw(@dump_state $dumper);
 sub dump : method {
     my ($object) = @_;
-    local $object->{parent};
-    print STDERR ::Dumper($object);
+
+    print STDERR dumper($object);
+}
+
+sub dumper {
+    local $dumper = Data::Dumper->new(\@_);
+    $dumper->Freezer("freeze");
+    local @dump_state;
+    return $dumper->Dump;
+}
+
+sub Dump1::DESTROY {
+    weaken(${$_[0][0]} = $_[0][1]);
+}
+
+sub Dump0::DESTROY {
+    ${$_[0][0]} = $_[0][1];
+}
+
+sub _dump_save {
+    push @dump_state, bless [\$_[0], $_[0]], isweak($_[0]) ? "Dump1" : "Dump0";
+    $_[0] = $_[1];
+}
+
+sub dump_save {
+    for my $val (@_) {
+        next if ref $val eq "";
+        _dump_save($val, "-- suppressed --");
+    }
+}
+
+sub freeze {
+    my $object = shift;
+
+    push @_, "parent";
+    dump_save(@$object{@_});
 }
 
 sub die : method {
@@ -1960,6 +2021,7 @@ use Scalar::Util qw(weaken);
 
 my $BASE_TIME  = Timer::realtime();
 my $BASE_CLOCK = Timer::clocktime();
+$BASE_CLOCK > 0 || die "Monotone clock $BASE_CLOCK was not positive";
 my $root = 0;
 
 sub new {
@@ -2405,7 +2467,8 @@ package _Stream;
 use vars qw(@ISA);
 @ISA = qw(Connection);
 
-use Errno qw(EINTR EAGAIN EWOULDBLOCK ECONNRESET);
+use Errno qw(EINTR EAGAIN EWOULDBLOCK ECONNRESET EINPROGRESS);
+use Socket qw(SOL_SOCKET SO_ERROR);
 
 # Leave the option open to redirect conn_reset() to eof()
 # If you do don't forget to deactivate events (reader, writer, timeout etc)
@@ -2428,8 +2491,11 @@ sub reader {
     if (!$rc) {
         if (defined $rc) {
             # EOF
+            my $msg = $stream->{peer} ?
+                "EOF from $stream->{peer}{display}" : "EOF";
+            $stream->info("Received $msg") if $verbose > 1;
             $stream->{reader} = undef;
-            $stream->eof($stream->{peer} ? "EOF from $stream->{peer}{display}" : "EOF");
+            $stream->eof($msg);
             # $stream->eof("EOF");
         } else {
             return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
@@ -2470,12 +2536,86 @@ sub writer {
 
     substr($stream->{out}, 0, $rc, "");
     if ($stream->{out} eq "") {
-        $stream->_end_write, return if $stream->{end_write};
-        $stream->{writer}  = undef;
-        $stream->{timeout} = undef;
+        $stream->{end_write} ?
+            $stream->_end_write :
+            $stream->on_empty;
         return;
     }
     $stream->writing();
+}
+
+sub on_empty {
+    my ($stream) = @_;
+
+    $stream->{writer}  = undef;
+    $stream->{timeout} = undef;
+}
+
+sub connect : method {
+    my ($stream) = @_;
+
+    $stream->{peer} || $stream->bug("No peer");
+    $stream->bug("Already unwritable") if $stream->{unwritable};
+    $stream->bug("Already have an input socket")  if $stream->{socket_in};
+    $stream->bug("Already have an output socket") if $stream->{socket_out};
+    $stream->{unwritable} = 1;
+
+    @$stream{qw(local socket_out)} =
+        $stream->socket_tcp($stream->{local} || $TCP4_ANY, 0);
+    if (connect($stream->{socket_out}, $stream->{peer}{packed})) {
+        # Immediate connect
+        $stream->{timeout} = Timer::immediate($stream, sub { shift->on_connect });
+    } elsif ($! == EINPROGRESS || $! == EWOULDBLOCK) {
+        $stream->info("Connecting to '$stream->{peer}{user}' [$stream->{peer}{display}]") if $verbose > 1;
+        $stream->connecting;
+    } else {
+        # Immediate error
+        my $err = $!;
+        $stream->{timeout} = $stream->immediate(sub { shift->on_connect_error($err)});
+    }
+}
+
+sub connect_timeout {
+    shift->on_connect_error($ETIMEDOUT);
+}
+
+sub connected {
+    my ($stream) = @_;
+
+    $stream->{writer} = undef;
+    # on_connect/on_connect_error will set timeout to undef
+    # $stream->{timeout} = undef;
+
+    my $packed = getsockopt($stream->{socket_out}, SOL_SOCKET, SO_ERROR) ||
+        $stream->bug("Could not getsockopt(SOL_SOCKET, SO_ERROR): $^E");
+    my $err = unpack("I", $packed) || ($stream->on_connect, return);
+    $stream->on_connect_error($err = $! = $err);
+}
+
+sub on_connect_error {
+    my ($stream, $err) = @_;
+
+    $stream->{timeout} = undef;
+    $stream->{writer}  = undef;
+    $stream->{socket_out} = undef;
+    # Leave unwritable
+
+    $stream->error("Could not connect to '$stream->{peer}{user}' [$stream->{peer}{display}]: $err");
+}
+
+sub on_connect {
+    my ($stream) = @_;
+
+    $stream->{timeout} = undef;
+
+    my $sockaddr = getsockname($stream->{socket_out}) ||
+        die "Assertion: Could not getsockname: $^E";
+    $stream->{local} = Address->from_packed($sockaddr, "tcp4");
+    $stream->info("Connected from '$stream->{local}{display}' to '$stream->{peer}{user}' [$stream->{peer}{display}]: $!") if $verbose;
+
+    $stream->{socket_in} = $stream->{socket_out};
+    $stream->resume_read("quiet");
+    $stream->writable;
 }
 
 package Stream;
@@ -2491,6 +2631,14 @@ sub writing {
     # This assumes parent == LineProtocol (or Root). Doesn't generalize
     $stream->{writer} ||= Events::add_write($stream->{socket_out}, $stream, \&_Stream::writer);
     $stream->{timeout} = Timer::timer($stream->{parent}{settings}{TIMEOUT}, $stream, \&Connection::timeout);
+}
+
+sub connecting {
+    my ($stream) = @_;
+
+    # This assumes parent == LineProtocol (or Root). Doesn't generalize
+    $stream->{writer} = Events::add_write($stream->{socket_out}, $stream, \&_Stream::connected);
+    $stream->{timeout} = $stream->timer($stream->{parent}{settings}{TIMEOUT_CONNECT}, \&connect_timeout);
 }
 
 sub resume_read {
@@ -2516,90 +2664,20 @@ sub writing {
     $stream->{timeout} = Timer::timer($stream->{parent}{settings}{TIMEOUT}, $stream, \&Connection::timeout);
 }
 
+sub connecting {
+    my ($stream) = @_;
+
+    # This assumes parent == LineProtocol (or Root). Doesn't generalize
+    $stream->{writer} = Events::add_write0($stream->{socket_out}, $stream, \&_Stream::connected);
+    $stream->{timeout} = $stream->timer0($stream->{parent}{settings}{TIMEOUT_CONNECT}, \&connect_timeout);
+}
+
 sub resume_read {
     my $stream = shift;
 
     $stream->info("resume_read") if $verbose > 1 && !shift;
     $stream->{reader} && $stream->die("Read not suspended");
     $stream->{reader} = Events::add_read0($stream->{socket_in}, $stream, \&_Stream::reader);
-}
-
-package Connect;
-# Make a connection, then behave like a Stream
-# Connect->new($parent, $local, $peer, %options)
-use vars qw(@ISA);
-@ISA = qw(Stream);
-
-use Errno qw(EINPROGRESS EWOULDBLOCK);
-use Socket qw(SOL_SOCKET SO_ERROR);
-
-sub new_suspended {
-    my $class  = shift;
-    my $parent = shift;
-    my $local  = shift;
-    my $peer   = shift;
-
-    # pass undef for socket_in.  This avoid reader being started by Stream
-    # pass undef for socket_out. This allows alternate call without connect()
-    my $connect = $class->SUPER::new_suspended(
-        $parent, undef, undef,
-        local	=> $local,
-        peer	=> $peer,
-        @_,
-    );
-    if (!defined $connect->{socket_out} && $peer) {
-        @$connect{qw(local socket_out)} = $connect->socket_tcp($local, 0);
-        $connect->{unwritable} = 1;
-        if (connect($connect->{socket_out}, $peer->{packed})) {
-            # Immediate connect
-            $connect->{timeout} = Timer::immediate($connect, sub { shift->on_connect(0)});
-        } elsif ($! == EINPROGRESS || $! == EWOULDBLOCK) {
-            $connect->info("Connecting to '$peer->{user}' [$peer->{display}]") if $verbose > 1;
-            $connect->{writer} = Events::add_write0($connect->{socket_out}, $connect, \&connected);
-            $connect->{timeout} = $connect->timer($connect->{parent}{settings}{TIMEOUT_CONNECT}, \&connect_timeout);
-        } else {
-            my $err = $!;
-            $connect->{timeout} = $connect->immediate(sub { shift->on_connect($err)});
-        }
-    }
-    return $connect;
-}
-
-sub connect_timeout {
-    my ($connect) = @_;
-
-    $connect->on_connect($ETIMEDOUT);
-}
-
-sub connected {
-    my ($connect) = @_;
-
-    $connect->{writer} = undef;
-    # on_connect will set timeout to undef
-    # $connect->{timeout} = undef;
-
-    my $packed = getsockopt($connect->{socket_out}, SOL_SOCKET, SO_ERROR) ||
-        $connect->bug("Could not getsockopt(SOL_SOCKET, SO_ERROR): $^E");
-    $connect->on_connect(my $err = $! = unpack("I", $packed));
-}
-
-sub on_connect {
-    my ($connect, $err) = @_;
-
-    if ($err) {
-        $connect->error("Could not connect to '$connect->{peer}{user}' [$connect->{peer}{display}]: $err");
-        return;
-    }
-    $connect->{timeout} = undef;
-
-    my $sockaddr = getsockname($connect->{socket_out}) ||
-        die "Assertion: Could not getsockname: $^E";
-    $connect->{local} = Address->from_packed($sockaddr, "tcp4");
-    $connect->info("Connected from '$connect->{local}{display}' to '$connect->{peer}{user}' [$connect->{peer}{display}]: $!") if $verbose;
-
-    $connect->{socket_in} = $connect->{socket_out};
-    $connect->resume_read("quiet");
-    $connect->writable;
 }
 
 package _UDP;
@@ -2716,7 +2794,7 @@ sub writer {
     my ($udp) = @_;
 
     my $data = $udp->{out}[0];
-    if (@$data == 1) {
+    if (ref $data ne "ARRAY") {
         my $rc = ::sendmsg($udp->{socket_out}, $data);
         if (!defined $rc) {
             return if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK;
@@ -3381,10 +3459,9 @@ sub on_accept {
     $remote{display} = "$remote{host}:$remote{port}";
 
     my $forward = TCP::Forward->new(
-        $line, undef, $peer,
+        $line, $local, $peer,
         socket_in	=> $accepted,
         socket_out	=> $accepted,
-        local		=> $local,
         remote		=> \%remote,
     );
     $forward->info("Start forwarding from %s to %s (remote connect may still fail though)", $peer->{display}, $remote{display}) if $verbose > 1;
@@ -3418,10 +3495,9 @@ sub on_accept {
     my $line = $listener->{parent};
 
     my $forward = TCP::Forward->new(
-        $line, undef, $peer,
+        $line, $local, $peer,
         socket_in	=> $accepted,
         socket_out	=> $accepted,
-        local		=> $local,
         remote_id	=> $listener->id,
     );
     $forward->info("Start forwarding from %s to TCP::Remote %d (remote connect may still fail though)", $peer->{display}, $forward->{remote_id}) if $verbose > 1;
@@ -3469,7 +3545,7 @@ package TCP::Forward;
 # Important options: partner, partner_unfinished, socket_in, socket_out, id
 
 use vars qw(@ISA);
-@ISA = qw(Forward Connect);
+@ISA = qw(Forward Stream);
 
 # By default we assume as partner. Override if this is not (immediately) so
 # e.g. Socks::Local has no partner until a SOCKS command is given
@@ -3479,11 +3555,15 @@ sub new_suspended {
     my $local	= shift;
     my $peer	= shift;
 
-    return $class->SUPER::new_suspended(
-        $line, $local, $peer,
+    my $forward = $class->SUPER::new_suspended(
+        $line, undef, undef,
+        local			=> $local,
+        peer			=> $peer,
         partner			=> 1,
         partner_unfinished	=> 1,
         @_);
+    $forward->connect if !defined $forward->{socket_out} && $forward->{peer};
+    return $forward;
 }
 
 package Listener::Socks::Local;
@@ -3508,10 +3588,9 @@ sub on_accept {
     my $line = $listener->{parent};
 
     my $socks = Socks::Local->new(
-        $line, undef, $peer,
+        $line, $local, $peer,
         socket_in	=> $accepted,
         socket_out	=> $accepted,
-        local		=> $local,
     );
     $socks->info("Socks connect from %s", $peer->{display}) if $verbose > 1;
     return $socks;
@@ -3578,7 +3657,7 @@ sub error_response {
     $socks->final_write(@_);
 }
 
-sub eof {
+sub eof : method {
     my $socks = shift;
 
     if ($socks_pipeline && $socks->{remote}) {
@@ -3854,7 +3933,7 @@ sub execute {
         $socks->{partner} = 1;
         $socks->{partner_unfinished} = 1;
 
-        $socks->{state} = $socks_pipeline ? \&TCP::Forward::on_read : \&no_input;
+        $socks->{state} = $socks_pipeline ? \&Forward::on_read : \&no_input;
         if ($socks->{in} ne "") {
             $socks->{state}->($socks, length $socks->{in});
             $socks->{in} = "";
@@ -3971,30 +4050,33 @@ my %SOCKS_STATUS = (
     ETIMEDOUT()		=> 6,
 );
 
-sub on_connect {
+sub on_connect_error {
     my ($connect, $err) = @_;
 
     my $line = $connect->{parent};
-    if ($err) {
-        # Send peer as address. We don't HAVE a local and it can be interesting
-        # to know what we actually tried to connect to
-        $line->write($SOCKS_RESULT,
-                     pack("wwww/a*a*", $connect->{id}, 1,
-                          $SOCKS_STATUS{$err+0} || 1,
-                          @{$connect->{peer}}{qw(type display)}));
-        # This will call error() and cause a finish which must come AFTER write
-        $connect->SUPER::on_connect($err);
-    } else {
-        # This will succeed and must come BEFORE write so we get "local"
-        $connect->SUPER::on_connect(0);
-        # Send "local" as address (as the RFC tells us we must)
-        $line->write($SOCKS_RESULT,
-                     pack("wwxw/a*a*", $connect->{id}, 1,
-                          @{$connect->{local}}{qw(type display)}));
-        $connect->info("Become TCP::Forward[%s] now that connect succeeded",
-                      $connect->id_full) if $verbose > 1;
-        bless $connect, "TCP::Forward"
-    }
+    # Send peer as address. We don't HAVE a local and it can be interesting
+    # to know what we actually tried to connect to
+    $line->write($SOCKS_RESULT,
+                 pack("wwww/a*a*", $connect->{id}, 1,
+                      $SOCKS_STATUS{$err+0} || 1,
+                      @{$connect->{peer}}{qw(type display)}));
+    # This will call error() and cause a finish which must come AFTER write
+    $connect->SUPER::on_connect_error($err);
+}
+
+sub on_connect {
+    my ($connect) = @_;
+
+    my $line = $connect->{parent};
+    # This will succeed and must come BEFORE write so we get "local"
+    $connect->SUPER::on_connect(0);
+    # Send "local" as address (as the RFC tells us we must)
+    $line->write($SOCKS_RESULT,
+                 pack("wwxw/a*a*", $connect->{id}, 1,
+                      @{$connect->{local}}{qw(type display)}));
+    $connect->info("Become TCP::Forward[%s] now that connect succeeded",
+                   $connect->id_full) if $verbose > 1;
+    bless $connect, "TCP::Forward"
 }
 
 package Listener::Socks::Accept;
@@ -4248,18 +4330,26 @@ package Resolver;
 use vars qw(@ISA);
 @ISA = qw(Object);
 
-use Scalar::Util qw(weaken);
+use Scalar::Util qw(weaken looks_like_number);
 use Socket qw(inet_ntoa inet_aton);
 use Errno qw(ENOENT);
 
 use constant {
     INFINITY		=> 9**9**9,
-    # Minimum time to wait between file reloads
-    LOAD_DELAY		=> 1,
-    DNS_TIMEOUT		=> 1,
+    # Minimum time to wait between file checks
+    CHECK_DELAY		=> 1,
     NEGATIVE		=> 10,
-    # Header + (name+type+class) * 4 + (ttl + rdlength) * 3
-    DNS_MIN_RESPONSE	=> 12 + (1+2+2)*4 + (4+2) * 3,
+    # Header + (name+type+class)
+    # (we always send 1 question, so we expect 1 back, otherwise it would be 12)
+    DNS_MIN_RESPONSE	=> 12 + (1+2+2),
+    # Reduce any TTL higher than this
+    TTL_MAX		=> 7*24*60*60,
+    # Empty array for sharing. Would set it to read-only if that was portable
+    ARRAY_EMPTY		=> [],
+    MAX_QUERIES		=> 100,
+    # Maximium number of query ids we remember.
+    MAX_FREE		=> 1000,
+    DNS_TIMEOUT		=> 5,
 
     # stat() fields
     DEV		=> 0,
@@ -4268,16 +4358,27 @@ use constant {
     MTIME	=> 9,
 
     # Response error codes
-    FORMAT_ERROR	=> 1,
-    SERVER_FAILURE	=> 2,
-    NAME_ERROR		=> 3,
-    NOT_IMPLEMENTED	=> 4,
-    REFUSED		=> 5,
+    # https://www.iana.org/assignments/dns-parameters/dns-parameters.xhtml#dns-parameters-6
+    NO_ERROR		=>  0,
+    FORMAT_ERROR	=>  1,
+    SERVER_FAILURE	=>  2,
+    NAME_ERROR		=>  3,
+    NOT_IMPLEMENTED	=>  4,
+    REFUSED		=>  5,
+    BADVERS		=> 16,
+    BADCOOKIE		=> 23,
 
-    # Types
+    # Some EDNS options
+    OPTION_COOKIE	=> 10,
+    OPTION_KEEPALIVE	=> 11,
+    OPTION_EXT_ERROR	=> 15,
+
+    # Some Types
     A		=> 1,
     CNAME	=> 5,
+    PTR		=> 12,
     AAAA	=> 28,
+    OPT		=> 41,
 
     # Classes
     IN		=> 1,
@@ -4287,15 +4388,31 @@ use constant {
     VALUE	=> 1,
     TTL		=> 2,
 
+    # DNS reply sections
+    QUESTION	=> 0,
+    ANSWER	=> 1,
+    AUTHORITIVE	=> 2,
+    ADDITIONAL	=> 3,
+
     # Query Callback
     OBJ		=> 0,
     CODE	=> 1,
     NAME	=> 2,
+    PROBE	=> 3,
+    DATA	=> 4,
 };
 
 use constant {
     STAT_SAME	=> [MTIME, SIZE, DEV, INO],
 };
+
+# MAX_QUERIES + MAX_FREE should be smallish to avoid query id allocation looping
+MAX_QUERIES + MAX_FREE < 2**14 || die "Assertion: Can grow to too many qids";
+
+my @foo;
+sub get_foo {
+    return \$foo[@foo];
+}
 
 sub foo {
     # shift->dump;
@@ -4312,52 +4429,77 @@ sub new {
     my $resolver = $class->SUPER::new(
         $root,
         settings	=> { %{$root->{settings}} },
-        hosts		=> {},
+        hosts		=> {
+            checked	=> -INFINITY,
+        },
         conf		=> {
+            checked	=> -INFINITY,
             # All servers, even if not in current resolv.conf anymore
-            servers	=> {},
+            dns_servers	=> {},
             # All nameserver entries of the current resolv.conf in file order
             nameserver	=> [],
         },
         cache		=> {},
         queries		=> {},
-        last_time	=> 0,
     );
-    $resolver->expire_all;
     weaken($root->{resolver} = $resolver);
 
     # For debugging
-    #$resolver->query(A, "cNAme-test2.hOme.lUNix", $resolver, \&foo);
-    #$resolver->query(A, "cNAme-test4.hOme.lUNix", $resolver, \&foo);
-    #$resolver->query(A, "cname-teST.HOMe.lunix", $resolver, \&foo);
-    #$resolver->query(A, "zzz.oracle.com", $resolver, \&foo);
+    if (0) {
+        $resolver->get_resolv(Timer::clocktime());
+        my $dns_server = $resolver->{conf}{dns_servers}{$resolver->{conf}{nameserver}[0]} || $resolver->bug("No nameserver");
+        $dns_server->tcp($resolver);
+        $resolver->query(get_foo(), A, "cNAme-test2.hOme.lUNix", $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), A, "cNAme-test4.hOme.lUNix", $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), A, "cname-teST.HOMe.lunix", $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), A, "zzz.oracle.com", $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), A, "10.1", $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), A, "naS.Eth", $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), A, "www.XS4all.CoM", $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), PTR, inet_aton("10.253.1.8"), $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), PTR, inet_aton("104.73.50.128"), $resolver, \&foo, __LINE__);
+    }
 
     return $resolver;
 }
 
 sub dispatch {
-    my ($resolver, $query, $type) = @_;
+    my ($resolver, $query) = @_;
 
     $query->{timeout} = undef;
-    while (my $callback = shift @{$query->{callbacks}}) {
-        $callback->[CODE]->($callback->[OBJ] || next, $query->{values}, $callback->[NAME], $type, @$query{qw(official aliases expires)});
+    while (@{$query->{callbacks}}) {
+        my $callback = shift @{$query->{callbacks}} || next;
+        # User must NEVER alter $query, but can access attributes
+        # type, official, aliases and expires
+        $callback->[CODE]->($callback->[OBJ] || next, $query->{values}, $callback->[DATA], $callback->[NAME], $query);
     }
+    $query->{probe} = undef;
 }
 
 # Chase CNAMEs for the answer
 # We assume $type != CNAME, but something like A or AAAA
 sub chase {
-    my ($resolver, $now, $query, $type, $name, $in_callback) = @_;
+    my ($resolver, $now, $query) = @_;
 
     if ($query->{expires} < $now) {
         # Previous answer expired.
         # But maybe the cache was updated and we can find the new answer
         my $cache = $resolver->{cache};
-        my ($values, $official, @aliases, %seen);
+        my $type = $query->{type};
+
+        # If the chase splits due to an entry with 2 (or more) CNAMES
+        # (invalid but could be returned by a name server) and the some point
+        # to an unexpired negative records while at others point to unexpired
+        # real results this would behave as if the negative CNAME chains didn't
+        # exist and you'd get a result comprised of the valid values.
+        # We use the $negative flag to detect dangling CNAME's and invalidate
+
+        my ($values, $official, @aliases, %seen, $negative, $not_first);
         my $expires = INFINITY;
-        my @todo = $name;
+        my @todo = $query->{name_low};
         while (@todo) {
-            my $name = lc shift @todo;
+            my $name = shift @todo;
+            $name =~ s/([A-Z])/\l$1/g;
             # CNAME loops can only be inserted as a whole
             # (otherwise we would have set a negative placeholder for the tail)
             # So this implies some nameserver sent us a CNAME loop
@@ -4378,12 +4520,16 @@ sub chase {
                         return 0;
                     }
                 }
-                $official = $types->{$type}{official} unless defined $official;
-                push @$values, @{$types->{$type}{values}} if
-                    $types->{$type}{values};
-            } elsif ($types->{+CNAME}) {
-                if ($types->{+CNAME}{expires} < $expires) {
-                    $expires = $types->{+CNAME}{expires};
+                if ($types->{$type}{values}) {
+                    $official = $types->{$type}{official} unless $negative || $not_first;
+                    push @$values, @{$types->{$type}{values}}
+                } else {
+                    $negative ||= 1;
+                }
+                $not_first ||= 1;
+            } elsif ($types->{CNAME()}) {
+                if ($types->{CNAME()}{expires} < $expires) {
+                    $expires = $types->{CNAME()}{expires};
                     if ($expires < $now) {
                         # If an entry has a CNAME it will be the only entry, so
                         # we can drop the whole name
@@ -4392,126 +4538,238 @@ sub chase {
                         return 0;
                     }
                 }
-                push @aliases, $types->{+CNAME}{official} unless defined $official;
-                unshift @todo, @{$types->{+CNAME}{values}} if
-                    $types->{+CNAME}{values};
+                if ($types->{CNAME()}{values}) {
+                    push @aliases, $types->{CNAME()}{official};
+                    unshift @todo, @{$types->{CNAME()}{values}}
+                } else {
+                    $negative ||= 1;
+                }
             } else {
                 return 0;
             }
         }
 
+        $values = undef if $negative;
         $resolver->bug("Empty result list") if $values && !@$values;
+
         $query->{values}   = $values;
         $query->{expires}  = $expires;
         $query->{official} = $official;
         $query->{aliases}  = \@aliases;
     }
-    if ($in_callback) {
-        $resolver->dispatch($query, $type);
-    } else {
-        $query->{timeout} = $resolver->immediate(
-            sub { shift->dispatch($query, $type) });
+    if ($verbose > 1) {
+        if ($query->{values}) {
+            my @values;
+            if ($query->{type} == A) {
+                @values = map inet_ntoa($_), @{$query->{values}};
+            } else {
+                @values = map ::display($_), @{$query->{values}};
+            }
+            $resolver->info("Resolved '$query->{name_low}' to @values");
+        } else {
+            $resolver->info("Could not resolve '$query->{name_low}'");
+        }
     }
     return 1;
 }
 
-sub expire_all {
-    my $resolver = shift;
+# Now figure out how to send the request
+# $query is completely set up, this code should consider it read-only
+sub queue {
+    my ($resolver, $now, $query) = @_;
 
-    $resolver->info("Time went backward. Invalidating DNS cache") if $verbose > 1 && @_;
+    # For now we always take the first server.
+    # MUST implement a fallback strategy soon..
+    my $dns_packed = $resolver->{conf}{nameserver}[0] ||
+        $resolver->bug("No active DNS servers not supported");
+    my $dns_server = $resolver->{conf}{dns_servers}{$dns_packed} ||
+        $resolver->bug("Could not find an active DNS server");
 
-    $resolver->{last_time} = @_ ? shift : -INFINITY;
+    # Add Checks (length, multiple ., . at start etc), add search domains
+    # Improve this at some point
 
-    %{$resolver->{cache}} = ();
-    for my $types (values %{$resolver->{queries}}) {
-        for my $query (values %$types) {
-            $query->{expires} = -INFINITY;
-        }
+    # Randomly permute case in request
+    my $name_sent = $query->{name_low};
+    if ($dns_server->{permute_case}) {
+        my $bits = 0;
+        my $rand;
+        $name_sent =~ s{([a-z])}{
+            if (--$bits < 0) {
+                $rand = rand(1 << 31);
+                $bits = 30;
+            }
+            my $bit = $rand & 1;
+            $rand >>= 1;
+            $bit ? $1 : uc $1;
+        }eg;
     }
-    $resolver->{conf}{loaded}  = -INFINITY;
-    $resolver->{hosts}{loaded} = -INFINITY;
-    $resolver->{conf}{stat}   = undef;
+
+    my $qids = $dns_server->{qids};
+    die "Way too many outstanding queries" if keys %$qids > MAX_QUERIES;
+    my $qid = int rand(1 << 16);
+    $qid = int rand(1 << 16) while vec($dns_server->{qids_bits}, $qid, 1);
+    vec($dns_server->{qids_bits}, $qid, 1) = 1;
+
+    my $packet = pack("n3x4n",
+                      $qid,
+                      1 << 8,	# Recursion
+                      1,	# Nr questions
+                      $dns_server->{edns},	# Nr additional
+                  );
+    my @labels = split /\./, $name_sent;
+    $packet .= pack("(C/a*)*x", @labels);
+    $packet .= pack("nn", $query->{type}, Resolver::IN);
+    my $cookie_client = "";
+    if ($dns_server->{edns}) {
+        $cookie_client = $dns_server->cookie_client($now);
+        $qids->{$qid}{cookie} = $cookie_client;
+        my $options = pack("(nn/a*)*",
+                           OPTION_COOKIE() => $cookie_client . $dns_server->{cookie_server});
+        $options .= pack("nx2", OPTION_KEEPALIVE) if
+            $dns_server->{tcp} && $dns_server->{tcp}{nr_sent} == 0;
+        $packet .= pack("xn2x4n/a*",
+                        Resolver::OPT,
+                        $dns_server->{max_udp_size},
+                        $options);
+    }
+
+    $qids->{$qid} = {
+        query		=> $query,
+        tcp		=> $dns_server->{tcp} ? 1 : 0,
+        name_sent	=> $name_sent,
+        # Must remember cookie we sent since it can have changed at response
+        cookie_client	=> $cookie_client,
+        cookie_server	=> $dns_server->{cookie_server},
+        sent		=> $now,
+        timeout		=>
+        # $dns_server->timeout0() would (incorrectly) set $dns_server->{timeout}
+        Timer::timer0(DNS_TIMEOUT, $dns_server,
+                      sub {shift->dns_timeout($qid)}),
+    };
+    $dns_server->{sent} = $now;
+
+    if ($dns_server->{tcp}) {
+        $resolver->bug("Already had qid $qid in TCP queue") if
+            $dns_server->{qids_tcp}{$qid}++;
+        $dns_server->{tcp}->write($packet);
+    } else {
+        $resolver->{dns}->write($dns_server, $packet);
+    }
+    return $qid;
 }
 
 # In principle this could supports multiple questions in one query
 # In practice no DNS resolver supports this
 # See https://stackoverflow.com/a/4083071/3042552
 sub query {
-    my ($resolver, $type, $name, $object, $code, $in_callback) = @_;
+    my ($resolver, $handle_ref, $type, $name, $object, $code, $data) = @_;
 
     defined $name || $resolver->bug("No query");
-    my $lc_name = lc $name;
-
-    # Store $name in callback to preserve case
-    my $callback = [$object, $code, $name];
-    weaken($callback->[OBJ]);
 
     my $now = Timer::clocktime();
     $resolver->get_hosts($now);
 
-    my $query = $resolver->{queries}{$lc_name}{$type} ||= {
-        qids		=> {},
+    if ($type == A) {
+        if ($name =~ /^ (?:0x)? [0-9]+ (?: \. (?:0x)?  [0-9]+){1,3} \z/ix) {
+            $$handle_ref = undef;
+            my $addr = inet_aton($name);
+            $code->($object, $addr ? [$addr] : undef, $data, $name);
+            return 1;
+        }
+        if (my $addrs = $resolver->{hosts}{forward}{lc $name}[0]) {
+            $$handle_ref = undef;
+            $code->($object, $addrs, $data, $name);
+            return 1;
+        }
+        # At some point maybe add punycode support here
+    } elsif ($type == PTR) {
+        my $n = join("." =>
+                     reverse(split /\./ => inet_ntoa($name)), "in-addr.arpa");
+        if (my $names = $resolver->{hosts}{reverse}{$name}) {
+            $$handle_ref = undef;
+            $code->($object, $names, $data, $n);
+            return 1;
+        }
+        $name = $n;
+    }
+    my $name_low = $name;
+    $name_low =~ s/([A-Z])/\l$1/g;
+
+    my $query = $resolver->{queries}{$name_low}{$type} ||= {
+        # The original case is preserved in the callbacks
+        name_low	=> $name_low,
+        type		=> $type,
         values		=> undef,
         expires		=> -INFINITY,	# Is also a negative expires
-        timeout		=> undef,
+        pending		=> undef,
+        name_servers	=> {},
+        probe		=> undef,
         callbacks	=> [],
     };
-    push @{$query->{callbacks}}, $callback;
-    return if $query->{timeout};
 
-    # First try to look in the cache
-    if ($now >= $resolver->{last_time}) {
-        return if $resolver->chase($now, $query, $type, $name, $in_callback);
-    } else {
-        # We have no idea what previous times mean now.
-        $resolver->expire_all($now);
+    # Check if we have a cached answer
+    # If not, see if we can construct an answer (unlikely but possible)
+    if ($now <= $query->{expires} || $resolver->chase($now, $query)) {
+        $$handle_ref = undef;
+        $code->($object, $query->{values}, $data, $name, $query);
+        return 1;
     }
 
+    # We didn't get a definitive answer from the cache.
+    # We will have to wait for the result of a DNS query
+
+    # Perl tracks if any callbacks are left
+    if (!$query->{probe}) {
+        weaken($query->{probe} = \my $a);
+        @{$query->{callbacks}} = ();
+    }
+    # Construct a handle to indicate interest in an answer
+    # Store $name in callback (to preserve case)
+    my $callback = [$object, $code, $name, $query->{probe}, $data];
+    weaken($callback->[OBJ]);
+    # Push weakly. After this point we always return 0
+    weaken($query->{callbacks}[@{$query->{callbacks}}] = $callback);
+    $$handle_ref = $callback;
+
+    # Immediately return if a DNS query is already running
+    return 0 if defined $query->{pending};
+
+    # We need to initiate a DNS query
+    # Make sure we have the most recent DNS configuration
     $resolver->get_resolv($now);
-    # For now we always take the first server. MUST implement a fallback strategy
-    my $active = $resolver->{conf}{nameserver}[0] ||
-        $resolver->bug("No active servers not supported");
-    my $server = $resolver->{conf}{servers}{$active} ||
-        $resolver->bug("Could not find active nameserver");
-
-    # Add Checks (length, multiple ., . at start etc), add search domains
-    # Improve this at some point
-    die "Too many qids" if keys %{$query->{qids}} > 1 >> 15;
-    my $qid = int rand(1 << 16);
-    $qid = int rand(1 << 16) while $query->{qids}{$qid};
-    $query->{qids}{$qid} = {
-        sent	=> Timer::clocktime(),
-        server	=> $server,
-    };
-    my $packet = pack("n3x6",
-                      $qid,
-                      1 << 8,	# Recursion
-                      1,		# Nr questions
-                  );
-    my @labels = split /\./, $name;
-    $packet .= pack("(C/a*)*x", @labels);
-    $packet .= pack("nn", $type, IN);
-    my $dns = $resolver->{dns};
-    $dns || weaken($resolver->{dns} = $dns = DNS::UDP->new($resolver));
-
-    $dns->write($server, $packet);
-    $query->{timeout} = Timer::timer0(DNS_TIMEOUT, $resolver, sub { shift->dns_timeout($type, $name) });
+    $query->{pending} = $now;
+    $resolver->queue($now, $query);
+    return 0;
 }
 
 # This must become a lot more robust. Most dies should be handled
 sub response {
-    my ($resolver, $from, $now, $bufref, $in_callback) = @_;
-
-    # First invalidate the cache if the clock moved back
-    $resolver->expire_all($now) if $now < $resolver->{last_time};
+    my ($resolver, $dns_server, $now, $bufref, $tcp) = @_;
 
     my $response = $$bufref;
     my $rlen = length $response;
     if ($rlen < DNS_MIN_RESPONSE) {
-        $resolver->info("Invalid response: Too short") if $verbose > 1;
+        $resolver->info("Invalid DNS response: Too short") if $verbose > 1;
         return;
     }
     my ($qid, $flags, @counts) = unpack("n6", $response);
+
+    # Find the query. Be paranoid about spoofing
+    my $server_data = $dns_server->{qids}{$qid};
+    if (!$server_data) {
+        $resolver->info(
+            vec($dns_server->{qids_bits}, $qid, 1) ?
+            "Response from '$dns_server->{display}' with unknown query id '$qid'" :
+            "Duplicate response from '$dns_server->{display}' with query id '$qid'") if $verbose > 1;
+        return;
+    }
+    if ($server_data->{tcp} != $tcp) {
+        $resolver->info("Response tcp=$tcp from '$dns_server->{display}' for query id $qid sent with tcp=$server_data->{tcp}") if $verbose > 1;
+        return;
+    }
+    my $query = $server_data->{query} ||
+        $resolver->bug("No query in server_data");
+
     if ($counts[0] != 1) {
         $resolver->info("%s questions in response, but I only send queries with 1 question", $counts[0] ? "Multiple" : "No") if $verbose > 1;
         return;
@@ -4519,7 +4777,7 @@ sub response {
     # Check that QR=1, OPCODE=0, RD=1, Z=0
     ($flags & 0b1111100101110000) == 0b1000000100000000 || return;
     $flags & 1 << 8 ||
-        die "Nameserver $from->{host} does not support recursion";
+        die "Nameserver $dns_server->{host} does not support recursion";
     die "Answer truncated" if $flags & 1 << 9;
     my $authorative = $flags >> 10 & 1;
     my $rcode = $flags & 0b1111;
@@ -4562,29 +4820,30 @@ sub response {
         return $name;
     };
 
-    my (@response, %results, $query, $qtype, $qname);
+    my $qtype = $query->{type};
+    my $trusted = 0;
+    my (@response, %results, $edns);
     eval {
         for my $section (0 .. $#counts) {
             push @response, \my @rr;
             for my $i (1..$counts[$section]) {
                 my %rr = (name => $get_name->());
+                ($rr{name_low} = $rr{name}) =~ s/([A-Z])/\l$1/g;
                 push @rr, \%rr;
-                if ($section == 0) {
+                if ($section == QUESTION) {
+                    $server_data->{name_sent} eq $rr{name} ||
+                        die "Asked for '$server_data->{name_sent}', got '$rr{name}'\n";
+
                     die "Truncated response\n" if $pos + 4 > $rlen;
                     @rr{qw(type class)} = unpack("nn", substr($response, $pos, 4));
                     $pos += 4;
                     $rr{class} == IN ||
                         die "I did not ask for class '$rr{class}'\n";
-                    $qtype = $rr{type};
-                    $qname = $rr{name};
-                    # Find the query
-                    $query = ($resolver->{queries}{lc $qname} || {})->{$qtype} ||
-                        die "Response but no $qtype query pending for '$qname'\n";
-                    my $qid_data = $query->{qids}{$qid} ||
-                        die "Response to $qtype query for '$qname' but I never sent id $qid\n";
-                    $qid_data->{server}{packed} eq $from->{packed} ||
-                        die "Type $qtype query for '$qname' was sent to $qid_data->{server}{display} but got response from $from->{display}\n";
-                    delete $query->{qids}{$qid};
+
+                    # Reply is at least somewhat trusted. It came from the
+                    # right server with the right qid with the right class with
+                    # the right case
+                    $trusted = 1;
                     next;
                 }
 
@@ -4594,73 +4853,165 @@ sub response {
                 die "Truncated response\n" if $pos+$rdlength > $rlen;
                 $rr{rdata} = substr($response, $pos, $rdlength);
                 $pos += $rdlength;
-                $rr{class} == IN || next;
+                if ($rr{type} == OPT && $section == ADDITIONAL) {
+                    die "Multiple EDNS OPT types\n" if $edns;
+                    delete $rr{name} eq "" || die "Non empty name in EDNS\n";
+                    $edns = \%rr;
+                    $rr{udp_size} = delete $rr{class};
+                    my $ttl = delete $rr{ttl};
+                    $rcode |= $ttl >> 20 & 0xff0;
+                    $rr{version} = $ttl >> 16 & 0xff;
+                    $rr{dnssec_ok} = $ttl >> 15 & 1;
+                    $rr{Z} = $ttl & 0x7fff;
+                    my $rdata = delete $rr{rdata};
+                    $rr{options} = \my %options;
+                    while ($rdata ne "") {
+                        # Errors here indicate a bad server (or spoofer)
+                        length $rdata >= 4 || die "Truncated EDNS value\n";
+                        my ($code, $len) = unpack("nn", substr($rdata, 0, 4, ""));
+                        # Duplicates aren't forbidden really.
+                        # The cookie RFC says only the first occurance counts
+                        # That is the only option we care about, so skip extras
+                        next if exists $options{$code};
+                        length $rdata >= $len  || die "Truncated EDNS value\n";
+                        $options{$code} = substr($rdata, 0, $len, "");
+                    }
+                } elsif ($rr{class} != IN) {
+                    die "Type $rr{type} Non class IN response\n" if $section == ANSWER;
+                    next;
+                }
 
-                if ($rr{type} == CNAME) {
+                if ($rr{type} == CNAME || $rr{type} == PTR) {
                     my $p = $pos;
                     $pos -= $rdlength;
                     $rr{rdata} = $get_name->();
+                    ($rr{rdata_low} = $rr{rdata}) =~ s/([A-Z])/\l$1/g if
+                        $rr{type} == CNAME;
                     $p == $pos || die "inconsistent CNAME size\n";
                 }
-                push @{$results{lc $rr{name}}{$rr{type}}}, \%rr if
-                    $section == 1 && ($rr{type} == $qtype || $rr{type} == CNAME);
+                push @{$results{$rr{name_low}}{$rr{type}}}, \%rr if
+                    $section == ANSWER && ($rr{type} == $qtype || $rr{type} == CNAME);
             }
         }
         $pos == $rlen || die "Spurious response bytes\n";
+
+        # How much do we trust the response ?
+        $trusted || return;
+
+        $dns_server->{edns} ||
+            $resolver->bug("Non EDNS requests not implemented (yet)");
+        $edns || die "Non EDNS response not implemented (yet)\n";
+        my $cookie_server = $edns->{options}{OPTION_COOKIE()} ||
+            die "Non cookie EDSN response not implemented (yet)\n";
+
+        # Server does cookies. Trust must now come from cookie
+        $trusted = 0;
+
+        length $cookie_server >= 16 || die "Cookie response too short\n";
+        length $cookie_server <= 49 || die "Cookie response too long\n";
+        my $cookie_client = substr($cookie_server, 0, 8, "");
+        $cookie_client eq $server_data->{cookie_client} || return;
+
+        # My cookie was in the reply. We trust the sender enough for cookies
+        $trusted = 1;
+
+        # But if our cookie rolled over don't try to update the server cookie
+        $cookie_client eq $dns_server->{cookie_client} || return;
+
+        # If the response matches the request server cookie we don't update
+        # (this avoids out of order replies reverting a new server cookie
+        return if $cookie_server eq $server_data->{cookie_server};
+        # No need for update if we got a consistent server cookie
+        # (if it is different it is because we did an update in the mean time
+        # which itself must have been from a devergent cookie)
+        return if $cookie_server eq $dns_server->{cookie_server};
+
+        # We got an inconsistent server cookie.
+        $resolver->info("Change DNS server '%s' cookie from '%s' to '%s'",
+                        $dns_server->{display},
+                        unpack("H*", $dns_server->{cookie_server}),
+                        unpack("H*", $cookie_server));
+        $dns_server->{cookie_server} = $cookie_server;
     };
+
     if ($@) {
-        $resolver->info($@) if $verbose > 1;
+        my $err = "Type $qtype DNS query for '$query->{name_low}': $@";
+        # Need to do more intelligent stuff if the response got positively
+        # matched to a our query
+        die $err if $trusted;
+        $resolver->info($err) if $verbose > 1;
         return;
     }
+    $trusted || $resolver->bug("Untrusted without error");
+
+    $dns_server->{received} = $now;
+    delete $dns_server->{qids}{$qid};
+    vec($dns_server->{qids_bits}, shift @{$dns_server->{qids_free}}, 1) = 0 if
+        push(@{$dns_server->{qids_free}}, $qid) > MAX_FREE;
+    if ($tcp) {
+        my $tcp_connection = $dns_server->{tcp} ||
+            $resolver->bug("TCP answer without TCP connection");
+        if (my $keepalive = $edns->{options}{OPTION_KEEPALIVE()}) {
+            if (length $keepalive == 2) {
+                $tcp_connection->{keepalive} = unpack("n", $keepalive) / 10;
+                $resolver->info("Set TCP idle timeout to %.1fs", $tcp_connection->{keepalive}) if $verbose > 1;
+            }
+        }
+        delete $dns_server->{qids_tcp}{$qid} ||
+            $resolver->bug("Qid $qid was not on the TCP queue");
+        %{$dns_server->{qids_tcp}} || $tcp_connection->idle;
+    }
+    $query->{pending} = undef;
 
     if ($rcode && $rcode != NAME_ERROR) {
         # Start doing more intelligent things here...
-        die "Error $rcode from Nameserver $from->{host}: $rcode";
+        die "Unhandled error code from DNS server $dns_server->{display}: $rcode";
     }
 
     # Packet is processed. Add result to cache
     my $error = 0;
-    for my $name (keys %results) {
-        my ($type, @values) = keys %{$results{$name}};
+    for my $name_low (keys %results) {
+        my ($type, @values) = keys %{$results{$name_low}};
         if (@values) {
             # Due to program logic @values = 1 ($qtype and CNAME in some order)
             @values == 1 &&
                 ($type == CNAME  && $values[0] == $qtype ||
                  $type == $qtype && $values[0] == CNAME) ||
-                     $resolver->bug("Type $qtype query for '$name' returned impossible multiple result types: $type @values");
+                     $resolver->bug("Type $qtype query for '$name_low' returned impossible multiple result types: $type @values");
             # Getting her is not a program bug, but a DNS server giving at least
             # a combined CNAME and $qtype response (already dropped extras)
-            die "Type $qtype query for '$name' returned a result AND a CNAME";
+            die "Type $qtype query for '$name_low' returned a result AND a CNAME";
         }
-        my $ttl = INFINITY;
-        for my $rr (@{$results{$name}{$type}}) {
+        my $ttl = TTL_MAX;
+        for my $rr (@{$results{$name_low}{$type}}) {
             # All these TTLs probable should be the same
             $ttl = $rr->{ttl} if $rr->{ttl} < $ttl;
             push @values, $rr->{rdata};
-            if ($type == CNAME && !$results{lc $rr->{rdata}}) {
+            if ($type == CNAME && !$results{$rr->{rdata_low}}) {
                 $error ||= NAME_ERROR;
-                delete $resolver->{cache}{lc $rr->{rdata}}{+CNAME};
-                my $cache = $resolver->{cache}{lc $rr->{rdata}}{$type} ||= {};
+                delete $resolver->{cache}{$rr->{rdata_low}}{CNAME()};
+                my $cache = $resolver->{cache}{$rr->{rdata_low}}{$type} ||= {};
                 $cache->{expires} = $now + NEGATIVE;
                 $cache->{values} = undef;
             }
         }
-        my $base = $resolver->{cache}{lc $name} ||= {};
-        my $cname = delete $base->{+CNAME};
+        my $base = $resolver->{cache}{$name_low} ||= {};
+        my $cname = delete $base->{CNAME()};
         if ($type == CNAME) {
             # Clean up all other entries and re-attach the cname
             %$base = ();
-            $base->{+CNAME} = $cname;
+            $base->{CNAME()} = $cname;
         }
         my $cache = $base->{$type} ||= {};
         $cache->{values} = \@values;
         $cache->{expires} = $now + $ttl;
-        $cache->{official} = $results{$name}{$type}[0]{name};
+        $cache->{official} = $results{$name_low}{$type}[0]{name};
     }
-    if (!$results{lc $qname}) {
+
+    if (!$results{$query->{name_low}}) {
         $error ||= NAME_ERROR;
-        delete $resolver->{cache}{lc $qname}{+CNAME};
-        my $cache = $resolver->{cache}{lc $qname}{$qtype} ||= {};
+        delete $resolver->{cache}{$query->{name_low}}{CNAME()};
+        my $cache = $resolver->{cache}{$query->{name_low}}{$qtype} ||= {};
         $cache->{expires} = $now + NEGATIVE;
         $cache->{values} = undef;
     }
@@ -4669,88 +5020,153 @@ sub response {
         $resolver->bug("Expected response code $error but got $rcode");
     };
 
-    $resolver->chase($now, $query, $qtype, $qname, $in_callback) ||
-        $resolver->bug("No chase result for response just entered in the cache");
-    $resolver->dispatch($query, $qtype);
+    $resolver->chase($now, $query) ||
+        $resolver->bug("No chase result for response I just entered in the cache");
+    $resolver->dispatch($query);
 }
 
 sub get_resolv {
-    my $resolver = shift;
+    my ($resolver, $now) = @_;
 
-    eval { $resolver->_get_resolv(@_) };
+    return if $now <= $resolver->{conf}{checked} + CHECK_DELAY;
+    my $conf = $resolver->{conf};
+    $conf->{checked} = $now;
+
+    eval { $resolver->_get_resolv };
     if ($@) {
-        die $@ unless $resolver->{conf}{stat};
-        # Should probably be rate limited (already implicitely by LOAD_DELAY)
+        die $@ unless $conf->{stat};
+        # Should probably be rate limited (already implicitely by CHECK_DELAY)
         $@ =~ s/\.?\s*\z//;
         $resolver->info("File '$resolv_file': $@. Keep using the existing resolver configuration") if $verbose;
     }
 }
 
 sub _get_resolv {
-    my ($resolver, $now) = @_;
+    my ($resolver) = @_;
 
-    return if $now < $resolver->{conf}{loaded};
-    if ($resolver->{conf}{stat}) {
+    my $conf = $resolver->{conf};
+    if ($conf->{stat}) {
         my @stat = stat($resolv_file) or die "Could not stat: $^E";
-        return if "@stat[@{+STAT_SAME}]" eq "@{$resolver->{conf}{stat}}[@{+STAT_SAME}]";
+        return if "@stat[@{STAT_SAME()}]" eq "@{$conf->{stat}}[@{STAT_SAME()}]";
     }
 
     # This part should be rarely executed (often only once)
+
+    # If we get here we plan to a DNS query, so we need a socket
+    $resolver->{dns} || weaken($resolver->{dns} = DNS::UDP->new($resolver));
+
     open(my $fh, "<", $resolv_file) || die "Could not open: $^E";
-    my (@servers, %servers);
+    my (@nameservers, %dns_servers, @search, @domain);
+    my @options = (
+        # These are the linux defaults
+        "ndots:1",
+        "timeout:5",
+        "attempts:2",
+    );
     local $_;
     while (<$fh>) {
-        my ($ip, $port) =
-            /^ \s* nameserver \s+
-             ( [0-9]{1,3} (?:\.[0-9]{1,3}){3} )
+        next if /^\s*[#;]/;
+        s/\s+\z//;
+        s/^\s+//;
+        if (my ($ip, $port) =
+            /^ nameserver \s+
+             # ( (?:0x)? [0-9]+ (?: \. (?:0x)?  [0-9]+){1,3} )
+             (\S*)
              (?::([0-9]+))?
-             \s* \z/x or next;
-        $port ||= 53;
-        # Will do no real resolving since we have a numeric value
-        my $server = Address->parse("$ip:$port", "nameserver", to => "udp4", resolve => 1);
-        if ($servers{$server->{packed}}) {
-            $resolver->info("Duplicate nameserver '$server->{display}'") if $verbose;
-            next;
+             \z/ix) {
+            $port ||= 53;
+            # Will do no real resolving since we have a numeric value
+            my $dns_server = DnsServer->parse("$ip:$port", "nameserver",
+                                               to => "udp4", resolve => 1);
+            if ($dns_servers{$dns_server->{packed}}) {
+                $resolver->info("Duplicate nameserver '$dns_server->{display}'") if $verbose;
+                next;
+            }
+            $dns_servers{$dns_server->{packed}} = $dns_server;
+            push @nameservers, $dns_server->{packed};
+        } elsif (/^ search \s+ (.*\S)/ix) {
+            push @search, split " ", $1;
+        } elsif (/^ domain \s+ (.*\S)/ix) {
+            push @domain, split " ", $1;
+        } elsif (/^ options \s+ (.*\S)/ix) {
+            push @options, split " ", $1;
         }
-        $servers{$server->{packed}} = $server;
-        push @servers, $server->{packed};
     }
-    @servers || die "No IPv4 nameservers";
+    @nameservers || die "No IPv4 DNS servers in file '$resolv_file'";
+
+    if (defined $ENV{LOCALDOMAIN}) {
+        @search = split " ", $ENV{LOCALDOMAIN};
+    } else {
+        @search = @domain if !@search;
+    }
+    my %seen;
+    @search = grep !$seen{lc()}++, @search;
+
+    push @options, split " ", $ENV{RES_OPTIONS} if defined $ENV{RES_OPTIONS};
+    my %options;
+    for my $option (@options) {
+        my ($o, $rest) = split /:/, $option, 2;
+        if (defined $rest) {
+            $options{$o} = looks_like_number($rest) ? $rest+0 : 0;
+        } else {
+            $options{$o} = 1;
+        }
+    }
+    # Linux limits
+    $options{ndots}    = 15 if $options{ndots}    > 15;
+    $options{timeout}  = 30 if $options{timeout}  > 30;
+    $options{attempts} =  5 if $options{attempts} >  5;
 
     my @stat = stat($fh) or die "Could not stat open file: $^E";
-    $resolver->info("Loaded named file '$resolv_file'") if
-        $verbose > 1;
+
     # From here on we cannot fail anymore
-    my $conf = $resolver->{conf};
-    $conf->{servers}{$_}{nameserver} = 0 for @{$conf->{nameserver}};
-    $conf->{nameserver} = \@servers;
-    for my $server (values %servers) {
-        $conf->{servers}{$server->{packed}} ||= $server;
-        $conf->{servers}{$server->{packed}}{nameserver} = 1;
+    for my $nameserver (@{$conf->{nameserver}}) {
+        my $dns_server = $conf->{dns_servers}{$nameserver} ||
+            $resolver->bug("Active nameserver not in list");
+        next if $dns_servers{$nameserver};
+        if (%{$dns_server->{qids}}) {
+            # Old DNS servers remain in the list if they have pending requests
+            $dns_server->{nameserver} = 0
+        } else {
+            delete $conf->{dns_servers}{$nameserver};
+        }
     }
+    $conf->{nameserver} = \@nameservers;
+    for my $nameserver (@nameservers) {
+        next if $conf->{dns_servers}{$nameserver};
+        $dns_servers{$nameserver}->init;
+        $conf->{dns_servers}{$nameserver} = $dns_servers{$nameserver};
+    }
+
+    $conf->{search} = \@search;
+    $conf->{options} = \%options;
+    $conf->{checked} = INFINITY if $options{"no-reload"};
     $conf->{stat} = \@stat;
-    $conf->{loaded} = $now;
+
+    $resolver->info("Loaded named file '$resolv_file'") if $verbose > 1;
 }
 
 sub get_hosts {
-    my $resolver = shift;
+    my ($resolver, $now) = @_;
 
-    eval { $resolver->_get_hosts(@_) };
+    return if $now <= $resolver->{hosts}{checked} + CHECK_DELAY;
+    $resolver->{hosts}{checked} = $now;
+
+    eval { $resolver->_get_hosts };
     if ($@) {
         die $@ unless $resolver->{hosts}{stat};
-        # Should probably be rate limited (already implicitely by LOAD_DELAY)
+        # Should probably be rate limited (already implicitely by CHECK_DELAY)
         $@ =~ s/\.?\s*\z//;
         $resolver->info("File '$hosts_file': $@. Keep using the existing hosts file") if $verbose;
     }
 }
 
 sub _get_hosts {
-    my ($resolver, $now) = @_;
+    my ($resolver) = @_;
 
-    return if $now < $resolver->{hosts}{loaded};
     if ($resolver->{hosts}{stat}) {
         my @stat = stat($hosts_file) or die "Could not stat: $^E";
-        return if "@stat[@{+STAT_SAME}]" eq "@{$resolver->{hosts}{stat}}[@{+STAT_SAME}]";
+        return if "@stat[@{STAT_SAME()}]" eq "@{$resolver->{hosts}{stat}}[@{STAT_SAME()}]";
     }
 
     # This part should be rarely executed (often only once)
@@ -4764,38 +5180,47 @@ sub _get_hosts {
                             ( (?:0x)? [0-9]+ (?: \. (?:0x)?  [0-9]+){1,3})
                             \s+
                             (.*\S)
-                           /x or next;
+                           /ix or next;
         my $addr = inet_aton($ip) || next;
-        $ip = inet_ntoa($addr);
         my @names = split " ", $names;
-        push @{$forward{+lc}[0]}, $addr for @names;
-        push @{$reverse{$ip}}, @names;
+        push @{$forward{lc()}[0]}, $addr for @names;
+        push @{$reverse{$addr}}, @names;
     }
     # Remove duplicates
+    my %seen;
     for my $names (values %reverse) {
-        my %seen;
-        @$names = grep !$seen{+lc}++, @$names;
+        %seen = ();
+        @$names = grep !$seen{lc()}++, @$names;
     }
     for my $ips (values %forward) {
         for my $addrs (@$ips) {
-            $addrs || next;
-            my %seen;
+            $addrs || next; # if there is no IPv4 there will be a hole
+            %seen = ();
             @$addrs = grep !$seen{$_}++, @$addrs;
         }
     }
-
     my @stat = stat($fh) or die "Could not stat open file: $^E";
-    $resolver->info("Loaded hosts file '$hosts_file'") if $verbose > 1;
+
     # From here on we cannot fail anymore
+    $resolver->info("Loaded hosts file '$hosts_file'") if $verbose > 1;
     my $hosts = $resolver->{hosts};
     $hosts->{forward} = \%forward;
     $hosts->{reverse} = \%reverse;
     $hosts->{stat} = \@stat;
-    $hosts->{loaded} = $now;
+}
+
+sub freeze {
+    my $resolver = shift;
+
+    for my $dns_server (values %{$resolver->{conf}{dns_servers}}) {
+        my @bits = grep vec($dns_server->{qids_bits}, $_, 1), 0..8*length($dns_server->{qids_bits})-1;
+        Object::_dump_save($dns_server->{qids_bits}, "bit_string(@bits)");
+    }
+    $resolver->SUPER::freeze(qw(hosts cache));
 }
 
 package DNS::UDP;
-# Do system DNS queries
+# Do system DNS queries over UDP
 # DNS::UDP->new($parent, %options)
 use vars qw(@ISA);
 @ISA = qw(UDP0);
@@ -4814,7 +5239,162 @@ sub new_suspended {
 sub on_read {
     my ($dns, $from, $ttl, $bufref) = @_;
 
-    $dns->{parent}->response($from, Timer::now(), $bufref, 1);
+    my $resolver = $dns->{parent};
+    my $dns_server = $resolver->{conf}{dns_servers}{$from->{packed}};
+    if (!$dns_server) {
+        $resolver->info("Response from unknown DNS server '$from->{display}'") if $verbose > 1;
+        return;
+    }
+    $resolver->response($dns_server, Timer::now(), $bufref, 0);
+}
+
+package DNS::TCP;
+# Do system DNS queries over TCP
+# DNS::UDP->new($parent, %options)
+use vars qw(@ISA);
+@ISA = qw(Stream0);
+
+use constant {
+    # How long we keep an idle DNS TCP connection open
+    KEEPALIVE	=> 2,
+    INFINITY	=> 9**9**9,
+};
+
+sub eof : method {
+    die "eof not implemented (yet)";
+}
+
+sub new_suspended {
+    my $class = shift;
+
+    return $class->SUPER::new_suspended(
+        shift, undef, undef,
+        nr_sent		=> 0,
+        nr_received	=> 0,
+        keepalive	=> KEEPALIVE,
+        sent		=> -INFINITY,
+        received	=> -INFINITY,
+        @_);
+}
+
+# Must write whole packets
+sub write {
+    my $tcp = shift;
+
+    my $len = 0;
+    $len += length for @_;
+    $tcp->SUPER::write(pack("n", $len), @_);
+    ++$tcp->{nr_sent};
+}
+
+sub on_empty {
+    my ($tcp) = @_;
+    $tcp->SUPER::on_empty;
+    $tcp->{sent} = Timer::now();
+    # Since we just sent stuff we have requests pending, so we are not idle
+}
+
+sub on_read {
+    my $tcp = shift;
+
+    my $now = $tcp->{received} = Timer::now();
+    while (1) {
+        my ($len) = unpack("n", $tcp->{in}) or return;
+        length $tcp->{in} >= $len || return;
+        ++$tcp->{nr_received};
+        my $packet = substr($tcp->{in}, 0, $len+2, "");
+        substr($packet, 0, 2, "");
+        $tcp->{parent}->response($tcp->{peer}, $now, \$packet, 1);
+    }
+}
+
+sub idle {
+    my ($tcp) = @_;
+
+    $tcp->bug("Cant't be idle if we have a timeout") if $tcp->{timeout};
+    $tcp->timer0($tcp->{keepalive} * 0.9, \&idle_timeout);
+}
+
+sub idle_timeout {
+    my ($tcp) = @_;
+
+    $tcp->finish("Idle DNS TCP connection");
+}
+
+package DnsServer;
+# State of a particular DNS server
+use vars qw(@ISA);
+@ISA = qw(Address);
+
+use Digest::MD5 qw(md5);
+use Scalar::Util qw(weaken);
+
+use constant {
+    INFINITY		=> 9**9**9,
+    # Maximium number of queries per nameserver
+    # Current recommended max requested UDP size to avoid fragmentation
+    MAX_UDP_SIZE	=> 1232,
+    COOKIE_VALIDITY	=> 24*60*60,
+};
+
+sub init {
+    my ($dns_server) = @_;
+
+    $dns_server->{nameserver} = 1;
+
+    $dns_server->{qids} = {};
+    vec($dns_server->{qids_bits} = "", int(2**16-1), 1) = 0;
+    $dns_server->{qids_free} = [];
+
+    $dns_server->{tcp} = undef;
+    $dns_server->{qids_tcp} = {};
+    $dns_server->{permute_case} = 1;
+    $dns_server->{edns} = 1;
+    $dns_server->{max_udp_size} = MAX_UDP_SIZE;
+    $dns_server->{cookie_server} = "";
+    $dns_server->{cookie_client} = "";
+    $dns_server->{cookie_client_expires} = -INFINITY;
+    $dns_server->{sent} = -INFINITY;
+    $dns_server->{received} = -INFINITY;
+}
+
+sub cookie_client {
+    my ($dns_server, $now) = @_;
+
+    return $dns_server->{cookie_client} if
+        $now <= $dns_server->{cookie_client_expires};
+
+    # server cookies are based on client cookie, so invalidate them
+    $dns_server->{cookie_server} = "";
+
+    # Make cookie vaidity less predictable
+    $dns_server->{cookie_client_expires} = $now +
+        0.6 * COOKIE_VALIDITY + rand(0.4 * COOKIE_VALIDITY);
+    my $local = ConnUtils->socket_udp_connected($dns_server, 1);
+    return $dns_server->{cookie_client} = substr(md5(
+        $dns_server->{packed} .
+        $local->{packed} .
+        $SECRET .
+        pack("NN", $$ ^ rand int 2**32, $^T ^ rand int 2**32) .
+        $dns_server .
+        $dns_server->{cookie_client} .
+        $now), 0, 8);
+}
+
+sub dns_timeout {
+    my ($dns, $qid) = @_;
+
+    die "dns_timeout not implemented (yet)";
+}
+
+sub tcp {
+    my ($dns_server, $resolver) = @_;
+
+    return $dns_server->{tcp} if $dns_server->{tcp};
+    my $tcp = DNS::TCP->new($resolver, peer => $dns_server);
+    weaken($dns_server->{tcp} = $tcp);
+    $tcp->connect;
+    return $tcp;
 }
 
 package LineProtocol;
@@ -4971,15 +5551,16 @@ sub writer {
                     ::display(substr($line->{out}, $line->{out_sent}, $rc)),
                     length($line->{out})-$line->{out_sent}-$rc) if $verbose > 1;
 
-        $line->{timeout} = undef;
         $line->{out_sent} += $rc;
         if (length $line->{out} == $line->{out_sent}) {
             $line->_end_write, return if $line->{end_write};
+            $line->{timeout} = undef;
             $line->{writer} = undef;
             $line->{keepalive} =
                 $line->timer($line->{settings}{KEEPALIVE}, \&keepalive);
             return;
         }
+        $line->{timeout} = undef;
     }
 }
 
@@ -5505,16 +6086,15 @@ use Errno qw(EINTR EAGAIN EWOULDBLOCK ECONNABORTED);
 sub new_suspended {
     my $class = shift;
     my $parent = shift;
-    my $address = shift;	# (Currently) assumed to be resolved
+    my $address = shift || $TCP4_ANY;	# (Currently) assumed to be resolved
 
     my %args = (
-        local	=> $address,
         loops	=> -1,
         socket	=> undef,
         reader	=> undef,
         @_
     );
-    @args{qw(local socket)} = $parent->socket_tcp($args{local}, 1) if
+    @args{qw(local socket)} = $parent->socket_tcp($address, 1) if
         !$args{socket};
     my $listener = $class->SUPER::new($parent, %args);
     $listener->info("Listening on '%s' [%s]",
@@ -5795,7 +6375,7 @@ sub command_dump {
             return;
         }
     }
-    $control->flush(::Dumper($object));
+    $control->flush($object->dumper);
 }
 
 sub command_set {
@@ -6020,6 +6600,7 @@ GetOptions("server:s"		=> \my $server,
            "server_lib=s"	=> \my @server_lib,
            "ssh=s"		=> \$ssh,
            "resolv_file=s"	=> \$resolv_file,
+           "server_resolv_file=s"	=> \my $server_resolv_file,
            # Add server and client variants too.
            # server: load at server side
            # client: load at client side and send content to server
@@ -6215,6 +6796,10 @@ if ($role eq "server") {
                  ping_max	=> $ping_max,
                  global_timeout	=> $global_timeout,
              );
+            if (defined $server_resolv_file) {
+                $replace{resolv_file} = $server_resolv_file;
+                $server_resolv_file = undef;
+            }
             while (my ($name, $value) = each %replace) {
                 $value = string_from_value($value);
                 # info("Value $name=<$value>") if $verbose;
@@ -6246,6 +6831,7 @@ if ($role eq "server") {
         $root->client($rd1, $wr0, \%connections, 0);
     }
 }
+die "Option server_resolv_file invalid in this mode" if defined $server_resolv_file;
 
 $root->timeout($global_timeout) if defined $global_timeout;
 

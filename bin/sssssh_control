@@ -200,7 +200,7 @@ $root = {
 print {$root->{OUT}} "Connected to $target->{display}\n";
 
 $root->{IN}->blocking(0);
-$root->{reader_IN} = $root->{IN}->add_read( $root,  \&command_reader);
+$root->{reader_IN} = $root->{IN}->add_read ($root,  \&command_reader);
 $root->{reader} = $root->{socket}->add_read ($root, \&control_reader);
 $root->{writer} = $root->{socket}->add_write($root, \&control_writer);
 
