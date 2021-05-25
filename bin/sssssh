@@ -1590,7 +1590,7 @@ sub defer_accept {
 package Object;
 # Base class of elements in out Object Tree
 # This should make it easy to clean up subtrees by simply deleting the root
-use Scalar::Util qw(weaken isweak);
+use Scalar::Util qw(weaken isweak refaddr);
 use Carp qw(croak);
 
 use constant {
@@ -1707,7 +1707,7 @@ sub _on_finish {
     $object->{finished} = DELETED;
 }
 
-use vars qw(@dump_state $dumper);
+use vars qw(@dump_state $dumper %frozen);
 sub dump : method {
     my ($object) = @_;
 
@@ -1715,6 +1715,7 @@ sub dump : method {
 }
 
 sub dumper {
+    local %frozen;
     local $dumper = Data::Dumper->new(\@_);
     $dumper->Freezer("freeze");
     local @dump_state;
@@ -1743,6 +1744,8 @@ sub dump_save {
 
 sub freeze {
     my $object = shift;
+
+    return if $frozen{refaddr($object)}++;
 
     push @_, "parent";
     dump_save(@$object{@_});
@@ -2552,7 +2555,7 @@ sub on_empty {
 }
 
 sub connect : method {
-    my ($stream) = @_;
+    my ($stream, $timeout) = @_;
 
     $stream->{peer} || $stream->bug("No peer");
     $stream->bug("Already unwritable") if $stream->{unwritable};
@@ -2646,7 +2649,7 @@ sub connecting {
 
     # This assumes parent == LineProtocol (or Root). Doesn't generalize
     $stream->{writer} = Events::add_write($stream->{socket_out}, $stream, \&_Stream::_connected);
-    $stream->{timeout} = $stream->timer($stream->{parent}{settings}{TIMEOUT_CONNECT}, \&connect_timeout);
+    $stream->{timeout} = $stream->timer($stream->{connect_timeout} || $stream->{parent}{settings}{TIMEOUT_CONNECT}, \&_Stream::connect_timeout);
 }
 
 sub resume_read {
@@ -2677,7 +2680,7 @@ sub connecting {
 
     # This assumes parent == LineProtocol (or Root). Doesn't generalize
     $stream->{writer} = Events::add_write0($stream->{socket_out}, $stream, \&_Stream::_connected);
-    $stream->{timeout} = $stream->timer0($stream->{parent}{settings}{TIMEOUT_CONNECT}, \&connect_timeout);
+    $stream->{timeout} = $stream->timer0($stream->{connect_timeout} || $stream->{parent}{settings}{TIMEOUT_CONNECT}, \&_Stream::connect_timeout);
 }
 
 sub resume_read {
@@ -4497,8 +4500,6 @@ sub new {
     # For debugging
     if (1) {
         $resolver->get_resolv(Timer::clocktime());
-        my $dns_server = $resolver->{conf}{dns_servers}{$resolver->{conf}{nameserver}[0]} || $resolver->bug("No nameserver");
-        # $dns_server->tcp($resolver);
         $resolver->query(get_foo(), A, "cNAme-test2.hOme.lUNix", $resolver, \&foo, __LINE__);
         $resolver->query(get_foo(), A, "cNAme-test4.hOme.lUNix", $resolver, \&foo, __LINE__);
         $resolver->query(get_foo(), A, "cname-teST.HOMe.lunix", $resolver, \&foo, __LINE__);
@@ -4508,7 +4509,12 @@ sub new {
         $resolver->query(get_foo(), A, "www.XS4all.CoM", $resolver, \&foo, __LINE__);
         $resolver->query(get_foo(), PTR, inet_aton("10.253.1.8"), $resolver, \&foo, __LINE__);
         $resolver->query(get_foo(), PTR, inet_aton("104.73.50.128"), $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), TXT, "google.com", $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), MX, "google.com", $resolver, \&foo, __LINE__);
         $resolver->query(get_foo(), NS, "google.com", $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), SOA, "google.com", $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), HINFO, "test2.hOME.LUnix", $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), SRV, "_sip._tCP.HOME.LUnix", $resolver, \&foo, __LINE__);
     }
 
     return $resolver;
@@ -4634,7 +4640,7 @@ sub chase {
 # Now figure out how to send the request
 # $query is completely set up, this code should consider it read-only
 sub query_activate {
-    my ($resolver, $now, $query) = @_;
+    my ($resolver, $now, $query, $try_next) = @_;
 
     # Add Checks (length, multiple ., . at start etc), add search domains
     # Improve this at some point
@@ -4642,9 +4648,11 @@ sub query_activate {
         $resolver->bug("No DNS server at index '$query->{dns_i}'");
 
     # Try TCP the very first time
-    unless ($dns_server->{tried}) {
-        $dns_server->{tried} = 1;
-        $dns_server->tcp($resolver);
+    if (!$dns_server->{tried_tcp}) {
+        $dns_server->{tried_tcp} = 1;
+        $dns_server->tcp($resolver, $query->{dns_timeout});
+    } elsif (!$dns_server->{tried_udp}) {
+        $dns_server->{tried_udp} = 1;
     }
 
     my $qids = $dns_server->{qids};
@@ -4743,8 +4751,23 @@ sub tcp_on_connect {
         $resolver->bug("Could not find DNS server '$peer->{display}'");
     $dns_server->{last_connect_error} = 0;
     $dns_server->{last_connect_time}  = $now;
+    $dns_server->{tried_tcp} = 2;
     while (@{$dns_server->{queue}}) {
         defined $resolver->query_activate($now, $dns_server->{queue}[0]) || last;
+        shift @{$dns_server->{queue}};
+    }
+}
+
+sub tcp_error {
+    die "Waf";
+    my ($resolver, $peer, $now, $err) = @_;
+
+    my $dns_server = $resolver->{conf}{dns_servers}{$peer->{packed}} ||
+        $resolver->bug("Could not find DNS server '$peer->{display}'");
+
+    my $try_next = $dns_server->{tried_udp};
+    while (@{$dns_server->{queue}}) {
+        defined $resolver->query_activate($now, $dns_server->{queue}[0], $try_next) || last;
         shift @{$dns_server->{queue}};
     }
 }
@@ -4918,7 +4941,8 @@ sub response {
             }
         }
         chop $name;
-        die "Invalid character ", ::display($1), " in name: ", ::display($name), "\n" if $name =~ /([^a-zA-Z0-9.-])/;
+        # _ added for SRV records
+        die "Invalid character ", ::display($1), " in name: ", ::display($name), "\n" if $name =~ /([^a-zA-Z0-9._-])/;
         $pos = $resume if $resume;
         return $name;
     };
@@ -4994,7 +5018,59 @@ sub response {
                     $rr{rdata} = $get_name->();
                     ($rr{rdata_low} = $rr{rdata}) =~ s/([A-Z])/\l$1/g if
                         $rr{type} == CNAME;
-                    $p == $pos || die "inconsistent CNAME size\n";
+                    $p == $pos || die "Inconsistent $rr{type} size\n";
+                } elsif ($rr{type} == SOA) {
+                    my $p = $pos;
+                    $pos -= $rdlength;
+                    # I've seen these take the capitalization of the request
+                    # e.g. SOA google.com
+                    $rr{rdata} = {
+                        mname => $get_name->(),
+                        rname => $get_name->(),
+                    };
+                    $pos + 20 == $p || die "Inconsistent $rr{type} size\n";
+                    @{$rr{rdata}}{qw(serial refresh retry expire minimum)} =
+                        unpack("N5", substr($response, $pos, 20));
+                    $pos = $p;
+                } elsif ($rr{type} == MX) {
+                    $rdlength >= 2 || die "Inconsistent $rr{type} size\n";
+                    my $p = $pos;
+                    $pos -= $rdlength;
+                    $pos += 2;
+                    # I've seen exchange take the capitalization of the request
+                    # e.g. MX google.com
+                    $rr{rdata} = {
+                        preference => unpack("n", substr($response, $pos-2, 2)),
+                        exchange   => $get_name->(),
+                    };
+                    $p == $pos || die "Inconsistent $rr{type} size\n";
+                } elsif ($rr{type} == TXT) {
+                    $rr{rdata} = [unpack("(C/a*)*", $rr{rdata})];
+                    $rdlength == length pack("(C/a*)*", @{$rr{rdata}}) ||
+                        die "Inconsistent $rr{type} size\n";
+                } elsif ($rr{type} == HINFO) {
+                    my @hinfo = unpack("(C/a*)*", $rr{rdata});
+                    $rdlength == length pack("(C/a*)*", @hinfo) ||
+                        die "Inconsistent $rr{type} size\n";
+                    @hinfo == 2 ||
+                        die "Incorrect number of fields in $rr{type} data\n";
+                    $rr{rdata} = {
+                        cpu	=> $hinfo[0],
+                        os	=> $hinfo[1],
+                    };
+                } elsif ($rr{type} == SRV) {
+                    $rdlength >= 6 || die "Inconsistent $rr{type} size\n";
+                    my $p = $pos;
+                    $pos -= $rdlength;
+                    my @vals = unpack("n3", substr($response, $pos, 6));
+                    $pos += 6;
+                    $rr{rdata} = {
+                        priority	=> $vals[0],
+                        weight		=> $vals[1],
+                        port		=> $vals[2],
+                        target		=> $get_name->(),
+                    };
+                    $p == $pos || die "Inconsistent $rr{type} size\n";
                 }
                 push @{$results{$rr{name_low}}{$rr{type}}}, \%rr;
             }
@@ -5093,6 +5169,7 @@ sub response {
     $query->{next} = $query->{previous} = undef;
     $query->{dns_servers} = undef;
     $query->{roundtrip} = $now - $query->{sent};
+    $dns_server->{$tcp ? "tried_tcp" : "tried_udp"} = 3;
 
     # print STDERR ::Dumper(\%results);
     # Packet is processed. Add result to cache
@@ -5398,7 +5475,7 @@ sub error {
     my $tcp = shift;
 
     $tcp->error_finish(@_);
-    $tcp->{parent}->tcp_error($tcp->{peer}, @_);
+    $tcp->{parent}->tcp_error($tcp->{peer}, Timer::now(), @_);
 }
 
 sub eof : method {
@@ -5500,7 +5577,8 @@ sub init {
     $dns_server->{qids_free} = [];
 
     # How many things heve we tried on this DNS server
-    $dns_server->{tried} = 0;
+    $dns_server->{tried_tcp} = 0;
+    $dns_server->{tried_udp} = 0;
     $dns_server->{tcp} = undef;
     # Query IDs pending on the current TCP connection. If we lose the connection
     # all of them have to be reactivated over UDP
@@ -5550,10 +5628,12 @@ sub dns_timeout {
 }
 
 sub tcp {
-    my ($dns_server, $resolver) = @_;
+    my ($dns_server, $resolver, $timeout) = @_;
 
     return $dns_server->{tcp} if $dns_server->{tcp};
-    my $tcp = DNS::TCP->new($resolver, peer => $dns_server);
+    my $tcp = DNS::TCP->new($resolver,
+                            connect_timeout	=> $timeout,
+                            peer		=> $dns_server);
     weaken($dns_server->{tcp} = $tcp);
     $tcp->connect;
     return $tcp;
@@ -6537,7 +6617,8 @@ sub command_dump {
             return;
         }
     }
-    $control->flush($object->dumper);
+    # $control->flush($object->dumper);
+    $control->flush(::Dumper($object));
 }
 
 sub command_set {
