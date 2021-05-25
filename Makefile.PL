@@ -8,7 +8,7 @@ use ExtUtils::MakeMaker;
 our $VERSION = '1.000';
 
 open(my $fh, "-|", $^X, "t/lib_extract") || die "Could not run 't/lib_extract': $^E";
-chomp(my @modules = map "lib/Net/Sssssh/$_", split " ", do { local $/; <$fh>});
+chomp(my @modules = map "lib/Net/Sssssh/$_.pm", split " ", do { local $/; <$fh>});
 
 settings();
 
@@ -117,11 +117,11 @@ sub settings {
     package MY;
     our %postamble;
 
-    $postamble{config} = <<'EOT';
-config :: lib/Net/Sssssh/Events.pm lib/Net/Sssssh/Timer.pm lib/Net/Sssssh/Address.pm
+    $postamble{config} = <<"EOT";
+config :: @modules
 
-lib/Net/Sssssh/Events.pm lib/Net/Sssssh/Timer.pm lib/Net/Sssssh/Address.pm :: bin/sssssh t/lib_extract
-	$(NOECHO) $(FULLPERL) t/lib_extract $@ $<
+@modules :: bin/sssssh t/lib_extract
+	\$(NOECHO) \$(FULLPERL) t/lib_extract \$\@ \$<
 EOT
 
     $postamble{README} = <<'EOT';

@@ -2579,7 +2579,7 @@ sub connect_timeout {
     shift->on_connect_error($ETIMEDOUT);
 }
 
-sub connected {
+sub _connected {
     my ($stream) = @_;
 
     $stream->{writer} = undef;
@@ -2618,6 +2618,14 @@ sub on_connect {
     $stream->writable;
 }
 
+# This is a reasonable heuristic most of the time.
+# Override if you do special stuff like e.g. not setting socket_in
+sub is_connected {
+    my ($stream) = @_;
+
+    return $stream->{socket_in} && $stream->{socket_out} ? 1 : 0;
+}
+
 package Stream;
 # Stream connections that keep the program alive
 # Stream->new($parent, $socket_in, $socket_out, %options)
@@ -2637,7 +2645,7 @@ sub connecting {
     my ($stream) = @_;
 
     # This assumes parent == LineProtocol (or Root). Doesn't generalize
-    $stream->{writer} = Events::add_write($stream->{socket_out}, $stream, \&_Stream::connected);
+    $stream->{writer} = Events::add_write($stream->{socket_out}, $stream, \&_Stream::_connected);
     $stream->{timeout} = $stream->timer($stream->{parent}{settings}{TIMEOUT_CONNECT}, \&connect_timeout);
 }
 
@@ -2668,7 +2676,7 @@ sub connecting {
     my ($stream) = @_;
 
     # This assumes parent == LineProtocol (or Root). Doesn't generalize
-    $stream->{writer} = Events::add_write0($stream->{socket_out}, $stream, \&_Stream::connected);
+    $stream->{writer} = Events::add_write0($stream->{socket_out}, $stream, \&_Stream::_connected);
     $stream->{timeout} = $stream->timer0($stream->{parent}{settings}{TIMEOUT_CONNECT}, \&connect_timeout);
 }
 
@@ -4321,6 +4329,37 @@ sub on_read {
         die "Assertion: package has no write";
 }
 
+package DoubleTerminator;
+# Sentinel for a circular double linked list
+{
+    my $count = 0;
+    sub new {
+        my $class = shift;
+
+        my $terminator = {};
+        $terminator->{next} = $terminator->{previous} = $terminator;
+        ++$count;
+        return bless \$terminator, $class;
+    }
+
+    sub DESTROY {
+        my $terminator = ${shift()};
+
+        --$count;
+        $terminator->{previous}->{next} = undef;
+        $terminator->{previous} = undef;
+        my $node = $terminator;
+        $node->{previous} = undef while $node = $node->{next};
+    }
+
+    sub count {
+        return $count;
+    }
+}
+
+sub terminator {
+    return ${shift()};
+}
 package Resolver;
 # Resolve names (hosts file/DNS)
 # We assume that if a name is a CNAME, it shouldn't have records of any other
@@ -4339,9 +4378,6 @@ use constant {
     # Minimum time to wait between file checks
     CHECK_DELAY		=> 1,
     NEGATIVE		=> 10,
-    # Header + (name+type+class)
-    # (we always send 1 question, so we expect 1 back, otherwise it would be 12)
-    DNS_MIN_RESPONSE	=> 12 + (1+2+2),
     # Reduce any TTL higher than this
     TTL_MAX		=> 7*24*60*60,
     # Empty array for sharing. Would set it to read-only if that was portable
@@ -4374,11 +4410,22 @@ use constant {
     OPTION_EXT_ERROR	=> 15,
 
     # Some Types
-    A		=> 1,
-    CNAME	=> 5,
+    A		=>  1,
+    NS		=>  2,
+    CNAME	=>  5,
+    SOA		=>  6,
     PTR		=> 12,
+    HINFO	=> 13,
+    MX		=> 15,
+    TXT		=> 16,
     AAAA	=> 28,
+    SRV		=> 33,
+    DNAME	=> 39,
     OPT		=> 41,
+    SSHFP	=> 44,
+    IXFR	=>251,
+    AXFR	=>252,
+    ALL		=>255,
 
     # Classes
     IN		=> 1,
@@ -4429,6 +4476,8 @@ sub new {
     my $resolver = $class->SUPER::new(
         $root,
         settings	=> { %{$root->{settings}} },
+        _terminator	=> DoubleTerminator->new,
+        terminator	=> undef,
         hosts		=> {
             checked	=> -INFINITY,
         },
@@ -4442,13 +4491,14 @@ sub new {
         cache		=> {},
         queries		=> {},
     );
+    weaken($resolver->{terminator} = $resolver->{_terminator}->terminator);
     weaken($root->{resolver} = $resolver);
 
     # For debugging
-    if (0) {
+    if (1) {
         $resolver->get_resolv(Timer::clocktime());
         my $dns_server = $resolver->{conf}{dns_servers}{$resolver->{conf}{nameserver}[0]} || $resolver->bug("No nameserver");
-        $dns_server->tcp($resolver);
+        # $dns_server->tcp($resolver);
         $resolver->query(get_foo(), A, "cNAme-test2.hOme.lUNix", $resolver, \&foo, __LINE__);
         $resolver->query(get_foo(), A, "cNAme-test4.hOme.lUNix", $resolver, \&foo, __LINE__);
         $resolver->query(get_foo(), A, "cname-teST.HOMe.lunix", $resolver, \&foo, __LINE__);
@@ -4458,9 +4508,17 @@ sub new {
         $resolver->query(get_foo(), A, "www.XS4all.CoM", $resolver, \&foo, __LINE__);
         $resolver->query(get_foo(), PTR, inet_aton("10.253.1.8"), $resolver, \&foo, __LINE__);
         $resolver->query(get_foo(), PTR, inet_aton("104.73.50.128"), $resolver, \&foo, __LINE__);
+        $resolver->query(get_foo(), NS, "google.com", $resolver, \&foo, __LINE__);
     }
 
     return $resolver;
+}
+
+sub _on_finish {
+    my $resolver = shift;
+
+    $resolver->{terminator} = undef;
+    $resolver->SUPER::_on_finish(@_);
 }
 
 sub dispatch {
@@ -4575,18 +4633,27 @@ sub chase {
 
 # Now figure out how to send the request
 # $query is completely set up, this code should consider it read-only
-sub queue {
+sub query_activate {
     my ($resolver, $now, $query) = @_;
-
-    # For now we always take the first server.
-    # MUST implement a fallback strategy soon..
-    my $dns_packed = $resolver->{conf}{nameserver}[0] ||
-        $resolver->bug("No active DNS servers not supported");
-    my $dns_server = $resolver->{conf}{dns_servers}{$dns_packed} ||
-        $resolver->bug("Could not find an active DNS server");
 
     # Add Checks (length, multiple ., . at start etc), add search domains
     # Improve this at some point
+    my $dns_server = $query->{dns_servers}[$query->{dns_i}] ||
+        $resolver->bug("No DNS server at index '$query->{dns_i}'");
+
+    # Try TCP the very first time
+    unless ($dns_server->{tried}) {
+        $dns_server->{tried} = 1;
+        $dns_server->tcp($resolver);
+    }
+
+    my $qids = $dns_server->{qids};
+    if (($dns_server->{tcp} && !$dns_server->{tcp}->is_connected) ||
+        keys %$qids > MAX_QUERIES) {
+        weaken($dns_server->{queue}[@{$dns_server->{queue}}] = $query);
+        return undef;
+    }
+    # It is possible for queue not to be empty here if we are busy unqueiung
 
     # Randomly permute case in request
     my $name_sent = $query->{name_low};
@@ -4604,8 +4671,6 @@ sub queue {
         }eg;
     }
 
-    my $qids = $dns_server->{qids};
-    die "Way too many outstanding queries" if keys %$qids > MAX_QUERIES;
     my $qid = int rand(1 << 16);
     $qid = int rand(1 << 16) while vec($dns_server->{qids_bits}, $qid, 1);
     vec($dns_server->{qids_bits}, $qid, 1) = 1;
@@ -4619,33 +4684,36 @@ sub queue {
     my @labels = split /\./, $name_sent;
     $packet .= pack("(C/a*)*x", @labels);
     $packet .= pack("nn", $query->{type}, Resolver::IN);
-    my $cookie_client = "";
+    # Must remember cookie we sent since it can have changed at response
+    $query->{cookie_client} = "";
+    $query->{cookie_server} = "";
     if ($dns_server->{edns}) {
-        $cookie_client = $dns_server->cookie_client($now);
-        $qids->{$qid}{cookie} = $cookie_client;
-        my $options = pack("(nn/a*)*",
-                           OPTION_COOKIE() => $cookie_client . $dns_server->{cookie_server});
-        $options .= pack("nx2", OPTION_KEEPALIVE) if
-            $dns_server->{tcp} && $dns_server->{tcp}{nr_sent} == 0;
+        my $options = "";
+        $query->{cookie_client} = $dns_server->cookie_client($now);
+        if ($dns_server->{tcp}) {
+            # Don't send a server cookie over TCP. We trust TCP and want to
+            # avoid resends because the server cookie was rolled over
+            # Don't just ask for it on the first query since hat may not be the
+            # first response you get (or get responded at all)
+            $options .= pack("nx2", OPTION_KEEPALIVE);
+        } else {
+            $query->{cookie_server} = $dns_server->{cookie_server};
+        }
+        $options .= pack("(nn/a*)*",
+                         OPTION_COOKIE() => $query->{cookie_client} . $dns_server->{cookie_server});
         $packet .= pack("xn2x4n/a*",
                         Resolver::OPT,
                         $dns_server->{max_udp_size},
                         $options);
     }
 
-    $qids->{$qid} = {
-        query		=> $query,
-        tcp		=> $dns_server->{tcp} ? 1 : 0,
-        name_sent	=> $name_sent,
-        # Must remember cookie we sent since it can have changed at response
-        cookie_client	=> $cookie_client,
-        cookie_server	=> $dns_server->{cookie_server},
-        sent		=> $now,
-        timeout		=>
-        # $dns_server->timeout0() would (incorrectly) set $dns_server->{timeout}
-        Timer::timer0(DNS_TIMEOUT, $dns_server,
-                      sub {shift->dns_timeout($qid)}),
-    };
+    weaken($qids->{$qid} = $query);
+    $query->{tcp} = $dns_server->{tcp} ? 1 : 0;
+    $query->{name_sent}	= $name_sent;
+    $query->{sent}	    = $now;
+    # $dns_server->timeout0() would (incorrectly) set $dns_server->{timeout}
+    $query->{timeout}	    = Timer::timer0($query->{dns_timeout}, $dns_server,
+                                            sub {shift->dns_timeout($qid)});
     $dns_server->{sent} = $now;
 
     if ($dns_server->{tcp}) {
@@ -4653,9 +4721,32 @@ sub queue {
             $dns_server->{qids_tcp}{$qid}++;
         $dns_server->{tcp}->write($packet);
     } else {
+die "Boem";
         $resolver->{dns}->write($dns_server, $packet);
     }
     return $qid;
+}
+
+sub tcp_on_connect_error {
+    my ($resolver, $peer, $now, $err) = @_;
+
+    my $dns_server = $resolver->{conf}{dns_servers}{$peer->{packed}} ||
+        $resolver->bug("Could not find DNS server '$peer->{display}'");
+    $dns_server->{last_connect_error} = $err;
+    $dns_server->{last_connect_time}  = $now;
+}
+
+sub tcp_on_connect {
+    my ($resolver, $peer, $now) = @_;
+
+    my $dns_server = $resolver->{conf}{dns_servers}{$peer->{packed}} ||
+        $resolver->bug("Could not find DNS server '$peer->{display}'");
+    $dns_server->{last_connect_error} = 0;
+    $dns_server->{last_connect_time}  = $now;
+    while (@{$dns_server->{queue}}) {
+        defined $resolver->query_activate($now, $dns_server->{queue}[0]) || last;
+        shift @{$dns_server->{queue}};
+    }
 }
 
 # In principle this could supports multiple questions in one query
@@ -4697,14 +4788,13 @@ sub query {
 
     my $query = $resolver->{queries}{$name_low}{$type} ||= {
         # The original case is preserved in the callbacks
+        callbacks	=> [],
+        expires		=> -INFINITY,	# Is also a negative expires
         name_low	=> $name_low,
+        # Probe is used to let perl garbage collection track callbacks
+        probe		=> undef,
         type		=> $type,
         values		=> undef,
-        expires		=> -INFINITY,	# Is also a negative expires
-        pending		=> undef,
-        name_servers	=> {},
-        probe		=> undef,
-        callbacks	=> [],
     };
 
     # Check if we have a cached answer
@@ -4738,7 +4828,23 @@ sub query {
     # Make sure we have the most recent DNS configuration
     $resolver->get_resolv($now);
     $query->{pending} = $now;
-    $resolver->queue($now, $query);
+
+    # Link as last into the query list
+    $resolver->bug("Already linked next")	if $query->{next};
+    $resolver->bug("Already linked previous")	if $query->{previous};
+    my $terminator = $resolver->{terminator};
+    $query->{previous} = $terminator->{previous};
+    $terminator->{previous} = $query->{previous}{next} = $query;
+    $query->{next} = $terminator;
+
+    # Get the current resolver configuration
+    $query->{dns_servers} = [@{$resolver->{conf}{dns_servers}}{@{$resolver->{conf}{nameserver}}}];
+    $query->{dns_i} = 0;
+    $query->{dns_attempts} = $resolver->{conf}{options}{attempts};
+    $query->{dns_timeout}  = $resolver->{conf}{options}{timeout};
+
+    $resolver->query_activate($now, $query);
+
     return 0;
 }
 
@@ -4748,30 +4854,29 @@ sub response {
 
     my $response = $$bufref;
     my $rlen = length $response;
-    if ($rlen < DNS_MIN_RESPONSE) {
+    my $pos = 12;	# We will start parsing just after the header
+    if ($rlen < $pos) {
         $resolver->info("Invalid DNS response: Too short") if $verbose > 1;
         return;
     }
     my ($qid, $flags, @counts) = unpack("n6", $response);
 
     # Find the query. Be paranoid about spoofing
-    my $server_data = $dns_server->{qids}{$qid};
-    if (!$server_data) {
+    my $query = $dns_server->{qids}{$qid};
+    if (!$query) {
         $resolver->info(
             vec($dns_server->{qids_bits}, $qid, 1) ?
             "Response from '$dns_server->{display}' with unknown query id '$qid'" :
             "Duplicate response from '$dns_server->{display}' with query id '$qid'") if $verbose > 1;
         return;
     }
-    if ($server_data->{tcp} != $tcp) {
-        $resolver->info("Response tcp=$tcp from '$dns_server->{display}' for query id $qid sent with tcp=$server_data->{tcp}") if $verbose > 1;
+    if ($query->{tcp} != $tcp) {
+        $resolver->info("Response tcp=$tcp from '$dns_server->{display}' for query id $qid sent with tcp=$query->{tcp}") if $verbose > 1;
         return;
     }
-    my $query = $server_data->{query} ||
-        $resolver->bug("No query in server_data");
 
-    if ($counts[0] != 1) {
-        $resolver->info("%s questions in response, but I only send queries with 1 question", $counts[0] ? "Multiple" : "No") if $verbose > 1;
+    if ($counts[QUESTION] != 1) {
+        $resolver->info("%d questions in response, but I only send queries with 1 question", $counts[QUESTION]) if $verbose > 1;
         return;
     }
     # Check that QR=1, OPCODE=0, RD=1, Z=0
@@ -4781,8 +4886,6 @@ sub response {
     die "Answer truncated" if $flags & 1 << 9;
     my $authorative = $flags >> 10 & 1;
     my $rcode = $flags & 0b1111;
-
-    my $pos = 12;	# We will start parsing just after the header
 
     # Helper to extract the DNS name at this position
     my $get_name = sub {
@@ -4821,7 +4924,7 @@ sub response {
     };
 
     my $qtype = $query->{type};
-    my $trusted = 0;
+    my $trusted = $tcp;
     my (@response, %results, $edns);
     eval {
         for my $section (0 .. $#counts) {
@@ -4831,8 +4934,12 @@ sub response {
                 ($rr{name_low} = $rr{name}) =~ s/([A-Z])/\l$1/g;
                 push @rr, \%rr;
                 if ($section == QUESTION) {
-                    $server_data->{name_sent} eq $rr{name} ||
-                        die "Asked for '$server_data->{name_sent}', got '$rr{name}'\n";
+                    if ($query->{name_sent} ne $rr{name}) {
+                        die "Asked for '$query->{name_sent}', got '$rr{name}'\n" unless $tcp && $query->{name_low} eq $rr{name_low};
+                        # We can't trust the capitalization of this DNS server
+                        $resolver->info("DNS server $dns_server->display} does not remember question case") if $verbose && $dns_server->{permute_case};
+                        $dns_server->{permute_case} &&= 0;
+                    }
 
                     die "Truncated response\n" if $pos + 4 > $rlen;
                     @rr{qw(type class)} = unpack("nn", substr($response, $pos, 4));
@@ -4843,7 +4950,7 @@ sub response {
                     # Reply is at least somewhat trusted. It came from the
                     # right server with the right qid with the right class with
                     # the right case
-                    $trusted = 1;
+                    $trusted ||= 1;
                     next;
                 }
 
@@ -4881,7 +4988,7 @@ sub response {
                     next;
                 }
 
-                if ($rr{type} == CNAME || $rr{type} == PTR) {
+                if ($rr{type} == CNAME || $rr{type} == PTR || $rr{type} == NS) {
                     my $p = $pos;
                     $pos -= $rdlength;
                     $rr{rdata} = $get_name->();
@@ -4889,8 +4996,7 @@ sub response {
                         $rr{type} == CNAME;
                     $p == $pos || die "inconsistent CNAME size\n";
                 }
-                push @{$results{$rr{name_low}}{$rr{type}}}, \%rr if
-                    $section == ANSWER && ($rr{type} == $qtype || $rr{type} == CNAME);
+                push @{$results{$rr{name_low}}{$rr{type}}}, \%rr;
             }
         }
         $pos == $rlen || die "Spurious response bytes\n";
@@ -4901,37 +5007,50 @@ sub response {
         $dns_server->{edns} ||
             $resolver->bug("Non EDNS requests not implemented (yet)");
         $edns || die "Non EDNS response not implemented (yet)\n";
-        my $cookie_server = $edns->{options}{OPTION_COOKIE()} ||
-            die "Non cookie EDSN response not implemented (yet)\n";
+        if (my $cookie_server = $edns->{options}{OPTION_COOKIE()}) {
+            # Server does cookies. Trust must now come from cookie
+            $trusted = 0;
 
-        # Server does cookies. Trust must now come from cookie
-        $trusted = 0;
+            length $cookie_server >= 16 || die "Cookie response too short\n";
+            length $cookie_server <= 49 || die "Cookie response too long\n";
+            my $cookie_client = substr($cookie_server, 0, 8, "");
+            $cookie_client eq $query->{cookie_client} ||
+                die "Client cookie mismatch\n";
 
-        length $cookie_server >= 16 || die "Cookie response too short\n";
-        length $cookie_server <= 49 || die "Cookie response too long\n";
-        my $cookie_client = substr($cookie_server, 0, 8, "");
-        $cookie_client eq $server_data->{cookie_client} || return;
+            # My cookie was in the reply. We trust the sender enough for cookies
+            $trusted = 1;
 
-        # My cookie was in the reply. We trust the sender enough for cookies
-        $trusted = 1;
+            # If our cookie rolled over don't try to update the server cookie
+            $cookie_client eq $dns_server->{cookie_client} || return;
 
-        # But if our cookie rolled over don't try to update the server cookie
-        $cookie_client eq $dns_server->{cookie_client} || return;
+            # For TCP the latest answer has the latest server cookie
+            # A stray late UDP response can be confusing but that has to be
+            # older since we don't do UDP while we have a TCP connection
 
-        # If the response matches the request server cookie we don't update
-        # (this avoids out of order replies reverting a new server cookie
-        return if $cookie_server eq $server_data->{cookie_server};
-        # No need for update if we got a consistent server cookie
-        # (if it is different it is because we did an update in the mean time
-        # which itself must have been from a devergent cookie)
-        return if $cookie_server eq $dns_server->{cookie_server};
+            # If the response matches the request server cookie we don't update
+            # (this avoids out of order replies reverting a new server cookie
+            # Automatically false for TCP (which we send without server cookie)
+            return if $cookie_server eq $query->{cookie_server};
+            # We don't really use this, but record it anyways
+            $query->{cookie_server} = $cookie_server;
 
-        # We got an inconsistent server cookie.
-        $resolver->info("Change DNS server '%s' cookie from '%s' to '%s'",
-                        $dns_server->{display},
-                        unpack("H*", $dns_server->{cookie_server}),
-                        unpack("H*", $cookie_server));
-        $dns_server->{cookie_server} = $cookie_server;
+            # No need for update if we got a consistent server cookie
+            # (if it is different it is because we did an update in the mean time
+            # which itself must have been from a devergent cookie)
+            return if $cookie_server eq $dns_server->{cookie_server};
+
+            # We got an inconsistent server cookie.
+            $resolver->info("Change DNS server '%s' cookie from '%s' to '%s'",
+                            $dns_server->{display},
+                            unpack("H*", $dns_server->{cookie_server}),
+                            unpack("H*", $cookie_server));
+            $dns_server->{cookie_server} = $cookie_server;
+        } elsif ($dns_server->{cookie_server}) {
+            my $err = "DNS server $dns_server->{display} stopped sending cookies";
+            $tcp || die "$err\n";
+            $resolver->info($err) if $verbose;
+            $dns_server->{cookie_server} = "";
+        }
     };
 
     if ($@) {
@@ -4961,51 +5080,52 @@ sub response {
             $resolver->bug("Qid $qid was not on the TCP queue");
         %{$dns_server->{qids_tcp}} || $tcp_connection->idle;
     }
-    $query->{pending} = undef;
 
     if ($rcode && $rcode != NAME_ERROR) {
         # Start doing more intelligent things here...
         die "Unhandled error code from DNS server $dns_server->{display}: $rcode";
     }
 
+    # We have a final response
+    $query->{pending} = undef;
+    $query->{previous}{next} = $query->{next};
+    $query->{next}{previous} = $query->{previous};
+    $query->{next} = $query->{previous} = undef;
+    $query->{dns_servers} = undef;
+    $query->{roundtrip} = $now - $query->{sent};
+
+    # print STDERR ::Dumper(\%results);
     # Packet is processed. Add result to cache
     my $error = 0;
-    for my $name_low (keys %results) {
-        my ($type, @values) = keys %{$results{$name_low}};
-        if (@values) {
-            # Due to program logic @values = 1 ($qtype and CNAME in some order)
-            @values == 1 &&
-                ($type == CNAME  && $values[0] == $qtype ||
-                 $type == $qtype && $values[0] == CNAME) ||
-                     $resolver->bug("Type $qtype query for '$name_low' returned impossible multiple result types: $type @values");
-            # Getting her is not a program bug, but a DNS server giving at least
-            # a combined CNAME and $qtype response (already dropped extras)
-            die "Type $qtype query for '$name_low' returned a result AND a CNAME";
-        }
-        my $ttl = TTL_MAX;
-        for my $rr (@{$results{$name_low}{$type}}) {
-            # All these TTLs probable should be the same
-            $ttl = $rr->{ttl} if $rr->{ttl} < $ttl;
-            push @values, $rr->{rdata};
-            if ($type == CNAME && !$results{$rr->{rdata_low}}) {
-                $error ||= NAME_ERROR;
-                delete $resolver->{cache}{$rr->{rdata_low}}{CNAME()};
-                my $cache = $resolver->{cache}{$rr->{rdata_low}}{$type} ||= {};
-                $cache->{expires} = $now + NEGATIVE;
-                $cache->{values} = undef;
+    while (my ($name_low, $results) = each %results) {
+        while (my ($type, $values) = each %$results) {
+            next if $type == OPT;
+            my $ttl = TTL_MAX;
+            my @values;
+            for my $rr (@$values) {
+                # All these TTLs probable should be the same
+                $ttl = $rr->{ttl} if $rr->{ttl} < $ttl;
+                push @values, $rr->{rdata};
+                if ($type == CNAME && !$results{$rr->{rdata_low}}) {
+                    $error ||= NAME_ERROR;
+                    delete $resolver->{cache}{$rr->{rdata_low}}{CNAME()};
+                    my $cache = $resolver->{cache}{$rr->{rdata_low}}{$type} ||= {};
+                    $cache->{expires} = $now + NEGATIVE;
+                    $cache->{values} = undef;
+                }
             }
+            my $base = $resolver->{cache}{$name_low} ||= {};
+            my $cname = delete $base->{CNAME()};
+            if ($type == CNAME) {
+                # Clean up all other entries and re-attach the cname
+                %$base = ();
+                $base->{CNAME()} = $cname;
+            }
+            my $cache = $base->{$type} ||= {};
+            $cache->{values} = \@values;
+            $cache->{expires} = $now + $ttl;
+            $cache->{official} = $values->[0]{name};
         }
-        my $base = $resolver->{cache}{$name_low} ||= {};
-        my $cname = delete $base->{CNAME()};
-        if ($type == CNAME) {
-            # Clean up all other entries and re-attach the cname
-            %$base = ();
-            $base->{CNAME()} = $cname;
-        }
-        my $cache = $base->{$type} ||= {};
-        $cache->{values} = \@values;
-        $cache->{expires} = $now + $ttl;
-        $cache->{official} = $results{$name_low}{$type}[0]{name};
     }
 
     if (!$results{$query->{name_low}}) {
@@ -5255,13 +5375,38 @@ use vars qw(@ISA);
 @ISA = qw(Stream0);
 
 use constant {
-    # How long we keep an idle DNS TCP connection open
-    KEEPALIVE	=> 2,
+    # How long we keep an idle DNS TCP connection open by default
+    KEEPALIVE	=> 4,
     INFINITY	=> 9**9**9,
 };
 
+sub on_connect_error {
+    my ($tcp, $err) = @_;;
+
+    $tcp->SUPER::on_connect_error($err);
+    $tcp->{parent}->tcp_on_connect_error($tcp->{peer}, Timer::now(), $err);
+}
+
+sub on_connect {
+    my $tcp = shift;
+
+    $tcp->SUPER::on_connect;
+    $tcp->{parent}->tcp_on_connect($tcp->{peer}, Timer::now());
+}
+
+sub error {
+    my $tcp = shift;
+
+    $tcp->error_finish(@_);
+    $tcp->{parent}->tcp_error($tcp->{peer}, @_);
+}
+
 sub eof : method {
-    die "eof not implemented (yet)";
+    my $tcp = shift;
+
+    my $empty = $tcp->out_is_empty;
+    $tcp->finish(@_);
+    $tcp->{parent}->tcp_eof($tcp->{peer}, $empty);
 }
 
 sub new_suspended {
@@ -5342,12 +5487,29 @@ sub init {
 
     $dns_server->{nameserver} = 1;
 
+    # queries we plan to run on this server but are held up for some reason
+    # (e.g. max queries, still connectong to TCP server)
+    $dns_server->{queue} = [];
+
+    # Queries sent to the server but not responded yet
     $dns_server->{qids} = {};
+
+    # Bitmask of recently used query IDs (pending and retired)
     vec($dns_server->{qids_bits} = "", int(2**16-1), 1) = 0;
+    # Retired query IDs (avoid reuse)
     $dns_server->{qids_free} = [];
 
+    # How many things heve we tried on this DNS server
+    $dns_server->{tried} = 0;
     $dns_server->{tcp} = undef;
+    # Query IDs pending on the current TCP connection. If we lose the connection
+    # all of them have to be reactivated over UDP
+    # (but fail queries where TCP was needed due to a truncated response)
     $dns_server->{qids_tcp} = {};
+    # Remember the last connection result.
+    $dns_server->{last_connect_error} = 0;
+    $dns_server->{last_connect_time}  = -INFINITY;
+
     $dns_server->{permute_case} = 1;
     $dns_server->{edns} = 1;
     $dns_server->{max_udp_size} = MAX_UDP_SIZE;
@@ -6548,6 +6710,9 @@ sub _cleanup_all {
     my $nr_events = Events->nr_events;
     die "Assertion: Pid $$ Still has $nr_events events" if
         $nr_events && defined $root;
+    for my $class (qw(DoubleTerminator)) {
+        die "Assertion: Still have $class references" if $class->count;
+    }
 }
 
 # Clean up all events and wait until the next loop in mainloop to exit

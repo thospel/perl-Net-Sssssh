@@ -1,6 +1,8 @@
 lib/Net/Sssssh/Events.pm
 lib/Net/Sssssh/Timer.pm
 lib/Net/Sssssh/Address.pm
+lib/Net/Sssssh/Object.pm
+lib/Net/Sssssh/Root.pm
 
 svn2mtn.state
 svn2mtn.state.old

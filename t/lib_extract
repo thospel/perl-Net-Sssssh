@@ -36,15 +36,28 @@ sub get_body {
 
     open(my $fh, "<", $file) || die "Could not open '$file': $^E";
     my $body = do { local $/; <$fh> };
-    my ($code) = $body =~
+    $body =~
         m{
              ^ \{ \s*
              ^ [^\S\n]*
              package \s+ \Q$lib\E; [^\S\n]*\n
              (.*?)
              \s*
-             ^\}}msx or die "Could not find package $lib in '$file'\n";
+             ^\}
+         |
+             ^ package \s+ \Q$lib\E; [^\S\n]*\n
+             (.*?)
+             \s*
+             (?:
+                 ^
+             |
+                 ^ \{ \s*
+                 ^ [^\S\n]*
+             )
+             package \s
 
+     }msx or die "Could not find package $lib in '$file'\n";
+    my $code = $+;
     my @exports;
     $code =~
         s{
@@ -69,7 +82,7 @@ sub get_body {
     return $code, \@exports;
 }
 
-my @modules = qw(Events Timer Address);
+my @modules = qw(Events Timer Address Object Root);
 if (!@ARGV) {
     print "@modules\n";
     exit;
