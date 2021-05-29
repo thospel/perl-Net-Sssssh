@@ -6,8 +6,8 @@ use strict;
 use warnings;
 use vars qw($VERSION $SUB_VERSION $release_time %history);
 $VERSION = "1.000";
-$SUB_VERSION = "072";
-$release_time = 1621947314;	## no critic (UselessNoCritic MagicNumbers)
+$SUB_VERSION = "073";
+$release_time = 1622304768;	## no critic (UselessNoCritic MagicNumbers)
 %history = (
   'Changes' => {
     '1.000' => '1.000'

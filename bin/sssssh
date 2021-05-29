@@ -4964,6 +4964,21 @@ sub response {
                         $resolver->info("DNS server $dns_server->display} does not remember question case") if $verbose && $dns_server->{permute_case};
                         $dns_server->{permute_case} &&= 0;
                     }
+                    # This does NOT ensure that all answers don't inherit
+                    # the mixed case. A DNS server can have consulted other
+                    # servers that answered in mixed case (through a pointer
+                    # to THEIR question section and during answer copy the
+                    # mixed case is preserved but without a new pointer to OUR
+                    # question section. This happens if I query google.com MX
+                    # through my local nameserver. And if I query through my
+                    # systemd-resolved the question pointer is restored again
+                    if ($query->{name_low} ne $rr{name}) {
+                        my $str = pack("(C/a*)*x", split /\./, $query->{name_low});
+                        # Sanity check
+                        substr($response, $pos - length $str, 1) eq substr($str, 0, 1) ||
+                            $response->bug("Cannot undo string");
+                        substr($response, $pos - length $str, length $str) = $str;
+                    }
 
                     die "Truncated response\n" if $pos + 4 > $rlen;
                     @rr{qw(type class)} = unpack("nn", substr($response, $pos, 4));

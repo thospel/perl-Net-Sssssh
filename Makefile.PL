@@ -21,6 +21,8 @@ WriteMakefile
          ExtUtils::MakeMaker->VERSION(6.55_01);
          1;
      } ? (BUILD_REQUIRES	=> {
+         # To generate README.md when editing source. Not needed for build
+         # "Pod::Markdown::Github"	=> "0.02",
          # Only for the tests
          "Test::More"	=> "0.01",
      }) : (),
