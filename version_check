@@ -1,6 +1,4 @@
 #!/usr/bin/perl -w
-# $HeadURL: http://subversion.bmsg.nl/repos/kpn/trunk/src/perl-modules/PackageTools/version_check $
-# $Id: version_check 5192 2012-09-07 14:43:22Z hospelt $
 # Author: Ton Hospel
 
 use strict;

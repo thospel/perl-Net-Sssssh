@@ -3,6 +3,7 @@ MANIFEST
 MANIFEST.SKIP
 Makefile.PL
 README
+README.md
 bin/sssssh
 bin/sssssh_control
 bin/udp_nat

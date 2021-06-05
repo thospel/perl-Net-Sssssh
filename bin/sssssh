@@ -33,7 +33,7 @@ use warnings;
 # modprobe fou
 # ip link add name fou1 type ipip remote 127.0.0.1 local 127.0.0.1 ttl 225 encap fou encap-sport auto encap-dport 1236
 # ip link set fou1 up
-# ip addr add 10.253.4.1/24 dev fou1
+# # ip addr add 10.253.4.1/24 dev fou1
 # # If you add "dev fou1" to the add port it seems to stop working
 # # If you remove the "local 127.0.0.1" it keeps working
 # ip fou add port 1237 ipproto 4 local 127.0.0.1
@@ -46,7 +46,7 @@ use warnings;
 # # Also catch ping requests
 # # iptables -t mangle -A OUTPUT -p icmp --icmp-type 8 -j FWMARK2
 # ip rule add fwmark 17 lookup 101
-# ip route add default via 10.253.4.1 table 101
+# ip route add default dev fou1 table 101
 
 # Avoid other stuff sneaking into the tunnel
 # (not sure how, but when using deluge (torrent): external traffic not on the marked port gets into the tunnel. Deluge for some reason sometimes uses the tunnel IP as its source address)

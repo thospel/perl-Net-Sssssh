@@ -7,8 +7,57 @@ use ExtUtils::MakeMaker;
 
 our $VERSION = '1.000';
 
+# Allows to suppress all program installation with -n (library only)
+use Getopt::Std;
+our ($opt_n, $opt_y);
+getopts("ny") || die "Usage: $0 [-n] [-y]\n";
+
 open(my $fh, "-|", $^X, "t/lib_extract") || die "Could not run 't/lib_extract': $^E";
 chomp(my @modules = map "lib/Net/Sssssh/$_.pm", split " ", do { local $/; <$fh>});
+
+my @programs_to_install;
+
+if (!$opt_n || $opt_y) {
+    print <<EOT	## no critic (UselessNoCritic InputOutput::RequireCheckedSyscalls)
+Note that you can avoid the following questions by passing
+the '-n' or '-y' option to 'Makefile.PL'.
+
+EOT
+        if !$opt_y;
+
+    # Only do this site_perl substitution for non binary extensions!
+    my $site_lib = "$ExtUtils::MakeMaker::Config{siteprefix}/lib/site_perl";
+    if ($ExtUtils::MakeMaker::Config{installsitelib} ne $site_lib &&
+        grep $_ eq $site_lib, @INC) {
+        print <<EOT	## no critic (UselessNoCritic InputOutput::RequireCheckedSyscalls)
+Your default perl library install directory is $ExtUtils::MakeMaker::Config{installsitelib}.
+This works fine but has the drawback that the library files will not be found
+anymore if the perl version gets upgraded. Since $site_lib is in
+your default library search path I can use that instead
+
+EOT
+            if !$opt_y;
+        # arch directories needed to get packlist into /usr/local/lib/site_perl
+        map $ExtUtils::MakeMaker::Config{$_} = $site_lib, qw(installsitelib sitelibexp sitearchexp installsitearch) if
+            $opt_y ||
+            prompt("Use $site_lib as default library install directory ?", "y") =~ /^y/i;
+    }
+
+    print <<EOT	## no critic (UselessNoCritic InputOutput::RequireCheckedSyscalls)
+This package comes with programs that I can try
+to install in $ExtUtils::MakeMaker::Config{installsitebin}.
+
+EOT
+        if !$opt_y;
+    my %programs = (
+        "bin/sssssh"	=> "forward ports",
+    );
+    for my $program (sort keys %programs) {
+        push @programs_to_install, $program if
+            $opt_y ||
+            prompt("Install $program, a utility to $programs{$program} ?", "y") =~ /^y/i;
+    }
+}
 
 settings();
 
@@ -98,7 +147,8 @@ EOT
     $postamble{commit} = <<'EOT';
 commit: all README.md
 	release_pm
-	git commit -a
+	git commit -av
+EOT
 
     $postamble{version_check} = <<'EOT';
 all ::
@@ -118,6 +168,14 @@ undef &postamble;	## no critic (UselessNoCritic AmpersandSigils)
 sub settings {
     package MY;
     our %postamble;
+
+    sub init_PM {
+        my $self = shift;
+	$self->SUPER::init_PM();
+        for my $pm (@modules) {
+            $self->{PM}{$pm} = "blib/$pm";
+        }
+    }
 
     $postamble{config} = <<"EOT";
 config :: @modules

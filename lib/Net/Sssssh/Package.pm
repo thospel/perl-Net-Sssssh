@@ -6,8 +6,8 @@ use strict;
 use warnings;
 use vars qw($VERSION $SUB_VERSION $release_time %history);
 $VERSION = "1.000";
-$SUB_VERSION = "073";
-$release_time = 1622304768;	## no critic (UselessNoCritic MagicNumbers)
+$SUB_VERSION = "074";
+$release_time = 1622973916;	## no critic (UselessNoCritic MagicNumbers)
 %history = (
   'Changes' => {
     '1.000' => '1.000'
@@ -22,6 +22,9 @@ $release_time = 1622304768;	## no critic (UselessNoCritic MagicNumbers)
     '1.000' => '1.000'
   },
   'README' => {
+    '1.000' => '1.000'
+  },
+  'README.md' => {
     '1.000' => '1.000'
   },
   'bin/sssssh' => {
