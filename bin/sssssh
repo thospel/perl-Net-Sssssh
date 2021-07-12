@@ -90,6 +90,8 @@ use Errno qw(EINTR ENOENT ETIMEDOUT);
 use Time::Local qw(timegm);
 use Socket qw(inet_aton);
 use POSIX qw(_exit);
+# Not explicitely used, but on older perls this is needed to provide blocking()
+use IO::Handle qw();
 
 use Data::Dumper;
 $Data::Dumper::Indent   = 1;
@@ -1149,7 +1151,7 @@ sub id_free {
 sub count {
     my ($ids) = @_;
 
-    return $ids->{free_id} - @{$ids->{free_ids}} + (1-INIT_ID);
+    return $ids->{free_id} - @{$ids->{free_ids}} + (1-INIT_ID());
 }
 
 sub id_check {
@@ -2744,7 +2746,7 @@ sub reader {
         }
     } else {
         $sockaddr = recv($udp->{socket_in}, my $buffer, $UDP_SIZE, 0);
-        $bufref = \$bufref;
+        $bufref = \$buffer;
         $ttl = $TTL;
     }
     if (!defined $sockaddr) {
@@ -4482,10 +4484,10 @@ sub new {
         _terminator	=> DoubleTerminator->new,
         terminator	=> undef,
         hosts		=> {
-            checked	=> -INFINITY,
+            checked	=> -INFINITY(),
         },
         conf		=> {
-            checked	=> -INFINITY,
+            checked	=> -INFINITY(),
             # All servers, even if not in current resolv.conf anymore
             dns_servers	=> {},
             # All nameserver entries of the current resolv.conf in file order
@@ -4498,7 +4500,7 @@ sub new {
     weaken($root->{resolver} = $resolver);
 
     # For debugging
-    if (1) {
+    if (0) {
         $resolver->get_resolv(Timer::clocktime());
         $resolver->query(get_foo(), A, "cNAme-test2.hOme.lUNix", $resolver, \&foo, __LINE__);
         $resolver->query(get_foo(), A, "cNAme-test4.hOme.lUNix", $resolver, \&foo, __LINE__);
@@ -4812,7 +4814,7 @@ sub query {
     my $query = $resolver->{queries}{$name_low}{$type} ||= {
         # The original case is preserved in the callbacks
         callbacks	=> [],
-        expires		=> -INFINITY,	# Is also a negative expires
+        expires		=> -INFINITY(),	# Is also a negative expires
         name_low	=> $name_low,
         # Probe is used to let perl garbage collection track callbacks
         probe		=> undef,
@@ -5509,8 +5511,8 @@ sub new_suspended {
         nr_sent		=> 0,
         nr_received	=> 0,
         keepalive	=> KEEPALIVE,
-        sent		=> -INFINITY,
-        received	=> -INFINITY,
+        sent		=> -INFINITY(),
+        received	=> -INFINITY(),
         @_);
 }
 
@@ -5601,16 +5603,16 @@ sub init {
     $dns_server->{qids_tcp} = {};
     # Remember the last connection result.
     $dns_server->{last_connect_error} = 0;
-    $dns_server->{last_connect_time}  = -INFINITY;
+    $dns_server->{last_connect_time}  = -INFINITY();
 
     $dns_server->{permute_case} = 1;
     $dns_server->{edns} = 1;
     $dns_server->{max_udp_size} = MAX_UDP_SIZE;
     $dns_server->{cookie_server} = "";
     $dns_server->{cookie_client} = "";
-    $dns_server->{cookie_client_expires} = -INFINITY;
-    $dns_server->{sent} = -INFINITY;
-    $dns_server->{received} = -INFINITY;
+    $dns_server->{cookie_client_expires} = -INFINITY();
+    $dns_server->{sent} = -INFINITY();
+    $dns_server->{received} = -INFINITY();
 }
 
 sub cookie_client {
@@ -5790,7 +5792,7 @@ sub writer {
     my ($line) = @_;
 
     use Scalar::Util qw(blessed);
-    blessed($line) && $line->isa("HASH") || $root->bug("Object not a line, but %s", ::Dumper($line) =~ s/\s*\z//r);
+    blessed($line) && $line->isa("HASH") || $root->bug("Object not a line, but %s", do { my $tmp = ::Dumper($line); $tmp =~ s/\s*\z//; $tmp });
     while (1) {
         my $rc = syswrite($line->{socket_out}, $line->{out}, $BLOCK_SIZE, $line->{out_sent});
         if (!$rc) {
@@ -5982,7 +5984,7 @@ sub process_FOU_REMOTE {
     $to   = Address->parse($to  , "FOU remote", to   => "UDP4", resolve => 1);
 
     my $fou = Fou::UDP->new($line->{parent}, $to);
-    my $listener = Receiver::Fou->new($line, $from, $fou);
+    my $listener = Receiver::Fou->new_suspended($line, $from, $fou);
 }
 
 sub process_UDP_DATA {
@@ -6642,9 +6644,9 @@ sub command_set {
 
     if (@_) {
         for my $arg (@_) {
-            if ($arg =~ /^verbose\s*=\s*((?:0|[1-9]\d*))\s*\z/ia) {
+            if ($arg =~ /^verbose\s*=\s*((?:0|[1-9][0-9]*))\s*\z/i) {
                 $verbose = int $1;
-            } elsif ($arg =~ /^human\s*=\s*([01])\s*\z/ia) {
+            } elsif ($arg =~ /^human\s*=\s*([01])\s*\z/i) {
                 $control->{human} = int $1;
             } else {
                 $control->{collect} .= "Invalid $arg\n";
